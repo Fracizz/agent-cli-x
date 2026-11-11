@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -71,7 +72,41 @@ pub(super) struct Prepared {
     pub cwd_display: String,
     pub shell: Shell,
     pub timeout: Duration,
+    /// 冷启动命令（未取到预热 shell 时使用）
     pub command: Command,
+    cwd: PathBuf,
+    env: BTreeMap<String, String>,
+}
+
+/// 所有命令共用的环境：尽量让工具以非交互、无颜色、无分页的方式运行。
+pub(super) fn apply_base_env(c: &mut Command) {
+    c.env("CI", "1")
+        .env("NO_COLOR", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_PAGER", "cat")
+        .env("PAGER", "cat")
+        .env("AGENT_CLI_X", "1");
+    if cfg!(unix) {
+        c.env("TERM", "dumb");
+    }
+}
+
+/// 启动命令：优先使用预热 shell，否则冷启动。返回子进程以及是否用了预热 shell。
+pub(super) fn spawn(ctx: &Ctx, p: &mut Prepared) -> std::io::Result<(Child, bool)> {
+    if let Some(mut child) = ctx.st.warm.take(p.shell) {
+        let payload = platform::warm_payload(&p.cwd, &p.env, &p.cmd);
+        let sent = child
+            .stdin
+            .take()
+            .is_some_and(|mut si| si.write_all(payload.as_bytes()).is_ok());
+        // stdin 随即关闭：命令里读取 stdin 的程序得到 EOF，与冷启动的 Stdio::null 一致
+        if sent {
+            return Ok((child, true));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    p.command.spawn().map(|c| (c, false))
 }
 
 /// 校验并构造命令。前台 exec 与后台任务共用，超时默认值与上限由调用方给出。
@@ -113,17 +148,8 @@ pub(super) fn prepare(
         .current_dir(&cwd.abs)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // 尽量让工具以非交互、无颜色、无分页的方式运行
-        .env("CI", "1")
-        .env("NO_COLOR", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_PAGER", "cat")
-        .env("PAGER", "cat")
-        .env("AGENT_CLI_X", "1");
-    if cfg!(unix) {
-        command.env("TERM", "dumb");
-    }
+        .stderr(Stdio::piped());
+    apply_base_env(&mut command);
     for (k, v) in &req.env {
         command.env(k, v);
     }
@@ -133,6 +159,8 @@ pub(super) fn prepare(
         shell,
         timeout: Duration::from_secs(timeout),
         command,
+        cwd: cwd.abs.clone(),
+        env: req.env,
     })
 }
 
@@ -192,7 +220,7 @@ pub fn run<W: Write>(ctx: &Ctx, body: Value, w: &mut W) {
             return;
         }
     };
-    let mut child: Child = match p.command.spawn() {
+    let (mut child, warm): (Child, bool) = match spawn(ctx, &mut p) {
         Ok(c) => c,
         Err(e) => {
             let err = AppError::io(format!("启动 {} 失败: {e}", p.shell.name()));
@@ -285,14 +313,14 @@ pub fn run<W: Write>(ctx: &Ctx, body: Value, w: &mut W) {
         let _ = send_text(w, 1, tail1);
         let _ = send(
             w,
-            json!({"t": "exit", "code": code, "ms": ms, "timed_out": timed_out, "shell": p.shell.name()}),
+            json!({"t": "exit", "code": code, "ms": ms, "timed_out": timed_out, "shell": p.shell.name(), "warm": warm}),
         );
     }
     ctx.st.audit.log(
         &ctx.ip,
         "exec",
         !timed_out && code == 0,
-        json!({"cmd": p.cmd, "cwd": p.cwd_display, "shell": p.shell.name(), "code": code, "ms": ms, "timed_out": timed_out, "client_gone": client_gone}),
+        json!({"cmd": p.cmd, "cwd": p.cwd_display, "shell": p.shell.name(), "code": code, "ms": ms, "timed_out": timed_out, "client_gone": client_gone, "warm": warm}),
     );
 }
 

@@ -491,6 +491,28 @@ fn identity_grep_transfer_jobs() {
         // 传脚本用的环境变量不泄漏给用户命令
         let o = run(c, &["exec", "b", "\"[$env:AGENT_CLI_X_PS_SCRIPT]\""]);
         assert_eq!(text(&o).trim(), "[]", "{}", text(&o));
+        // 预热 shell：工作目录、--env、上一条命令的状态不残留
+        let o = run(
+            c,
+            &[
+                "exec",
+                "b",
+                "$global:leak='x'; $env:LEAK2='y'; cd ..; exit 0",
+            ],
+        );
+        assert!(o.status.success(), "{}", text(&o));
+        let cmd = "\"$PWD|$([Environment]::CurrentDirectory)|$env:FOO|[$global:leak$env:LEAK2]\"";
+        let o = run(c, &["exec", "b", "--env", "FOO=中文 'q'", cmd]);
+        let out = text(&o);
+        let parts: Vec<&str> = out.trim().split('|').collect();
+        assert_eq!(parts.len(), 4, "{out}");
+        assert_eq!(parts[0], parts[1], "{out}");
+        assert!(parts[0].to_lowercase().ends_with("proj"), "{out}");
+        assert_eq!(parts[2], "中文 'q'", "{out}");
+        assert_eq!(parts[3], "[]", "{out}");
+        let o = run(c, &["info", "b", "--json"]);
+        let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+        assert_eq!(v["prewarm"]["size"], 1, "{}", text(&o));
     }
 
     // 后台任务：启动 → follow 拿到输出与退出码

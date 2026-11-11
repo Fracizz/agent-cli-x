@@ -65,6 +65,9 @@ pub struct Policy {
     pub max_jobs: usize,
     #[serde(default = "d_job_timeout")]
     pub job_timeout_secs: u64,
+    /// 预热的空闲 PowerShell 数量（仅默认 shell 为 pwsh / powershell 时生效），0 关闭。
+    #[serde(default = "d_prewarm")]
+    pub prewarm_shells: usize,
 }
 
 impl Default for Policy {
@@ -79,6 +82,7 @@ impl Default for Policy {
             max_transfer_mb: d_transfer_mb(),
             max_jobs: d_max_jobs(),
             job_timeout_secs: d_job_timeout(),
+            prewarm_shells: d_prewarm(),
         }
     }
 }
@@ -103,6 +107,9 @@ fn d_transfer_mb() -> u64 {
 }
 fn d_max_jobs() -> usize {
     16
+}
+fn d_prewarm() -> usize {
+    1
 }
 fn d_job_timeout() -> u64 {
     86_400
@@ -283,6 +290,11 @@ max_transfer_mb = 2048
 # 后台任务（exec --detach）：同时运行的最大数量、单个任务最长运行时间（秒）。
 max_jobs = 16
 job_timeout_secs = 86400
+
+# 预热的空闲 shell 数量：仅当默认 shell 是 pwsh / powershell 时生效（sh / bash / cmd 启动本来就快）。
+# 每条命令仍在全新进程中执行、互不影响，只是省掉 PowerShell 的冷启动时间（pwsh 约 0.3 秒，5.1 约 2 秒）。
+# 每个空闲进程约占几十 MB 内存；并发超过此数量时自动退回冷启动。设为 0 关闭。
+prewarm_shells = 1
 "#,
         node_name = toml_str(node_name),
         node_id = toml_str(node_id),

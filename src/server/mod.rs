@@ -6,6 +6,7 @@ mod exec;
 mod fs;
 mod jobs;
 pub mod transfer;
+mod warm;
 pub mod workspace;
 
 use crate::config::{self, Config};
@@ -30,6 +31,7 @@ pub struct State {
     pub home: PathBuf,
     pub audit: audit::Audit,
     pub jobs: jobs::Jobs,
+    pub warm: Arc<warm::WarmPool>,
     active: AtomicUsize,
 }
 
@@ -57,7 +59,19 @@ pub fn serve(home: &Path) -> Result<()> {
     );
     eprintln!("  监听:   {}", cfg.listen);
     eprintln!("  指纹:   {fp}");
-    eprintln!("  shell:  {}", platform::default_shell().name());
+    let shell = platform::default_shell();
+    let warm = warm::WarmPool::new(shell, cfg.policy.prewarm_shells);
+    eprintln!("  shell:  {}", shell.name());
+    if warm.size() > 0 {
+        eprintln!(
+            "  预热:   {} 个空闲 {}（policy.prewarm_shells）",
+            warm.size(),
+            shell.name()
+        );
+    }
+    if shell == platform::Shell::PowerShell {
+        eprintln!("  提示:   未找到 pwsh，正在使用 Windows PowerShell 5.1（冷启动约 2 秒）；安装 PowerShell 7 可明显加快 exec");
+    }
     if ws.is_empty() {
         eprintln!(
             "  警告:   未配置任何工作区，对端无法访问文件或执行命令（编辑 {}）",
@@ -76,11 +90,13 @@ pub fn serve(home: &Path) -> Result<()> {
     let st = Arc::new(State {
         audit: audit::Audit::new(home.join("audit")),
         jobs: jobs::Jobs::new(home.join("jobs")),
+        warm: Arc::clone(&warm),
         home: home.to_path_buf(),
         cfg,
         ws,
         active: AtomicUsize::new(0),
     });
+    warm.refill();
     for stream in listener.incoming() {
         let Ok(tcp) = stream else { continue };
         let st = Arc::clone(&st);
@@ -235,5 +251,10 @@ fn info(ctx: &Ctx) -> Value {
         "deny_commands": ctx.st.cfg.policy.deny_commands,
         "default_timeout_secs": ctx.st.cfg.policy.default_timeout_secs,
         "max_timeout_secs": ctx.st.cfg.policy.max_timeout_secs,
+        "prewarm": {
+            "shell": ctx.st.warm.shell().map(|s| s.name()),
+            "size": ctx.st.warm.size(),
+            "idle": ctx.st.warm.idle_count(),
+        },
     })
 }

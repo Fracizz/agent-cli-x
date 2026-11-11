@@ -1,7 +1,8 @@
 //! 平台差异：shell 选择、进程树终止、输出回退编码、主机名。
 
 use crate::error::{AppError, Result};
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::OnceLock;
 
@@ -88,6 +89,41 @@ exit 1
 /// PowerShell 脚本经此环境变量传给子进程。
 const PS_SCRIPT_ENV: &str = "AGENT_CLI_X_PS_SCRIPT";
 
+impl Shell {
+    pub fn is_powershell(&self) -> bool {
+        matches!(self, Shell::Pwsh | Shell::PowerShell)
+    }
+}
+
+/// PowerShell 进程：程序名与公共参数。
+fn ps_command(shell: Shell) -> Command {
+    let mut c = Command::new(if shell == Shell::Pwsh {
+        "pwsh"
+    } else {
+        "powershell"
+    });
+    c.args(["-NoLogo", "-NoProfile", "-NonInteractive"]);
+    if cfg!(windows) {
+        c.args(["-ExecutionPolicy", "Bypass"]);
+    }
+    c
+}
+
+/// 所有子进程共用的创建参数：Windows 不弹窗口，Unix 独立进程组（超时可一次杀掉整棵进程树）。
+fn apply_spawn_flags(c: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        c.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        c.process_group(0);
+    }
+}
+
 pub fn build_command(shell: Shell, cmd: &str) -> Result<Command> {
     let mut c = match shell {
         Shell::Pwsh | Shell::PowerShell => {
@@ -101,15 +137,7 @@ pub fn build_command(shell: Shell, cmd: &str) -> Result<Command> {
                     "命令过长（超过约 30000 字符），请先用 write 写入脚本文件再执行",
                 ));
             }
-            let mut c = Command::new(if shell == Shell::Pwsh {
-                "pwsh"
-            } else {
-                "powershell"
-            });
-            c.args(["-NoLogo", "-NoProfile", "-NonInteractive"]);
-            if cfg!(windows) {
-                c.args(["-ExecutionPolicy", "Bypass"]);
-            }
+            let mut c = ps_command(shell);
             c.env(PS_SCRIPT_ENV, &script);
             // 读出后立即删除该变量，避免泄漏给用户命令启动的子进程
             c.args([
@@ -142,19 +170,53 @@ pub fn build_command(shell: Shell, cmd: &str) -> Result<Command> {
             c
         }
     };
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        c.creation_flags(CREATE_NO_WINDOW);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // 独立进程组，超时时可一次杀掉整棵进程树
-        c.process_group(0);
-    }
+    apply_spawn_flags(&mut c);
     Ok(c)
+}
+
+/// 预热 shell 的引导脚本：先完成启动和 Invoke-Expression 的首次初始化，
+/// 再阻塞读取 stdin 的一行任务（Base64 编码的 UTF-8 脚本）并执行。
+/// 服务端退出时管道关闭，ReadLine 返回空，进程自行退出，不会残留。
+const PS_WARM_BOOT: &str = "$null=Invoke-Expression '$null=Get-Location'; $__l=[Console]::In.ReadLine(); if (-not $__l) { exit 0 }; $__s=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($__l)); Remove-Variable __l; Invoke-Expression $__s";
+
+/// 构造一个预热 shell（仅 PowerShell；其他 shell 启动足够快，不需要预热）。
+/// 返回的命令尚未设置 stdio，由调用方配置。
+pub fn build_warm_command(shell: Shell) -> Option<Command> {
+    if !shell.is_powershell() {
+        return None;
+    }
+    let mut c = ps_command(shell);
+    c.args(["-Command", PS_WARM_BOOT]);
+    apply_spawn_flags(&mut c);
+    Some(c)
+}
+
+/// 交给预热 shell 的任务：设置环境变量与工作目录后执行命令（与冷启动同一个包装脚本）。
+/// 所有动态内容都经 Base64 传入，无需处理 PowerShell 引号转义。返回一行（含换行）。
+pub fn warm_payload(cwd: &Path, env: &BTreeMap<String, String>, cmd: &str) -> String {
+    let lit = |s: &str| {
+        format!(
+            "([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{}')))",
+            crate::util::base64(s.as_bytes())
+        )
+    };
+    let mut script = String::new();
+    for (k, v) in env {
+        script.push_str(&format!(
+            "[Environment]::SetEnvironmentVariable({}, {})\n",
+            lit(k),
+            lit(v)
+        ));
+    }
+    // Set-Location 影响 PowerShell 与其启动的外部程序；CurrentDirectory 影响 .NET 相对路径
+    script.push_str(&format!(
+        "Set-Location -LiteralPath {}\n[Environment]::CurrentDirectory=(Get-Location).ProviderPath\n",
+        lit(&cwd.to_string_lossy())
+    ));
+    script.push_str(&PS_WRAPPER.replace("__AGENT_CLI_CMD__", cmd));
+    let mut line = crate::util::base64(script.as_bytes());
+    line.push('\n');
+    line
 }
 
 /// 进程树终止句柄：Windows 用 Job Object，Unix 用进程组。

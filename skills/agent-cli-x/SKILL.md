@@ -50,6 +50,7 @@ Add `--json` to any command for machine-readable output.
 
 - Commands run non-interactively (empty stdin, `CI=1`). Anything that prompts will hang until timeout: pass `-y` / `--yes` / `--no-edit`.
 - Default shell: `pwsh` (fallback `powershell`) on Windows, `sh` on Linux. Check `info` and use matching syntax.
+- Every `exec` is a fresh shell: `cd`, variables and env changes do not carry over to the next call. Use `--cwd` / `--env`, or chain steps in one command.
 - Long output shows the first and last ~200 lines; the full log path is printed to stderr and can be read locally.
 - `edit` needs `--old` to match **exactly once** (including indentation). Widen the context or use `--all`. CRLF/LF is handled.
 - `read` before `edit`. To guard against concurrent changes, take `sha256` from `read --json` and pass `--expect-sha`.

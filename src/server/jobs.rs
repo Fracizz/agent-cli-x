@@ -103,7 +103,7 @@ pub fn start(ctx: &Ctx, body: Value) -> Result<Value> {
     let dir = jobs.dir.join(&id);
     fs::create_dir_all(&dir)?;
     let log = File::create(dir.join("output.log"))?;
-    let mut child = p.command.spawn().map_err(|e| {
+    let (mut child, _) = exec::spawn(ctx, &mut p).map_err(|e| {
         let _ = fs::remove_dir_all(&dir);
         AppError::io(format!("启动 {} 失败: {e}", p.shell.name()))
     })?;

@@ -91,7 +91,12 @@ max_timeout_secs = 3600
 max_transfer_mb = 2048     # per put/get
 max_jobs = 16              # concurrent background jobs
 job_timeout_secs = 86400
+prewarm_shells = 1         # idle PowerShell kept ready for exec; 0 = off
 ```
+
+### Performance
+
+`serve` is one process: one thread per connection (up to 64 concurrent), each `exec` a fresh child process. On Windows the dominant cost is PowerShell startup (pwsh ≈ 0.3 s, Windows PowerShell 5.1 ≈ 2 s), so `serve` keeps `prewarm_shells` idle PowerShell processes started and waiting. A request takes one, hands it cwd/env/command over stdin, and a replacement is started in the background. Every command still runs in its own new process, so nothing leaks between calls; when the pool is empty `exec` falls back to a cold start. Measured locally for `exec "echo hi"` round trips: pwsh 520 ms → 170 ms, 5.1 2.6 s → 0.2–0.9 s. If only 5.1 is installed, installing PowerShell 7 (`pwsh`) helps further. `sh`/`bash`/`cmd` start fast and are not prewarmed.
 
 ## Security model
 

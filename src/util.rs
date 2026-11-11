@@ -14,6 +14,30 @@ pub fn hex(bytes: &[u8]) -> String {
     s
 }
 
+/// 标准 Base64 编码（带填充）。
+pub fn base64(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut s = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n = (c[0] as u32) << 16
+            | (*c.get(1).unwrap_or(&0) as u32) << 8
+            | *c.get(2).unwrap_or(&0) as u32;
+        s.push(T[(n >> 18) as usize & 63] as char);
+        s.push(T[(n >> 12) as usize & 63] as char);
+        s.push(if c.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        s.push(if c.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    s
+}
+
 pub fn random_hex(n_bytes: usize) -> String {
     let mut buf = vec![0u8; n_bytes];
     SystemRandom::new()
@@ -160,6 +184,15 @@ mod tests {
         assert_eq!(utc_parts(UNIX_EPOCH), (1970, 1, 1, 0, 0, 0));
         let t = UNIX_EPOCH + std::time::Duration::from_secs(1_709_210_096); // 2024-02-29T12:34:56Z
         assert_eq!(utc_parts(t), (2024, 2, 29, 12, 34, 56));
+    }
+
+    #[test]
+    fn base64_known() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64("中".as_bytes()), "5Lit");
     }
 
     #[test]
