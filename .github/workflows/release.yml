@@ -27,19 +27,34 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      # 优先用发行版包；runner 到 ubuntu 归档源的 DNS 偶发故障时快速失败，
+      # 交给下面的 docker 兜底，避免卡在 apt 重试上十几分钟。
       - name: Install musl toolchain
         if: runner.os == 'Linux'
         run: |
-          for i in 1 2 3; do
-            sudo apt-get update && sudo apt-get install -y musl-tools && exit 0
-            echo "apt failed (attempt $i/3), retrying in 15s"
-            sleep 15
-          done
-          exit 1
+          if command -v musl-gcc >/dev/null 2>&1; then exit 0; fi
+          sudo timeout 90 apt-get -o Acquire::Retries=1 \
+            -o Acquire::http::Timeout=8 -o Acquire::https::Timeout=8 update || true
+          sudo timeout 150 apt-get install -y --no-install-recommends \
+            -o Acquire::Retries=1 -o Acquire::http::Timeout=8 -o Acquire::https::Timeout=8 \
+            musl-tools || true
+          command -v musl-gcc >/dev/null 2>&1 && echo "musl-gcc ready" || echo "musl-gcc unavailable, will use cross image"
       - name: Build
-        env:
-          CC_x86_64_unknown_linux_musl: musl-gcc
+        if: runner.os != 'Linux'
         run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Build (Linux musl)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          if command -v musl-gcc >/dev/null 2>&1; then
+            CC_x86_64_unknown_linux_musl=musl-gcc \
+              cargo build --locked --release --target ${{ matrix.target }}
+          else
+            docker run --rm -v "$PWD":/project -w /project \
+              ghcr.io/cross-rs/${{ matrix.target }}:edge \
+              cargo build --locked --release --target ${{ matrix.target }}
+            sudo chown -R "$(id -u):$(id -g)" target
+          fi
       - name: Package (Linux)
         if: runner.os == 'Linux'
         run: |
