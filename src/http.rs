@@ -14,6 +14,7 @@ pub struct Request {
     pub method: String,
     pub path: String,
     pub headers: Vec<(String, String)>,
+    pub content_length: u64,
     pub body: Vec<u8>,
 }
 
@@ -60,7 +61,8 @@ fn read_headers<R: BufRead>(r: &mut R) -> Result<Vec<(String, String)>> {
     }
 }
 
-pub fn read_request<R: BufRead>(r: &mut R, max_body: usize) -> Result<Request> {
+/// 只读取请求行与请求头；请求体由调用方按需读取（put 需要流式读取大文件）。
+pub fn read_request_head<R: BufRead>(r: &mut R) -> Result<Request> {
     let line = read_line(r)?;
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_string();
@@ -69,26 +71,38 @@ pub fn read_request<R: BufRead>(r: &mut R, max_body: usize) -> Result<Request> {
         return Err(AppError::bad_request("无效的 HTTP 请求行"));
     }
     let headers = read_headers(r)?;
-    let len = headers
+    let content_length = headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-        .map(|(_, v)| v.parse::<usize>())
+        .map(|(_, v)| v.parse::<u64>())
         .transpose()
         .map_err(|_| AppError::bad_request("Content-Length 无效"))?
         .unwrap_or(0);
-    if len > max_body {
-        return Err(AppError::bad_request(format!(
-            "请求体过大（{len} 字节，上限 {max_body}）"
-        )));
-    }
-    let mut body = vec![0u8; len];
-    r.read_exact(&mut body)?;
     Ok(Request {
         method,
         path,
         headers,
-        body,
+        content_length,
+        body: Vec::new(),
     })
+}
+
+pub fn read_body<R: Read>(r: &mut R, len: u64, max_body: usize) -> Result<Vec<u8>> {
+    if len > max_body as u64 {
+        return Err(AppError::bad_request(format!(
+            "请求体过大（{len} 字节，上限 {max_body}）"
+        )));
+    }
+    let mut body = vec![0u8; len as usize];
+    r.read_exact(&mut body)?;
+    Ok(body)
+}
+
+#[cfg(test)]
+pub fn read_request<R: BufRead>(r: &mut R, max_body: usize) -> Result<Request> {
+    let mut req = read_request_head(r)?;
+    req.body = read_body(r, req.content_length, max_body)?;
+    Ok(req)
 }
 
 fn reason(status: u16) -> &'static str {
@@ -140,6 +154,19 @@ pub fn write_request<W: Write>(
     )?;
     w.write_all(body)?;
     w.flush()
+}
+
+pub fn write_request_head<W: Write>(
+    w: &mut W,
+    path: &str,
+    token: &str,
+    len: u64,
+    content_type: &str,
+) -> std::io::Result<()> {
+    write!(
+        w,
+        "POST {path} HTTP/1.1\r\nHost: agent-cli-x\r\nAuthorization: Bearer {token}\r\nContent-Type: {content_type}\r\nContent-Length: {len}\r\nX-Agent-Cli-Version: {VERSION}\r\n\r\n"
+    )
 }
 
 pub fn read_response_head<R: BufRead>(r: &mut R) -> Result<u16> {

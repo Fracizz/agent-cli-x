@@ -343,3 +343,141 @@ fn full_flow() {
     .unwrap();
     assert_eq!(run(c, &["info", "b"]).status.code(), Some(101));
 }
+
+#[test]
+fn identity_grep_transfer_jobs() {
+    let env = setup();
+    let c = &env.client_home;
+
+    // 机器标识：init 生成 UUID，info / peer list 可见
+    let who = run(&env.server_home, &["whoami", "--json"]);
+    assert!(who.status.success(), "{}", text(&who));
+    let who: serde_json::Value = serde_json::from_slice(&who.stdout).unwrap();
+    let node_id = who["node_id"].as_str().unwrap().to_string();
+    assert_eq!(node_id.len(), 36);
+    let info: serde_json::Value =
+        serde_json::from_slice(&run(c, &["info", "b", "--json"]).stdout).unwrap();
+    assert_eq!(info["node_id"], node_id.as_str());
+    let list = String::from_utf8_lossy(&run(c, &["peer", "list"]).stdout).to_string();
+    assert!(list.contains(&node_id), "{list}");
+
+    // grep：命中正常文件，跳过黑名单目录
+    let o = run(c, &["grep", "b", "println", "proj:"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("proj:src/main.rs:2:"));
+    let o = run(c, &["grep", "b", "TOP-SECRET", "proj:"]);
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "黑名单内容不应被搜到: {}",
+        text(&o)
+    );
+    let o = run(c, &["grep", "b", "-F", "(\"hi\")", "--glob", "*.rs"]);
+    assert!(o.status.success(), "{}", text(&o));
+
+    // put 目录（含排除）→ 远端；get 回本地
+    let local = env.server_home.parent().unwrap().join("upload/site");
+    fs::create_dir_all(local.join("sub")).unwrap();
+    fs::create_dir_all(local.join("node_modules/x")).unwrap();
+    fs::write(local.join("index.html"), "<h1>中文</h1>").unwrap();
+    fs::write(local.join("sub/app.bin"), [0u8, 1, 2, 255]).unwrap();
+    fs::write(local.join("node_modules/x/big.js"), "x").unwrap();
+    let o = run(
+        c,
+        &[
+            "put",
+            "b",
+            local.to_str().unwrap(),
+            "proj:dist",
+            "--exclude",
+            "node_modules",
+            "--json",
+        ],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["files"], 2);
+    assert_eq!(
+        fs::read(env.ws.join("dist/sub/app.bin")).unwrap(),
+        [0u8, 1, 2, 255]
+    );
+    assert!(!env.ws.join("dist/node_modules").exists());
+    // 目标已存在目录：放到其下
+    let o = run(
+        c,
+        &[
+            "put",
+            "b",
+            local.join("index.html").to_str().unwrap(),
+            "proj:dist/sub",
+        ],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(env.ws.join("dist/sub/index.html").is_file());
+    // 黑名单目录不可写入
+    let o = run(
+        c,
+        &[
+            "put",
+            "b",
+            local.join("index.html").to_str().unwrap(),
+            "proj:secrets/x.html",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(102), "{}", text(&o));
+    // get 目录
+    let down = env.server_home.parent().unwrap().join("download");
+    fs::create_dir_all(&down).unwrap();
+    let o = run(c, &["get", "b", "proj:dist", down.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert_eq!(
+        fs::read_to_string(down.join("dist/index.html")).unwrap(),
+        "<h1>中文</h1>"
+    );
+    // get 整个工作区时跳过黑名单
+    let o = run(
+        c,
+        &["get", "b", "proj:", down.join("all").to_str().unwrap()],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(down.join("all/src/main.rs").is_file());
+    assert!(!down.join("all/secrets").exists());
+    assert!(!down.join("all/.env").exists());
+    // put 的 rollback 撤销所有新建文件
+    let op = v["op_id"].as_str().unwrap();
+    assert!(run(c, &["rollback", "b", op]).status.success());
+    assert!(!env.ws.join("dist/index.html").exists());
+
+    // 后台任务：启动 → follow 拿到输出与退出码
+    // pwsh 与 sh 都支持这段语法
+    let quick = "echo job-out; exit 3";
+    let o = run(c, &["exec", "b", "--detach", "--json", quick]);
+    assert!(o.status.success(), "{}", text(&o));
+    let id = serde_json::from_slice::<serde_json::Value>(&o.stdout).unwrap()["job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let o = run(c, &["job", "logs", "b", &id, "--follow"]);
+    assert_eq!(o.status.code(), Some(3), "{}", text(&o));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("job-out"));
+    // 长任务：kill
+    let slow = if cfg!(windows) {
+        "Start-Sleep -Seconds 60"
+    } else {
+        "sleep 60"
+    };
+    let o = run(c, &["exec", "b", "--detach", "--json", slow]);
+    let id2 = serde_json::from_slice::<serde_json::Value>(&o.stdout).unwrap()["job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let o = run(c, &["job", "logs", "b", &id2]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    assert!(run(c, &["job", "kill", "b", &id2]).status.success());
+    let started = Instant::now();
+    let o = run(c, &["job", "logs", "b", &id2, "--follow"]);
+    assert_eq!(o.status.code(), Some(137), "{}", text(&o));
+    assert!(started.elapsed() < Duration::from_secs(20));
+    let list = String::from_utf8_lossy(&run(c, &["job", "list", "b"]).stdout).to_string();
+    assert!(list.contains(&id) && list.contains("killed"), "{list}");
+}

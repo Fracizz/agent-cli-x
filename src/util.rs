@@ -22,6 +22,23 @@ pub fn random_hex(n_bytes: usize) -> String {
     hex(&buf)
 }
 
+/// 随机 UUID v4（小写，带连字符）。
+pub fn uuid_v4() -> String {
+    let mut b = [0u8; 16];
+    SystemRandom::new().fill(&mut b).expect("系统随机数不可用");
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h = hex(&b);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    )
+}
+
 pub fn sha256_hex(data: &[u8]) -> String {
     hex(ring::digest::digest(&ring::digest::SHA256, data).as_ref())
 }

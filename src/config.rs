@@ -26,7 +26,13 @@ pub struct Config {
     #[serde(default = "default_listen")]
     pub listen: String,
     pub token: String,
-    /// 预留给 `ask`：本机 AI CLI 命令。
+    /// 本机名称：对端 `info` / `peer list` 中显示，未配置时用主机名。
+    #[serde(default)]
+    pub node_name: Option<String>,
+    /// 本机唯一 ID（UUID），init 时随机生成。
+    #[serde(default)]
+    pub node_id: Option<String>,
+    /// 旧版本模板里的预留字段，保留以兼容已有配置。
     #[serde(default)]
     #[allow(dead_code)]
     pub ai_cmd: String,
@@ -53,6 +59,12 @@ pub struct Policy {
     pub max_read_kb: u64,
     #[serde(default = "d_write_kb")]
     pub max_write_kb: u64,
+    #[serde(default = "d_transfer_mb")]
+    pub max_transfer_mb: u64,
+    #[serde(default = "d_max_jobs")]
+    pub max_jobs: usize,
+    #[serde(default = "d_job_timeout")]
+    pub job_timeout_secs: u64,
 }
 
 impl Default for Policy {
@@ -64,6 +76,9 @@ impl Default for Policy {
             max_timeout_secs: d_max_timeout(),
             max_read_kb: d_read_kb(),
             max_write_kb: d_write_kb(),
+            max_transfer_mb: d_transfer_mb(),
+            max_jobs: d_max_jobs(),
+            job_timeout_secs: d_job_timeout(),
         }
     }
 }
@@ -82,6 +97,15 @@ fn d_read_kb() -> u64 {
 }
 fn d_write_kb() -> u64 {
     8192
+}
+fn d_transfer_mb() -> u64 {
+    2048
+}
+fn d_max_jobs() -> usize {
+    16
+}
+fn d_job_timeout() -> u64 {
+    86_400
 }
 
 pub fn config_path(home: &Path) -> PathBuf {
@@ -104,7 +128,50 @@ pub fn load_config(home: &Path) -> Result<Config> {
     for name in cfg.workspaces.keys() {
         validate_name(name, "工作区")?;
     }
+    if let Some(n) = &cfg.node_name {
+        validate_name(n, "机器")?;
+    }
     Ok(cfg)
+}
+
+impl Config {
+    pub fn node_name(&self) -> String {
+        self.node_name
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(crate::platform::hostname)
+    }
+}
+
+/// 旧配置没有 node_id 时生成一个并写回文件顶部（顶层键必须位于第一个表之前）。
+pub fn ensure_node_id(home: &Path) -> Result<()> {
+    let cfg = load_config(home)?;
+    if cfg.node_id.as_deref().is_some_and(|s| !s.is_empty()) {
+        return Ok(());
+    }
+    let p = config_path(home);
+    let text = fs::read_to_string(&p)?;
+    let line = format!(
+        "# 本机唯一 ID（自动生成，一般不要修改）\nnode_id = {}\n\n",
+        toml_str(&crate::util::uuid_v4())
+    );
+    crate::util::atomic_write(&p, format!("{line}{text}").as_bytes())?;
+    crate::util::restrict_permissions(&p);
+    Ok(())
+}
+
+/// 机器名：只允许字母数字和 `_-.`，便于在命令行和 AI 提示中引用。
+pub fn default_node_name() -> String {
+    let h: String = crate::platform::hostname()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        .take(64)
+        .collect();
+    if h.is_empty() {
+        "node".to_string()
+    } else {
+        h
+    }
 }
 
 /// 名称只允许字母数字和 `_-.`；工作区名至少 2 个字符（避免与 Windows 盘符 `C:` 混淆）。
@@ -129,7 +196,13 @@ fn toml_str(s: &str) -> String {
 }
 
 /// `init` 生成的带注释配置模板。
-pub fn template(listen: &str, token: &str, workspaces: &[(String, String)]) -> String {
+pub fn template(
+    node_name: &str,
+    node_id: &str,
+    listen: &str,
+    token: &str,
+    workspaces: &[(String, String)],
+) -> String {
     let mut ws = String::new();
     if workspaces.is_empty() {
         ws.push_str("# proj = \"D:/code/proj\"\n");
@@ -141,15 +214,19 @@ pub fn template(listen: &str, token: &str, workspaces: &[(String, String)]) -> S
         r#"# agent-cli-x 服务端配置（TOML）。修改后需重启 `agent-cli-x serve` 生效。
 # 本文件包含 token，请勿提交到仓库或分享给他人。
 
+# 本机名称：对端执行 `info` / `peer list` 时看到的机器名，方便 AI 分辨是哪台机器。
+# 仅限字母、数字、_ - .，可随时修改（重启 serve 生效）。
+node_name = {node_name}
+
+# 本机唯一 ID（init 时随机生成的 UUID）。一般不要修改；重装系统后保留它可让对端认出是同一台机器。
+node_id = {node_id}
+
 # 监听地址。只想在某张网卡上监听时改成该网卡 IP。
 listen = {listen}
 
 # 访问令牌。对端登记本机时使用：
 #   agent-cli-x peer add <名称> <本机IP:端口> --token <此值> --fingerprint <本机指纹>
 token = {token}
-
-# （预留，M3）`ask` 调用的本机 AI CLI，例如 "claude -p" 或 "codex exec"。
-ai_cmd = ""
 
 # 默认工作区：路径没写 `工作区:` 前缀时使用。只有一个工作区时可省略。
 # default_workspace = "proj"
@@ -199,7 +276,16 @@ max_timeout_secs = 3600
 # read 单次最多返回 / write 单次最多写入（KB）。
 max_read_kb = 512
 max_write_kb = 8192
+
+# put / get 单次传输总量上限（MB）。
+max_transfer_mb = 2048
+
+# 后台任务（exec --detach）：同时运行的最大数量、单个任务最长运行时间（秒）。
+max_jobs = 16
+job_timeout_secs = 86400
 "#,
+        node_name = toml_str(node_name),
+        node_id = toml_str(node_id),
         listen = toml_str(listen),
         token = toml_str(token),
     )
@@ -218,6 +304,11 @@ pub struct Peer {
     pub addr: String,
     pub token: String,
     pub fingerprint: String,
+    /// 登记时对端报告的机器名与 ID（仅用于展示与核对）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
 }
 
 pub fn peers_path(home: &Path) -> PathBuf {
@@ -267,6 +358,8 @@ mod tests {
     #[test]
     fn template_parses() {
         let t = template(
+            "dev-01",
+            "00000000-0000-4000-8000-000000000000",
             "0.0.0.0:7700",
             "0123456789abcdef0123",
             &[("proj".into(), r"D:\code\x".into())],

@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "agent-cli-x"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "clap",
@@ -14,6 +14,7 @@ dependencies = [
  "ignore",
  "libc",
  "rcgen",
+ "regex",
  "ring",
  "rustls",
  "serde",
@@ -378,6 +379,18 @@ dependencies = [
  "rustls-pki-types",
  "time",
  "yasna",
+]
+
+[[package]]
+name = "regex"
+version = "1.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f020237b6c8eed93db2e2cb53c00c60a8e1bc73da7d073199a1180401450218d"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]

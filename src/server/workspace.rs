@@ -303,6 +303,8 @@ mod tests {
         let cfg = Config {
             listen: String::new(),
             token: "x".repeat(20),
+            node_name: None,
+            node_id: None,
             ai_cmd: String::new(),
             default_workspace: None,
             workspaces,

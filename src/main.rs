@@ -3,6 +3,7 @@ mod client;
 mod config;
 mod decode;
 mod error;
+mod frame;
 mod http;
 mod platform;
 mod server;

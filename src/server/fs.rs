@@ -89,6 +89,132 @@ pub fn ls(ctx: &Ctx, body: Value) -> Result<Value> {
     Ok(json!({"ws": r.ws, "path": r.rel, "entries": entries, "truncated": truncated}))
 }
 
+// ---------------- grep ----------------
+
+#[derive(Deserialize)]
+struct GrepReq {
+    pattern: String,
+    #[serde(default)]
+    path: String,
+    /// 只搜索匹配这些 glob 的文件，如 "*.rs"、"src/**/*.ts"
+    #[serde(default)]
+    glob: Vec<String>,
+    #[serde(default)]
+    ignore_case: bool,
+    /// 按字面量匹配（不当作正则）
+    #[serde(default)]
+    fixed: bool,
+    #[serde(default = "grep_max")]
+    max: usize,
+}
+fn grep_max() -> usize {
+    200
+}
+
+const GREP_FILE_LIMIT: u64 = 8 * 1024 * 1024;
+const GREP_LINE_CHARS: usize = 300;
+
+pub fn grep(ctx: &Ctx, body: Value) -> Result<Value> {
+    let req: GrepReq = parse(body)?;
+    if req.pattern.is_empty() {
+        return Err(AppError::bad_request("pattern 不能为空"));
+    }
+    let pat = if req.fixed {
+        regex::escape(&req.pattern)
+    } else {
+        req.pattern.clone()
+    };
+    let re = regex::bytes::RegexBuilder::new(&pat)
+        .case_insensitive(req.ignore_case)
+        .size_limit(8 * 1024 * 1024)
+        .build()
+        .map_err(|e| AppError::bad_request(format!("正则无效: {e}")))?;
+    let r = ctx.st.ws.resolve(&req.path)?;
+    if !r.exists {
+        return Err(AppError::not_found(format!("路径不存在: {}", r.display())));
+    }
+    let max = req.max.clamp(1, 5000);
+
+    let st = Arc::clone(&ctx.st);
+    let ws_name = r.ws.clone();
+    let root = r.root.clone();
+    let mut builder = ignore::WalkBuilder::new(&r.abs);
+    builder
+        .hidden(false)
+        .git_ignore(true)
+        .git_exclude(true)
+        .git_global(false)
+        .require_git(false)
+        .parents(true)
+        .filter_entry(move |e| {
+            e.file_name() != ".git" && st.ws.denied_by(&ws_name, &root, e.path()).is_none()
+        });
+    if !req.glob.is_empty() {
+        let mut ob = ignore::overrides::OverrideBuilder::new(&r.abs);
+        for g in &req.glob {
+            ob.add(g)
+                .map_err(|e| AppError::bad_request(format!("glob `{g}` 无效: {e}")))?;
+        }
+        builder.overrides(
+            ob.build()
+                .map_err(|e| AppError::bad_request(format!("glob 无效: {e}")))?,
+        );
+    }
+
+    let mut matches = Vec::new();
+    let mut files_scanned = 0usize;
+    let mut truncated = false;
+    'walk: for item in builder.build().flatten() {
+        if !item.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        if item.metadata().map(|m| m.len()).unwrap_or(0) > GREP_FILE_LIMIT {
+            continue;
+        }
+        let Ok(data) = fs::read(item.path()) else {
+            continue;
+        };
+        if data[..data.len().min(8192)].contains(&0) {
+            continue;
+        }
+        files_scanned += 1;
+        let rel = item
+            .path()
+            .strip_prefix(&r.root)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        for (i, line) in data.split(|&b| b == b'\n').enumerate() {
+            if !re.is_match(line) {
+                continue;
+            }
+            if matches.len() >= max {
+                truncated = true;
+                break 'walk;
+            }
+            let text = String::from_utf8_lossy(line);
+            let text = text.trim_end_matches('\r');
+            let text: String = if text.chars().count() > GREP_LINE_CHARS {
+                text.chars().take(GREP_LINE_CHARS).collect::<String>() + "…"
+            } else {
+                text.to_string()
+            };
+            matches.push(json!({"path": rel, "line": i + 1, "text": text}));
+        }
+    }
+    ctx.st.audit.log(
+        &ctx.ip,
+        "grep",
+        true,
+        json!({"path": r.display(), "pattern": req.pattern, "matches": matches.len()}),
+    );
+    Ok(json!({
+        "ws": r.ws,
+        "matches": matches,
+        "files_scanned": files_scanned,
+        "truncated": truncated,
+    }))
+}
+
 // ---------------- read ----------------
 
 #[derive(Deserialize)]
@@ -232,8 +358,9 @@ pub fn write(ctx: &Ctx, body: Value) -> Result<Value> {
         }
     }
     check_expect_sha(&r.abs, &req.expect_sha)?;
-    let op_id = backup::new_op_id();
-    backup::backup(&ctx.st.home, &op_id, &r.abs, &r.display())?;
+    let mut op = backup::Op::new(&ctx.st.home)?;
+    op.add(&r.abs, &r.display())?;
+    let op_id = op.id.clone();
     util::atomic_write(&r.abs, req.content.as_bytes())?;
     let sha = util::sha256_hex(req.content.as_bytes());
     ctx.st.audit.log(
@@ -337,8 +464,9 @@ pub fn edit(ctx: &Ctx, body: Value) -> Result<Value> {
         data.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
     }
     data.extend_from_slice(out.text.as_bytes());
-    let op_id = backup::new_op_id();
-    backup::backup(&ctx.st.home, &op_id, &r.abs, &r.display())?;
+    let mut op = backup::Op::new(&ctx.st.home)?;
+    op.add(&r.abs, &r.display())?;
+    let op_id = op.id.clone();
     util::atomic_write(&r.abs, &data)?;
     let sha = util::sha256_hex(&data);
     ctx.st.audit.log(

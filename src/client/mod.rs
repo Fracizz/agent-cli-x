@@ -1,6 +1,7 @@
 //! 客户端：短连接 HTTPS（证书指纹固定），一次调用一个请求。
 
 pub mod output;
+pub mod transfer;
 
 use crate::config::{self, Peer};
 use crate::error::{AppError, Result};
@@ -12,7 +13,7 @@ use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-type Stream = StreamOwned<ClientConnection, TcpStream>;
+pub type Stream = StreamOwned<ClientConnection, TcpStream>;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -154,6 +155,59 @@ impl Client {
                 .map_err(|e| AppError::internal(format!("流数据无效: {e}")))?;
             on_line(v)?;
         }
+    }
+
+    /// 流式上传：先发请求头，再由 `write_body` 写入恰好 `len` 字节的请求体。
+    pub fn upload(
+        &self,
+        path: &str,
+        len: u64,
+        timeout: Duration,
+        write_body: impl FnOnce(&mut Stream) -> Result<()>,
+    ) -> Result<Value> {
+        let (mut s, _) = connect(&self.peer.addr, Some(&self.peer.fingerprint), timeout)?;
+        http::write_request_head(
+            &mut s,
+            path,
+            &self.peer.token,
+            len,
+            "application/octet-stream",
+        )
+        .map_err(map_io)?;
+        let body_res = write_body(&mut s);
+        let _ = s.flush();
+        // 服务端可能中途拒绝并关闭连接：即使写入失败，也优先读取它返回的错误
+        let mut br = BufReader::new(s);
+        let status = match http::read_response_head(&mut br) {
+            Ok(st) => st,
+            Err(e) => return Err(body_res.err().unwrap_or(e)),
+        };
+        let mut data = Vec::new();
+        read_all(&mut br, &mut data)?;
+        let v: Value = serde_json::from_slice(&data)
+            .map_err(|e| AppError::internal(format!("响应不是有效 JSON: {e}")))?;
+        if status != 200 {
+            return Err(http::remote_error(&v, status));
+        }
+        body_res?;
+        Ok(v)
+    }
+
+    /// 流式下载：返回定位在响应体开头的读取器。
+    pub fn download(
+        &self,
+        path: &str,
+        body: &Value,
+        timeout: Duration,
+    ) -> Result<BufReader<Stream>> {
+        let (status, mut br) = self.send(path, body, timeout)?;
+        if status != 200 {
+            let mut data = Vec::new();
+            read_all(&mut br, &mut data)?;
+            let v: Value = serde_json::from_slice(&data).unwrap_or(Value::Null);
+            return Err(http::remote_error(&v, status));
+        }
+        Ok(br)
     }
 }
 

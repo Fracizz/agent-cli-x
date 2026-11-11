@@ -4,6 +4,8 @@ pub mod audit;
 mod backup;
 mod exec;
 mod fs;
+mod jobs;
+pub mod transfer;
 pub mod workspace;
 
 use crate::config::{self, Config};
@@ -27,8 +29,11 @@ pub struct State {
     pub ws: Workspaces,
     pub home: PathBuf,
     pub audit: audit::Audit,
+    pub jobs: jobs::Jobs,
     active: AtomicUsize,
 }
+
+type Conn = BufReader<StreamOwned<ServerConnection, TcpStream>>;
 
 pub struct Ctx {
     pub st: Arc<State>,
@@ -36,6 +41,7 @@ pub struct Ctx {
 }
 
 pub fn serve(home: &Path) -> Result<()> {
+    config::ensure_node_id(home)?;
     let cfg = config::load_config(home)?;
     let ws = Workspaces::new(&cfg, home)?;
     let (tls_cfg, fp) = tls::server_config(home)?;
@@ -44,6 +50,11 @@ pub fn serve(home: &Path) -> Result<()> {
         .map_err(|e| AppError::io(format!("监听 {} 失败: {e}", cfg.listen)))?;
 
     eprintln!("agent-cli-x {} 服务已启动", http::VERSION);
+    eprintln!(
+        "  机器:   {} ({})",
+        cfg.node_name(),
+        cfg.node_id.as_deref().unwrap_or("-")
+    );
     eprintln!("  监听:   {}", cfg.listen);
     eprintln!("  指纹:   {fp}");
     eprintln!("  shell:  {}", platform::default_shell().name());
@@ -64,6 +75,7 @@ pub fn serve(home: &Path) -> Result<()> {
 
     let st = Arc::new(State {
         audit: audit::Audit::new(home.join("audit")),
+        jobs: jobs::Jobs::new(home.join("jobs")),
         home: home.to_path_buf(),
         cfg,
         ws,
@@ -96,27 +108,31 @@ fn handle_conn(st: Arc<State>, tls_cfg: Arc<ServerConfig>, tcp: TcpStream) {
     let Ok(conn) = ServerConnection::new(tls_cfg) else {
         return;
     };
-    let mut s = StreamOwned::new(conn, tcp);
+    let mut conn: Conn = BufReader::new(StreamOwned::new(conn, tcp));
 
     let n = st.active.fetch_add(1, Ordering::SeqCst) + 1;
     let _guard = ActiveGuard(&st.active);
     let max_body = (st.cfg.policy.max_write_kb as usize * 1024) * 6 + 64 * 1024;
-    let req = {
-        let mut br = BufReader::new(&mut s);
-        http::read_request(&mut br, max_body)
-    };
+    // put 的请求体是大文件流，由 transfer::put 边读边写；其余接口一次读完
+    let req = http::read_request_head(&mut conn).and_then(|mut req| {
+        if req.path != "/v1/fs/put" {
+            req.body = http::read_body(&mut conn, req.content_length, max_body)?;
+        }
+        Ok(req)
+    });
     match req {
         Err(e) => {
-            let _ = http::write_error(&mut s, &e);
+            let _ = http::write_error(conn.get_mut(), &e);
         }
         Ok(_) if n > MAX_CONNECTIONS => {
             let _ = http::write_error(
-                &mut s,
+                conn.get_mut(),
                 &AppError::new("busy", "服务端并发连接已满，请稍后重试"),
             );
         }
-        Ok(req) => dispatch(&st, ip, req, &mut s),
+        Ok(req) => dispatch(&st, ip, req, &mut conn),
     }
+    let s = conn.get_mut();
     s.conn.send_close_notify();
     let _ = s.flush();
 }
@@ -129,14 +145,23 @@ fn authorized(st: &State, req: &http::Request) -> bool {
     util::ct_eq(got.as_bytes(), st.cfg.token.as_bytes())
 }
 
-fn dispatch<W: Write>(st: &Arc<State>, ip: String, req: http::Request, w: &mut W) {
+fn dispatch(st: &Arc<State>, ip: String, req: http::Request, conn: &mut Conn) {
     if !authorized(st, &req) {
         st.audit
             .log(&ip, "auth_fail", false, json!({"path": req.path}));
         thread::sleep(Duration::from_millis(300));
-        let _ = http::write_error(w, &AppError::auth("token 无效"));
+        let _ = http::write_error(conn.get_mut(), &AppError::auth("token 无效"));
         return;
     }
+    let ctx = Ctx {
+        st: Arc::clone(st),
+        ip,
+    };
+    if req.path == "/v1/fs/put" {
+        transfer::put(&ctx, req.content_length, conn);
+        return;
+    }
+    let w = conn.get_mut();
     let body: Value = if req.body.is_empty() {
         json!({})
     } else {
@@ -148,10 +173,6 @@ fn dispatch<W: Write>(st: &Arc<State>, ip: String, req: http::Request, w: &mut W
             }
         }
     };
-    let ctx = Ctx {
-        st: Arc::clone(st),
-        ip,
-    };
     let result = match req.path.as_str() {
         "/v1/info" => Ok(info(&ctx)),
         "/v1/exec" => {
@@ -162,6 +183,18 @@ fn dispatch<W: Write>(st: &Arc<State>, ip: String, req: http::Request, w: &mut W
         "/v1/fs/read" => fs::read(&ctx, body),
         "/v1/fs/write" => fs::write(&ctx, body),
         "/v1/fs/edit" => fs::edit(&ctx, body),
+        "/v1/fs/grep" => fs::grep(&ctx, body),
+        "/v1/fs/get" => {
+            transfer::get(&ctx, body, w);
+            return;
+        }
+        "/v1/jobs/start" => jobs::start(&ctx, body),
+        "/v1/jobs/list" => jobs::list(&ctx, body),
+        "/v1/jobs/kill" => jobs::kill(&ctx, body),
+        "/v1/jobs/log" => {
+            jobs::log(&ctx, body, w);
+            return;
+        }
         "/v1/rollback" => backup::rollback(&ctx, body),
         other => Err(AppError::not_found(format!("未知接口 {other}"))),
     };
@@ -189,6 +222,8 @@ fn info(ctx: &Ctx) -> Value {
         .map(|(n, p)| json!({"name": n, "path": p.to_string_lossy()}))
         .collect();
     json!({
+        "node_name": ctx.st.cfg.node_name(),
+        "node_id": ctx.st.cfg.node_id,
         "version": http::VERSION,
         "hostname": platform::hostname(),
         "os": std::env::consts::OS,

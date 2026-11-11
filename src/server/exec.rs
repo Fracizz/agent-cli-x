@@ -28,8 +28,8 @@ struct ExecReq {
 }
 
 /// 主进程退出后，等待后台孙进程释放输出管道的最长时间。
-const DRAIN_AFTER_EXIT: Duration = Duration::from_secs(2);
-const POLL: Duration = Duration::from_millis(200);
+pub(super) const DRAIN_AFTER_EXIT: Duration = Duration::from_secs(2);
+pub(super) const POLL: Duration = Duration::from_millis(200);
 
 fn collapse_lower(s: &str) -> String {
     s.split_whitespace()
@@ -66,15 +66,21 @@ pub fn denied_command(cmd: &str, rules: &[String]) -> Option<String> {
     None
 }
 
-struct Prepared {
-    cmd: String,
-    cwd_display: String,
-    shell: Shell,
-    timeout: Duration,
-    command: Command,
+pub(super) struct Prepared {
+    pub cmd: String,
+    pub cwd_display: String,
+    pub shell: Shell,
+    pub timeout: Duration,
+    pub command: Command,
 }
 
-fn prepare(ctx: &Ctx, body: Value) -> Result<Prepared> {
+/// 校验并构造命令。前台 exec 与后台任务共用，超时默认值与上限由调用方给出。
+pub(super) fn prepare(
+    ctx: &Ctx,
+    body: Value,
+    default_timeout: u64,
+    max_timeout: u64,
+) -> Result<Prepared> {
     let req: ExecReq = serde_json::from_value(body)
         .map_err(|e| AppError::bad_request(format!("参数错误: {e}")))?;
     if req.cmd.trim().is_empty() {
@@ -100,8 +106,8 @@ fn prepare(ctx: &Ctx, body: Value) -> Result<Prepared> {
     let shell = Shell::parse(req.shell.as_deref())?;
     let timeout = req
         .timeout_secs
-        .unwrap_or(policy.default_timeout_secs)
-        .clamp(1, policy.max_timeout_secs.max(1));
+        .unwrap_or(default_timeout)
+        .clamp(1, max_timeout.max(1));
     let mut command = platform::build_command(shell, &req.cmd)?;
     command
         .current_dir(&cwd.abs)
@@ -130,7 +136,7 @@ fn prepare(ctx: &Ctx, body: Value) -> Result<Prepared> {
     })
 }
 
-fn spawn_reader<R: Read + Send + 'static>(
+pub(super) fn spawn_reader<R: Read + Send + 'static>(
     mut r: R,
     kind: u8,
     tx: mpsc::Sender<(u8, Option<Vec<u8>>)>,
@@ -170,7 +176,13 @@ fn send_text<W: Write>(w: &mut W, kind: u8, text: String) -> std::io::Result<()>
 
 pub fn run<W: Write>(ctx: &Ctx, body: Value, w: &mut W) {
     let started = Instant::now();
-    let mut p = match prepare(ctx, body) {
+    let policy = &ctx.st.cfg.policy;
+    let mut p = match prepare(
+        ctx,
+        body,
+        policy.default_timeout_secs,
+        policy.max_timeout_secs,
+    ) {
         Ok(p) => p,
         Err(e) => {
             ctx.st
@@ -284,7 +296,7 @@ pub fn run<W: Write>(ctx: &Ctx, body: Value, w: &mut W) {
     );
 }
 
-fn exit_code(s: std::process::ExitStatus) -> i32 {
+pub(super) fn exit_code(s: std::process::ExitStatus) -> i32 {
     if let Some(c) = s.code() {
         return c;
     }
