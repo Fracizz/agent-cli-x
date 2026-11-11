@@ -110,7 +110,7 @@ fn ps_command(shell: Shell) -> Command {
 }
 
 /// 所有子进程共用的创建参数：Windows 不弹窗口，Unix 独立进程组（超时可一次杀掉整棵进程树）。
-fn apply_spawn_flags(c: &mut Command) {
+pub fn apply_spawn_flags(c: &mut Command) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

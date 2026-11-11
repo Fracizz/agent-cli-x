@@ -2,6 +2,7 @@ mod cli;
 mod client;
 mod config;
 mod decode;
+mod doctor;
 mod error;
 mod frame;
 mod http;

@@ -348,6 +348,82 @@ pub fn save_peers(home: &Path, peers: &Peers) -> Result<()> {
     Ok(())
 }
 
+// ---------------- tokens.toml ----------------
+
+/// config.toml 里 `token` 的名称；`tokens.toml` 中不能使用。
+pub const DEFAULT_TOKEN_NAME: &str = "default";
+
+/// 按调用方分别签发的 token（`agent-cli-x token add`）。只保存 sha256，不保存明文。
+#[derive(Serialize, Deserialize, Default)]
+pub struct Tokens {
+    #[serde(default)]
+    pub tokens: BTreeMap<String, TokenEntry>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TokenEntry {
+    pub sha256: String,
+    #[serde(default)]
+    pub created: String,
+}
+
+pub fn tokens_path(home: &Path) -> PathBuf {
+    home.join("tokens.toml")
+}
+
+pub fn load_tokens(home: &Path) -> Result<Tokens> {
+    let p = tokens_path(home);
+    match fs::read_to_string(&p) {
+        Ok(t) => toml::from_str(&t)
+            .map_err(|e| AppError::config(format!("解析 {} 失败: {e}", p.display()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Tokens::default()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub fn save_tokens(home: &Path, tokens: &Tokens) -> Result<()> {
+    fs::create_dir_all(home)?;
+    let p = tokens_path(home);
+    let body = toml::to_string(tokens).map_err(|e| AppError::internal(e.to_string()))?;
+    let text = format!(
+        "# 由 `agent-cli-x token add/remove/rotate` 维护：按调用方签发的访问令牌（只存 sha256）。\n\
+# serve 运行中修改也会在几秒内生效，无需重启。\n\n{body}"
+    );
+    crate::util::atomic_write(&p, text.as_bytes())?;
+    crate::util::restrict_permissions(&p);
+    Ok(())
+}
+
+/// 只读取 config.toml 里的 token（serve 热加载用，不做完整校验）。
+pub fn read_config_token(home: &Path) -> Option<String> {
+    let text = fs::read_to_string(config_path(home)).ok()?;
+    let v: toml::Value = toml::from_str(&text).ok()?;
+    v.get("token")?
+        .as_str()
+        .filter(|t| t.len() >= 16)
+        .map(|s| s.to_string())
+}
+
+/// 替换 config.toml 中顶层 `token = ...` 这一行，保留其余内容与注释。
+pub fn replace_config_token(home: &Path, token: &str) -> Result<()> {
+    let p = config_path(home);
+    let text = fs::read_to_string(&p)?;
+    let re = regex::Regex::new(r"(?m)^token\s*=.*$").expect("静态正则");
+    if !re.is_match(&text) {
+        return Err(AppError::config(format!(
+            "{} 中没有找到 `token = ...` 行",
+            p.display()
+        )));
+    }
+    let new_line = format!("token = {}", toml_str(token));
+    let out = re
+        .replacen(&text, 1, regex::NoExpand(&new_line))
+        .to_string();
+    crate::util::atomic_write(&p, out.as_bytes())?;
+    crate::util::restrict_permissions(&p);
+    Ok(())
+}
+
 /// `10.0.0.5` → `10.0.0.5:47821`
 pub fn normalize_addr(addr: &str) -> String {
     let a = addr.trim();

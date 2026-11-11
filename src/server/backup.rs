@@ -177,6 +177,7 @@ pub fn rollback(ctx: &Ctx, body: Value) -> Result<Value> {
     }
     ctx.st.audit.log(
         &ctx.ip,
+        &ctx.caller,
         "rollback",
         true,
         json!({"op_id": req.op_id, "files": files.len()}),

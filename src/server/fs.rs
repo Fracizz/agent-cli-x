@@ -82,6 +82,7 @@ pub fn ls(ctx: &Ctx, body: Value) -> Result<Value> {
     entries.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
     ctx.st.audit.log(
         &ctx.ip,
+        &ctx.caller,
         "ls",
         true,
         json!({"path": r.display(), "count": entries.len()}),
@@ -203,6 +204,7 @@ pub fn grep(ctx: &Ctx, body: Value) -> Result<Value> {
     }
     ctx.st.audit.log(
         &ctx.ip,
+        &ctx.caller,
         "grep",
         true,
         json!({"path": r.display(), "pattern": req.pattern, "matches": matches.len()}),
@@ -288,6 +290,7 @@ pub fn read(ctx: &Ctx, body: Value) -> Result<Value> {
     let sha = full_scan.then(|| util::hex(hasher.finish().as_ref()));
     ctx.st.audit.log(
         &ctx.ip,
+        &ctx.caller,
         "read",
         true,
         json!({"path": r.display(), "bytes": content.len()}),
@@ -366,6 +369,7 @@ pub fn write(ctx: &Ctx, body: Value) -> Result<Value> {
     let sha = util::sha256_hex(req.content.as_bytes());
     ctx.st.audit.log(
         &ctx.ip,
+        &ctx.caller,
         "write",
         true,
         json!({"path": r.display(), "op_id": op_id, "bytes": req.content.len()}),
@@ -472,6 +476,7 @@ pub fn edit(ctx: &Ctx, body: Value) -> Result<Value> {
     let sha = util::sha256_hex(&data);
     ctx.st.audit.log(
         &ctx.ip,
+        &ctx.caller,
         "edit",
         true,
         json!({"path": r.display(), "op_id": op_id, "replacements": out.replacements}),

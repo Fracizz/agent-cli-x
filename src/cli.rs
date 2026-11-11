@@ -1,9 +1,9 @@
 //! 命令行入口。
 
-use crate::client::{self, output::ExecOutput, Client};
-use crate::config::{self, Peer};
+use crate::client::{self, multi, output::ExecOutput, Client};
+use crate::config::{self, Peer, TokenEntry, DEFAULT_TOKEN_NAME};
 use crate::error::{AppError, Result};
-use crate::{server, tls, util};
+use crate::{doctor, http, server, tls, util};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -48,10 +48,37 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
-    /// 前台运行服务端
-    Serve,
+    /// 前台运行服务端（日志同时写入 ~/.agent-cli-x/serve-logs/）
+    Serve {
+        /// 端口被占用时最多等待的秒数（升级重启时新进程等待旧进程退出）
+        #[arg(long, hide = true, default_value_t = 0)]
+        wait_port: u64,
+    },
     /// 显示本机的名称、ID、指纹与工作区（不联网）
-    Whoami,
+    Whoami {
+        /// 同时打印供其他机器登记本机的 `peer add` 命令（含默认 token）
+        #[arg(long)]
+        pair: bool,
+    },
+    /// 自检：配置、本机服务、开机自启、防火墙、各对端连通性与版本
+    Doctor {
+        /// 不检查对端
+        #[arg(long)]
+        no_peers: bool,
+    },
+    /// 管理访问本机的 token（按调用方分别签发，可单独吊销）
+    #[command(subcommand)]
+    Token(TokenCmd),
+    /// 远程升级对端：上传新二进制并重启对端服务（对端可写 A,B 或 @all）
+    Upgrade {
+        peer: String,
+        /// 要部署的二进制，默认用本机正在运行的这个（对端系统/架构需相同）
+        #[arg(long)]
+        binary: Option<PathBuf>,
+        /// 对端有后台任务在运行时也强制升级（任务会被中断）
+        #[arg(long)]
+        force: bool,
+    },
     /// 打印本机证书指纹（供对端 peer add 核对）
     Fingerprint,
     /// 打印给 AI 阅读的用法说明
@@ -59,9 +86,9 @@ enum Cmd {
     /// 管理对端节点
     #[command(subcommand)]
     Peer(PeerCmd),
-    /// 查看对端信息（机器名/ID、系统、shell、工作区、黑名单）
+    /// 查看对端信息（机器名/ID、系统、shell、工作区、黑名单）；A,B 或 @all 时显示概览
     Info { peer: String },
-    /// 在对端执行命令（选项写在命令之前）
+    /// 在对端执行命令（选项写在命令之前）；对端写 A,B 或 @all 时并行执行并分组输出
     Exec {
         peer: String,
         /// 工作目录（工作区:相对路径），默认是对端的默认工作区根目录
@@ -205,6 +232,18 @@ enum PeerCmd {
 }
 
 #[derive(Subcommand)]
+enum TokenCmd {
+    /// 为一个调用方签发 token，并打印对方需要执行的 `peer add` 命令
+    Add { name: String },
+    /// 列出已签发的 token（只显示名称与创建时间）
+    List,
+    /// 吊销一个调用方的 token（serve 运行中几秒内生效）
+    Remove { name: String },
+    /// 更换 token（名称为 default 时更换 config.toml 中的默认 token）
+    Rotate { name: String },
+}
+
+#[derive(Subcommand)]
 enum JobCmd {
     /// 列出最近的后台任务
     List {
@@ -236,8 +275,15 @@ pub fn run() -> Result<i32> {
             workspaces,
             force,
         } => init(name, &listen, &workspaces, force, json),
-        Cmd::Serve => server::serve(&config::home_dir()).map(|_| 0),
-        Cmd::Whoami => whoami(json),
+        Cmd::Serve { wait_port } => server::serve(&config::home_dir(), wait_port).map(|_| 0),
+        Cmd::Whoami { pair } => whoami(pair, json),
+        Cmd::Doctor { no_peers } => doctor::run(json, !no_peers),
+        Cmd::Token(t) => token(t, json),
+        Cmd::Upgrade {
+            peer,
+            binary,
+            force,
+        } => upgrade(&peer, binary, force, json),
         Cmd::Fingerprint => {
             let fp = tls::local_fingerprint(&config::home_dir())?;
             if json {
@@ -252,6 +298,9 @@ pub fn run() -> Result<i32> {
             Ok(0)
         }
         Cmd::Peer(p) => peer(p, json),
+        Cmd::Info { peer } if multi::is_multi(&peer) => {
+            Ok(multi::info_many(&multi::resolve(&peer)?, json))
+        }
         Cmd::Info { peer } => {
             let v = Client::load(&peer)?.call("/v1/info", &json!({}), CALL_TIMEOUT)?;
             if json {
@@ -272,6 +321,13 @@ pub fn run() -> Result<i32> {
             command,
         } => {
             let body = exec_body(cwd, shell, timeout, envs, command.join(" "))?;
+            if multi::is_multi(&peer) {
+                if detach {
+                    return Err(AppError::bad_request("--detach 一次只能用于一个对端"));
+                }
+                let peers = multi::resolve(&peer)?;
+                return Ok(multi::exec_many(&peers, &body, timeout, full, json));
+            }
             if detach {
                 start_job(&peer, &body, json)
             } else {
@@ -523,7 +579,9 @@ fn init(
     println!("下一步:");
     println!("  1. 编辑配置，在 [workspaces] 中登记允许访问的目录、按需调整 deny_paths 黑名单");
     println!("  2. 运行 `agent-cli-x serve`");
-    println!("  3. 在对端执行: agent-cli-x peer add {node_name} <本机IP>:{port} --token {token} --fingerprint {fp}");
+    println!("  3. 在要访问本机的机器上执行（为每个调用方单独签发 token 可用 `agent-cli-x token add <名称>`）:");
+    println!("     {}", pair_command(&node_name, listen, &token, &fp));
+    println!("  4. 配置开机自启（见 README「Start at boot」），完成后用 `agent-cli-x doctor` 自检");
     if cfg!(windows) {
         println!("  防火墙（管理员 PowerShell 执行一次）:");
         println!("     netsh advfirewall firewall add rule name=\"agent-cli-x\" dir=in action=allow protocol=TCP localport={port}");
@@ -533,7 +591,18 @@ fn init(
     Ok(0)
 }
 
-fn whoami(json: bool) -> Result<i32> {
+/// 其他机器登记本机所需的 `peer add` 命令。监听全部网卡时用本机主 IP。
+fn pair_command(node_name: &str, listen: &str, token: &str, fp: &str) -> String {
+    let port = listen.rsplit(':').next().unwrap_or_default();
+    let host = listen[..listen.len() - port.len()].trim_end_matches(':');
+    let ip = match host {
+        "" | "0.0.0.0" | "[::]" => util::local_ip().unwrap_or_else(|| "<本机IP>".into()),
+        h => h.to_string(),
+    };
+    format!("agent-cli-x peer add {node_name} {ip}:{port} --token {token} --fingerprint {fp}")
+}
+
+fn whoami(pair: bool, json: bool) -> Result<i32> {
     let home = config::home_dir();
     config::ensure_node_id(&home)?;
     let cfg = config::load_config(&home)?;
@@ -546,6 +615,8 @@ fn whoami(json: bool) -> Result<i32> {
         "listen": cfg.listen,
         "fingerprint": fp,
         "workspaces": cfg.workspaces,
+        "version": http::VERSION,
+        "pair_command": pair.then(|| pair_command(&cfg.node_name(), &cfg.listen, &cfg.token, &fp)),
     });
     if json {
         println!("{v}");
@@ -562,8 +633,154 @@ fn whoami(json: bool) -> Result<i32> {
         for (n, p) in &cfg.workspaces {
             println!("  工作区 {n} = {p}");
         }
+        if pair {
+            println!("  在要访问本机的机器上执行:");
+            println!(
+                "    {}",
+                pair_command(&cfg.node_name(), &cfg.listen, &cfg.token, &fp)
+            );
+        }
     }
     Ok(0)
+}
+
+fn token(cmd: TokenCmd, json: bool) -> Result<i32> {
+    let home = config::home_dir();
+    let cfg = config::load_config(&home)?;
+    let fp = tls::local_fingerprint(&home)?;
+    let mut tokens = config::load_tokens(&home)?;
+    let issued = |name: &str, tok: &str, verb: &str| {
+        let cmd = pair_command(&cfg.node_name(), &cfg.listen, tok, &fp);
+        if json {
+            println!(
+                "{}",
+                json!({"name": name, "token": tok, "pair_command": cmd})
+            );
+        } else {
+            println!("已{verb} token `{name}`: {tok}");
+            println!("在调用方执行（token 只显示这一次）:");
+            println!("  {cmd}");
+        }
+    };
+    match cmd {
+        TokenCmd::Add { name } => {
+            config::validate_name(&name, "token")?;
+            if name == DEFAULT_TOKEN_NAME || tokens.tokens.contains_key(&name) {
+                return Err(AppError::conflict(format!(
+                    "token `{name}` 已存在，更换请用 `agent-cli-x token rotate {name}`"
+                )));
+            }
+            let tok = util::random_hex(24);
+            tokens.tokens.insert(
+                name.clone(),
+                TokenEntry {
+                    sha256: util::sha256_hex(tok.as_bytes()),
+                    created: util::now_iso(),
+                },
+            );
+            config::save_tokens(&home, &tokens)?;
+            issued(&name, &tok, "签发");
+        }
+        TokenCmd::Rotate { name } => {
+            let tok = util::random_hex(24);
+            if name == DEFAULT_TOKEN_NAME {
+                config::replace_config_token(&home, &tok)?;
+            } else {
+                let Some(e) = tokens.tokens.get_mut(&name) else {
+                    return Err(AppError::not_found(format!("没有名为 `{name}` 的 token")));
+                };
+                e.sha256 = util::sha256_hex(tok.as_bytes());
+                e.created = util::now_iso();
+                config::save_tokens(&home, &tokens)?;
+            }
+            issued(&name, &tok, "更换");
+            if !json {
+                println!("旧 token 已作废（运行中的 serve 几秒内生效），用旧 token 登记的调用方需重新 peer add");
+            }
+        }
+        TokenCmd::Remove { name } => {
+            if name == DEFAULT_TOKEN_NAME {
+                return Err(AppError::bad_request(
+                    "默认 token 不能删除，可用 `agent-cli-x token rotate default` 更换",
+                ));
+            }
+            if tokens.tokens.remove(&name).is_none() {
+                return Err(AppError::not_found(format!("没有名为 `{name}` 的 token")));
+            }
+            config::save_tokens(&home, &tokens)?;
+            if json {
+                println!("{}", json!({"removed": name}));
+            } else {
+                println!("已吊销 token `{name}`（运行中的 serve 几秒内生效）");
+            }
+        }
+        TokenCmd::List => {
+            if json {
+                let list: Vec<Value> =
+                    std::iter::once(json!({"name": DEFAULT_TOKEN_NAME, "created": null}))
+                        .chain(
+                            tokens
+                                .tokens
+                                .iter()
+                                .map(|(n, e)| json!({"name": n, "created": e.created})),
+                        )
+                        .collect();
+                println!("{}", Value::Array(list));
+            } else {
+                println!("{DEFAULT_TOKEN_NAME}\t(config.toml)");
+                for (n, e) in &tokens.tokens {
+                    println!("{n}\t{}", e.created);
+                }
+            }
+        }
+    }
+    Ok(0)
+}
+
+fn upgrade(spec: &str, binary: Option<PathBuf>, force: bool, json: bool) -> Result<i32> {
+    client::disable_version_warning();
+    let peers = multi::resolve(spec)?;
+    let mut results = Vec::new();
+    let mut code = 0;
+    // 逐台升级：出问题时影响面最小，也便于看清是哪一台失败
+    for p in &peers {
+        if !json {
+            eprintln!("[agent-cli-x: 正在升级 {p} …]");
+        }
+        let r =
+            Client::load(p).and_then(|c| client::upgrade::upgrade(&c, binary.as_deref(), force));
+        match r {
+            Ok(v) => {
+                if !json {
+                    println!(
+                        "{p}: {} → {}（{}，用时 {:.1}s）",
+                        v["old_version"].as_str().unwrap_or("?"),
+                        v["new_version"].as_str().unwrap_or("?"),
+                        if v["restart"] == "exit" {
+                            "由服务管理器重启"
+                        } else {
+                            "已自动重启"
+                        },
+                        v["ms"].as_u64().unwrap_or(0) as f64 / 1000.0
+                    );
+                }
+                results.push(v);
+            }
+            Err(e) => {
+                if code == 0 {
+                    code = e.exit_code();
+                }
+                if !json {
+                    println!("{p}: 升级失败 {e}");
+                }
+                results.push(json!({"peer": p, "error": http::error_json(&e)}));
+            }
+        }
+    }
+    if json {
+        println!("{}", json!({"exit_code": code, "results": results}));
+    }
+    Ok(code)
 }
 
 fn peer(cmd: PeerCmd, json: bool) -> Result<i32> {
@@ -595,7 +812,8 @@ fn peer(cmd: PeerCmd, json: bool) -> Result<i32> {
                 node_name: None,
                 node_id: None,
             };
-            let info = Client::from_peer(p.clone()).call("/v1/info", &json!({}), CALL_TIMEOUT)?;
+            let info =
+                Client::from_peer(&name, p.clone()).call("/v1/info", &json!({}), CALL_TIMEOUT)?;
             p.node_name = info["node_name"].as_str().map(|s| s.to_string());
             p.node_id = info["node_id"].as_str().map(|s| s.to_string());
             let mut peers = config::load_peers(&home)?;
@@ -880,12 +1098,17 @@ fn print_info(name: &str, v: &Value) {
         v["node_name"].as_str().unwrap_or("?"),
         v["node_id"].as_str().unwrap_or("-")
     );
+    let ver = v["version"].as_str().unwrap_or("?");
     println!(
-        "  主机 {}  {}/{}  agent-cli-x {}  默认 shell: {}",
+        "  主机 {}  {}/{}  agent-cli-x {ver}{}  默认 shell: {}",
         v["hostname"].as_str().unwrap_or("?"),
         v["os"].as_str().unwrap_or("?"),
         v["arch"].as_str().unwrap_or("?"),
-        v["version"].as_str().unwrap_or("?"),
+        if ver != http::VERSION {
+            format!("（本机 {}，可用 upgrade 统一）", http::VERSION)
+        } else {
+            String::new()
+        },
         v["shell"].as_str().unwrap_or("?")
     );
     let def = v["default_workspace"].as_str();

@@ -166,6 +166,14 @@ pub fn prune_older_than(dir: &Path, days: u64) {
     }
 }
 
+/// 本机对外的主 IP：对公网地址做一次 UDP connect 让系统选路（不会发出任何数据包）。
+pub fn local_ip() -> Option<String> {
+    let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    s.connect("8.8.8.8:80").ok()?;
+    let ip = s.local_addr().ok()?.ip();
+    (!ip.is_unspecified() && !ip.is_loopback()).then(|| ip.to_string())
+}
+
 /// 仅当前用户可读写（Unix）。Windows 上用户目录本身已有 ACL 隔离。
 pub fn restrict_permissions(_path: &Path) {
     #[cfg(unix)]

@@ -21,8 +21,9 @@ impl Audit {
         }
     }
 
-    pub fn log(&self, ip: &str, op: &str, ok: bool, detail: Value) {
-        let line = json!({"ts": util::now_iso(), "ip": ip, "op": op, "ok": ok, "detail": detail});
+    /// `caller` 是通过鉴权的 token 名称（默认 token 为 `default`，鉴权失败为空）。
+    pub fn log(&self, ip: &str, caller: &str, op: &str, ok: bool, detail: Value) {
+        let line = json!({"ts": util::now_iso(), "ip": ip, "caller": caller, "op": op, "ok": ok, "detail": detail});
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let path = self.dir.join(format!("{}.jsonl", util::today()));
         if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {

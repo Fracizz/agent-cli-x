@@ -78,6 +78,11 @@ impl Jobs {
             .get(id)
             .cloned()
     }
+
+    /// 正在运行的后台任务数。
+    pub fn running_count(&self) -> usize {
+        self.running.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
 }
 
 #[derive(Deserialize)]
@@ -128,6 +133,7 @@ pub fn start(ctx: &Ctx, body: Value) -> Result<Value> {
         .insert(id.clone(), Arc::clone(&flag));
     ctx.st.audit.log(
         &ctx.ip,
+        &ctx.caller,
         "job_start",
         true,
         json!({"id": id, "cmd": p.cmd, "cwd": p.cwd_display}),
@@ -135,6 +141,7 @@ pub fn start(ctx: &Ctx, body: Value) -> Result<Value> {
 
     let st = Arc::clone(&ctx.st);
     let ip = ctx.ip.clone();
+    let caller = ctx.caller.clone();
     let job_id = id.clone();
     let timeout = p.timeout;
     thread::spawn(move || {
@@ -226,6 +233,7 @@ pub fn start(ctx: &Ctx, body: Value) -> Result<Value> {
             .remove(&job_id);
         st.audit.log(
             &ip,
+            &caller,
             "job_end",
             outcome == "exited" && code == 0,
             json!({"id": job_id, "status": outcome, "code": code}),
@@ -268,9 +276,13 @@ pub fn kill(ctx: &Ctx, body: Value) -> Result<Value> {
     match ctx.st.jobs.running_flag(&req.id) {
         Some(flag) => {
             flag.store(true, Ordering::SeqCst);
-            ctx.st
-                .audit
-                .log(&ctx.ip, "job_kill", true, json!({"id": req.id}));
+            ctx.st.audit.log(
+                &ctx.ip,
+                &ctx.caller,
+                "job_kill",
+                true,
+                json!({"id": req.id}),
+            );
             // 等任务线程真正终止进程并写回状态，避免紧接着的 job logs / list 仍显示 running
             let deadline = Instant::now() + KILL_WAIT;
             while ctx.st.jobs.running_flag(&req.id).is_some() && Instant::now() < deadline {

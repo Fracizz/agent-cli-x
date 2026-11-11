@@ -11,6 +11,7 @@ Machine B: Codex       ──> agent-cli-x ──TLS──> Machine A: agent-cli
 - **Lightweight.** Synchronous std + rustls, no async runtime, no OpenSSL. Short-lived HTTPS request per call.
 - **Machine identity.** Every node has a configurable `node_name` and a random `node_id` (UUID), so agents know exactly which machine they are talking to.
 - **Built for agents.** Exit codes pass through, long output is trimmed to head/tail with the full log saved locally, `--json` everywhere, exact-match `edit`, `rollback`.
+- **Many machines.** Run one command on several peers at once (`exec A,B,C` / `@all`), issue a separate revocable token per caller, push upgrades remotely, and check everything with `doctor`.
 - **Guard rails.** Token auth, self-signed TLS with fingerprint pinning, workspace allow-list, path deny-list, command deny-list, automatic backups, audit log.
 
 ## Install
@@ -37,15 +38,23 @@ agent-cli-x init --name build-01 --workspace proj=/home/me/proj   # prints node 
 agent-cli-x serve                                   # keep running; set up start at boot (see below)
 ```
 
-On the machine that wants to call B:
+`init` prints a ready-to-paste `peer add` command. To give each caller its own token instead, run on B:
 
 ```bash
-agent-cli-x peer add B 10.0.0.5 --token <B's token> --fingerprint <B's fingerprint>
+agent-cli-x token add A          # prints the exact `peer add` command for machine A
+```
+
+Then on the machine that wants to call B (A here):
+
+```bash
+agent-cli-x peer add B 10.0.0.5:47821 --token <token> --fingerprint <B's fingerprint>
 agent-cli-x info B
 agent-cli-x exec B cargo test
 ```
 
-Without `--fingerprint`, `peer add` only prints the fingerprint it sees. Compare it with `agent-cli-x fingerprint` on B before registering.
+Without `--fingerprint`, `peer add` only prints the fingerprint it sees. Compare it with `agent-cli-x fingerprint` on B before registering. `agent-cli-x whoami --pair` prints the command again later.
+
+Set up [start at boot](#start-at-boot-recommended) on every machine, then run `agent-cli-x doctor` to verify.
 
 Then teach your agent the tool: copy [`skills/agent-cli-x/SKILL.md`](skills/agent-cli-x/SKILL.md) into its skills folder (e.g. `~/.claude/skills/agent-cli-x/`), or run `agent-cli-x skill` to print it.
 
@@ -53,10 +62,13 @@ Then teach your agent the tool: copy [`skills/agent-cli-x/SKILL.md`](skills/agen
 
 | Command | Purpose |
 |---|---|
-| `init` / `serve` / `whoami` / `fingerprint` | set up, run and identify this machine |
+| `init` / `serve` / `whoami [--pair]` / `fingerprint` | set up, run and identify this machine |
+| `doctor [--no-peers]` | check config, local service, start at boot, firewall, peers and their versions |
+| `token add\|list\|remove\|rotate` | per-caller tokens for this machine (`rotate default` replaces the config token) |
 | `peer add\|list\|remove` | manage peers (`~/.agent-cli-x/peers.toml`) |
-| `info <peer>` | OS, shell, workspaces, deny rules |
-| `exec <peer> [--cwd] [--shell] [--timeout] [--env K=V] <cmd>` | run a command, streamed |
+| `info <peer>` | OS, shell, workspaces, deny rules; `info @all` is a one-line-per-peer overview |
+| `exec <peer> [--cwd] [--shell] [--timeout] [--env K=V] <cmd>` | run a command, streamed; `A,B` or `@all` runs on several peers in parallel |
+| `upgrade <peer> [--binary <file>] [--force]` | replace the peer's binary and restart its `serve` (`A,B` / `@all` allowed) |
 | `exec <peer> --detach <cmd>`, `job list\|logs\|kill` | background jobs (`job logs --follow` exits with the job's code) |
 | `ls` / `grep` / `read` / `write` / `edit` | file operations inside workspaces |
 | `put <peer> <local> <dest>` / `get <peer> <src> <local>` | transfer files or directories (`--exclude`) |
@@ -64,6 +76,19 @@ Then teach your agent the tool: copy [`skills/agent-cli-x/SKILL.md`](skills/agen
 | `skill` | print the agent guide |
 
 Paths use `workspace:relative/path`. See `agent-cli-x --help`.
+
+## Multiple machines
+
+Every machine runs `serve` and registers the others as peers, so A, B and C can all call each other. A full mesh of N machines needs N×(N−1) `peer add` commands. `token add <caller>` prints each one for you.
+
+- **One command, many peers.** `exec A,B,C <cmd>` or `exec @all <cmd>` runs in parallel and prints the output grouped by peer, followed by a summary line. The exit code is 0 when every peer succeeded, otherwise the first failing peer's code. `--json` returns one result per peer. `info @all` shows which peers are online, their versions and latency.
+- **Per-caller tokens.** `token add <name>` issues a token for one caller. `token remove <name>` revokes it without affecting the others, and `token rotate <name>` replaces it. Only the sha256 of these tokens is stored, in `~/.agent-cli-x/tokens.toml`. Changes take effect immediately, with no `serve` restart. The audit log records which token made each request (`"caller"`). The original `token` in `config.toml` remains valid under the name `default`.
+- **Version check.** Every response carries the server version. When a peer runs a different version, the client prints a one-time hint to run `agent-cli-x upgrade <peer>`.
+- **Remote upgrade.** `upgrade <peer>` uploads the local binary, or `--binary <file>` for a peer with a different OS or architecture. The peer checks the sha256, runs the new file's `--version`, swaps it into place, and restarts. The client waits until the new process answers. If background jobs are running, the upgrade is refused unless you pass `--force`. Peers on 0.0.2 or earlier have no upgrade endpoint and must be upgraded by hand once.
+  - Under **systemd**, `serve` exits with code 75 and the unit's `Restart=on-failure` brings it back.
+  - Everywhere else (Task Scheduler, a terminal, `nohup`), it starts the new `serve` detached and exits.
+  - Set `AGENT_CLI_X_RESTART=exit` to force the exit-and-restart behaviour for another supervisor.
+- **Not supported:** relaying through another machine (A → B → C) or automatic discovery. Every pair of machines must reach each other directly on the listen port.
 
 ## Configuration
 
@@ -103,13 +128,14 @@ prewarm_shells = 1         # idle PowerShell kept ready for exec; 0 = off
 Intended for machines you own on a trusted network.
 
 - Traffic is TLS. Clients pin the server certificate fingerprint; a changed fingerprint is a hard error (exit 106).
-- Access requires the peer's token (compared in constant time; failures are delayed and audited).
+- Access requires a token: the `default` one from `config.toml`, or a per-caller token from `token add`. Tokens are compared in constant time, and failures are delayed and audited.
 - File operations are confined to workspaces: canonicalized paths, no `..`, no absolute paths, no symlink/junction escapes, deny-list checked on every ancestor. The agent-cli-x data folder is always denied.
 - `deny_paths` applies to `ls`/`read`/`write`/`edit`/`rollback` and to the `exec` working directory. **A shell command itself cannot be sandboxed**: `exec "cat secrets/x"` can still read the file. For hard isolation, run `serve` as a dedicated low-privilege OS user and protect directories with file-system permissions.
 - `deny_commands` is a guard rail against accidents, not a security boundary.
 - `grep`, `get` and `ls` skip deny-listed paths; `put` refuses to write into them.
 - Background jobs run as the same user; their output lives in `~/.agent-cli-x/jobs/` (7 days). Jobs still running when `serve` restarts are marked `lost`.
-- Every write/edit/put is backed up to `~/.agent-cli-x/backup/` (7 days). All requests are logged to `~/.agent-cli-x/audit/YYYY-MM-DD.jsonl`.
+- Every write/edit/put is backed up to `~/.agent-cli-x/backup/` (7 days). All requests are logged to `~/.agent-cli-x/audit/YYYY-MM-DD.jsonl` with the client IP and token name.
+- `serve` writes its own log (startup, token reloads, upgrades, internal errors, panics) to `~/.agent-cli-x/serve-logs/` (7 days) as well as to stderr. When it runs at boot with no console, check this log first.
 
 ## Start at boot (recommended)
 
@@ -157,7 +183,7 @@ netsh advfirewall firewall add rule name="agent-cli-x" dir=in action=allow proto
 
 Why these settings: Task Scheduler's defaults stop a task after 3 days and skip or stop it on battery power. `S4U` runs it at boot without anyone logged in, with no console window and no stored password. The trade-off is that the task has no network credentials, so mapped drives and Credential Manager logins are unavailable to `exec`. If you need them, use `-AtLogOn` with `-LogonType Interactive` instead. That variant only starts after you log in and shows a console window, and closing the window stops `serve`.
 
-Check with `agent-cli-x info <peer>` from another machine after a reboot.
+After a reboot, run `agent-cli-x doctor` on the machine. On Windows it flags a task that will stop after 72 hours, a task that stops or won't start on battery, a task that launches a different binary path, and a missing firewall rule. On Linux it flags a unit that isn't enabled and linger that is off. Also run `agent-cli-x info <peer>` from another machine to confirm the peer can be reached.
 
 ## Exit codes
 

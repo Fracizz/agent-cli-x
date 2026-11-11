@@ -1,11 +1,14 @@
 //! 服务端：TLS 监听，每个连接一个线程、一个请求。
 
 pub mod audit;
+mod auth;
 mod backup;
 mod exec;
 mod fs;
 mod jobs;
+pub mod log;
 pub mod transfer;
+mod upgrade;
 mod warm;
 pub mod workspace;
 
@@ -20,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use workspace::Workspaces;
 
 const MAX_CONNECTIONS: usize = 64;
@@ -32,6 +35,9 @@ pub struct State {
     pub audit: audit::Audit,
     pub jobs: jobs::Jobs,
     pub warm: Arc<warm::WarmPool>,
+    pub auth: auth::Auth,
+    /// 本进程启动时间（info 返回，供 upgrade 判断服务是否已重启）。
+    pub started: String,
     active: AtomicUsize,
 }
 
@@ -40,48 +46,88 @@ type Conn = BufReader<StreamOwned<ServerConnection, TcpStream>>;
 pub struct Ctx {
     pub st: Arc<State>,
     pub ip: String,
+    /// 通过鉴权的 token 名称（默认 token 为 `default`）。
+    pub caller: String,
 }
 
-pub fn serve(home: &Path) -> Result<()> {
+/// 启动服务端。`wait_port_secs > 0` 时端口被占用会重试这么久（升级后新进程等待旧进程退出）。
+pub fn serve(home: &Path, wait_port_secs: u64) -> Result<()> {
+    log::init(home);
+    let r = serve_inner(home, wait_port_secs);
+    if let Err(e) = &r {
+        crate::slog!("serve 退出: {e}");
+    }
+    r
+}
+
+fn bind(listen: &str, wait_secs: u64) -> Result<TcpListener> {
+    let deadline = Instant::now() + Duration::from_secs(wait_secs);
+    loop {
+        match TcpListener::bind(listen) {
+            Ok(l) => return Ok(l),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(200));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                return Err(AppError::io(format!(
+                    "监听 {listen} 失败: 端口已被占用。可能已有一个 agent-cli-x serve 在运行（例如开机自启的那个），可用 `agent-cli-x doctor` 检查；或在 config.toml 中修改 listen"
+                )))
+            }
+            Err(e) => return Err(AppError::io(format!("监听 {listen} 失败: {e}"))),
+        }
+    }
+}
+
+fn serve_inner(home: &Path, wait_port_secs: u64) -> Result<()> {
     config::ensure_node_id(home)?;
     let cfg = config::load_config(home)?;
     let ws = Workspaces::new(&cfg, home)?;
     let (tls_cfg, fp) = tls::server_config(home)?;
     util::prune_older_than(&home.join("backup"), backup::RETAIN_DAYS);
-    let listener = TcpListener::bind(&cfg.listen)
-        .map_err(|e| AppError::io(format!("监听 {} 失败: {e}", cfg.listen)))?;
+    upgrade::cleanup_leftovers();
+    let listener = bind(&cfg.listen, wait_port_secs)?;
+    let auth = auth::Auth::new(home, &cfg.token);
 
-    eprintln!("agent-cli-x {} 服务已启动", http::VERSION);
-    eprintln!(
+    crate::slog!(
+        "agent-cli-x {} 服务已启动（pid {}）",
+        http::VERSION,
+        std::process::id()
+    );
+    crate::slog!(
         "  机器:   {} ({})",
         cfg.node_name(),
         cfg.node_id.as_deref().unwrap_or("-")
     );
-    eprintln!("  监听:   {}", cfg.listen);
-    eprintln!("  指纹:   {fp}");
+    crate::slog!("  监听:   {}", cfg.listen);
+    crate::slog!("  指纹:   {fp}");
     let shell = platform::default_shell();
     let warm = warm::WarmPool::new(shell, cfg.policy.prewarm_shells);
-    eprintln!("  shell:  {}", shell.name());
+    crate::slog!("  shell:  {}", shell.name());
     if warm.size() > 0 {
-        eprintln!(
+        crate::slog!(
             "  预热:   {} 个空闲 {}（policy.prewarm_shells）",
             warm.size(),
             shell.name()
         );
     }
     if shell == platform::Shell::PowerShell {
-        eprintln!("  提示:   未找到 pwsh，正在使用 Windows PowerShell 5.1（冷启动约 2 秒）；安装 PowerShell 7 可明显加快 exec");
+        crate::slog!("  提示:   未找到 pwsh，正在使用 Windows PowerShell 5.1（冷启动约 2 秒）；安装 PowerShell 7 可明显加快 exec");
     }
     if ws.is_empty() {
-        eprintln!(
+        crate::slog!(
             "  警告:   未配置任何工作区，对端无法访问文件或执行命令（编辑 {}）",
             config::config_path(home).display()
         );
     }
     for (n, p) in ws.list() {
-        eprintln!("  工作区: {n} = {}", p.display());
+        crate::slog!("  工作区: {n} = {}", p.display());
     }
-    eprintln!(
+    crate::slog!(
+        "  token:  默认 token + {} 个调用方 token",
+        auth.named_count()
+    );
+    crate::slog!("  日志:   {}", log::dir(home).display());
+    crate::slog!(
         "  黑名单: {} 条路径规则，{} 条命令规则",
         ws.deny_rules().len(),
         cfg.policy.deny_commands.len()
@@ -92,6 +138,8 @@ pub fn serve(home: &Path) -> Result<()> {
         jobs: jobs::Jobs::new(home.join("jobs")),
         warm: Arc::clone(&warm),
         home: home.to_path_buf(),
+        auth,
+        started: util::now_iso(),
         cfg,
         ws,
         active: AtomicUsize::new(0),
@@ -131,7 +179,7 @@ fn handle_conn(st: Arc<State>, tls_cfg: Arc<ServerConfig>, tcp: TcpStream) {
     let max_body = (st.cfg.policy.max_write_kb as usize * 1024) * 6 + 64 * 1024;
     // put 的请求体是大文件流，由 transfer::put 边读边写；其余接口一次读完
     let req = http::read_request_head(&mut conn).and_then(|mut req| {
-        if req.path != "/v1/fs/put" {
+        if !is_streaming_upload(&req.path) {
             req.body = http::read_body(&mut conn, req.content_length, max_body)?;
         }
         Ok(req)
@@ -153,29 +201,37 @@ fn handle_conn(st: Arc<State>, tls_cfg: Arc<ServerConfig>, tcp: TcpStream) {
     let _ = s.flush();
 }
 
-fn authorized(st: &State, req: &http::Request) -> bool {
+/// 请求体是大块二进制流、由处理函数边读边写的接口。
+fn is_streaming_upload(path: &str) -> bool {
+    matches!(path, "/v1/fs/put" | "/v1/upgrade")
+}
+
+/// 鉴权通过时返回调用方名称。
+fn authorize(st: &State, req: &http::Request) -> Option<String> {
     let got = req
         .header("authorization")
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or("");
-    util::ct_eq(got.as_bytes(), st.cfg.token.as_bytes())
+    st.auth.check(got)
 }
 
 fn dispatch(st: &Arc<State>, ip: String, req: http::Request, conn: &mut Conn) {
-    if !authorized(st, &req) {
+    let Some(caller) = authorize(st, &req) else {
         st.audit
-            .log(&ip, "auth_fail", false, json!({"path": req.path}));
+            .log(&ip, "", "auth_fail", false, json!({"path": req.path}));
         thread::sleep(Duration::from_millis(300));
         let _ = http::write_error(conn.get_mut(), &AppError::auth("token 无效"));
         return;
-    }
+    };
     let ctx = Ctx {
         st: Arc::clone(st),
         ip,
+        caller,
     };
-    if req.path == "/v1/fs/put" {
-        transfer::put(&ctx, req.content_length, conn);
-        return;
+    match req.path.as_str() {
+        "/v1/fs/put" => return transfer::put(&ctx, req.content_length, conn),
+        "/v1/upgrade" => return upgrade::handle(&ctx, req.content_length, conn),
+        _ => {}
     }
     let w = conn.get_mut();
     let body: Value = if req.body.is_empty() {
@@ -215,9 +271,13 @@ fn dispatch(st: &Arc<State>, ip: String, req: http::Request, conn: &mut Conn) {
         other => Err(AppError::not_found(format!("未知接口 {other}"))),
     };
     if let Err(e) = &result {
+        if e.code == "internal" {
+            crate::slog!("{} 内部错误: {}", req.path, e.message);
+        }
         if e.code == "policy_denied" {
             ctx.st.audit.log(
                 &ctx.ip,
+                &ctx.caller,
                 "denied",
                 false,
                 json!({"path": req.path, "error": e.message}),
@@ -241,6 +301,9 @@ fn info(ctx: &Ctx) -> Value {
         "node_name": ctx.st.cfg.node_name(),
         "node_id": ctx.st.cfg.node_id,
         "version": http::VERSION,
+        "pid": std::process::id(),
+        "started": ctx.st.started,
+        "running_jobs": ctx.st.jobs.running_count(),
         "hostname": platform::hostname(),
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,

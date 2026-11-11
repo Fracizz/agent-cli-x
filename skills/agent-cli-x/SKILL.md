@@ -14,6 +14,8 @@ Install the binary on `PATH` (see README) so it can be called as `agent-cli-x` f
 agent-cli-x whoami             # which machine am I (node name + id)
 agent-cli-x peer list          # registered peers with their node name + id
 agent-cli-x info <peer>        # node name/id, OS, default shell, workspaces, deny rules
+agent-cli-x info @all          # every peer: online?, version, latency
+agent-cli-x doctor             # local service, start at boot, firewall, peers
 ```
 
 Each machine has a `node_name` (human label) and a `node_id` (UUID). Use them to tell machines apart in your reasoning and reports; the peer alias in `peer list` is just a local nickname.
@@ -42,6 +44,9 @@ agent-cli-x write B proj:notes.md --content "..."      # or --from <local file>,
 agent-cli-x put B ./dist proj:web/dist --exclude node_modules   # upload file/dir (like cp -r)
 agent-cli-x get B proj:logs ./logs                     # download file/dir
 agent-cli-x rollback B <op_id>                         # undo a write/edit/put
+agent-cli-x exec B,C "git pull && cargo build"         # several peers in parallel, output grouped per peer
+agent-cli-x exec @all --json "uname -a"                # every registered peer; one result per peer
+agent-cli-x upgrade B                                  # push this binary to B and restart its serve
 ```
 
 Add `--json` to any command for machine-readable output.
@@ -58,6 +63,10 @@ Add `--json` to any command for machine-readable output.
 - Raise `--timeout` for long builds (capped by the peer). On timeout the whole process tree is killed (exit 104).
 - Anything longer than a few minutes (builds, test suites, servers): use `exec --detach`, then `job logs --follow`.
 - Prefer `grep` over `exec "grep ..."`: it respects .gitignore and deny rules and works the same on Windows.
+- Multi-peer `exec` (`A,B` / `@all`) exits 0 only if every peer succeeded; otherwise with the first failing peer's code. Read the per-peer headers and the summary line. `--detach` and file commands take a single peer.
+- A `版本不一致` hint means a peer runs a different version. Run `agent-cli-x upgrade <peer>`, or `--binary <file>` if its OS/arch differs from yours. An upgrade is refused while background jobs are running (exit 105). Only use `--force` if interrupting those jobs is acceptable.
+- If a peer is unreachable (exit 100), run `agent-cli-x doctor` here. On the peer itself, check `doctor` and `~/.agent-cli-x/serve-logs/`.
+- Setting up start at boot for `serve` on a machine you run on: follow README "Start at boot". On Windows, the scheduled task needs `ExecutionTimeLimit 0`, both battery options turned off, and restart on failure. On Linux, use a systemd user unit with `Restart=on-failure` plus `loginctl enable-linger`. Confirm with `agent-cli-x doctor` afterwards.
 - `put`/`get`: if the destination is an existing directory the source goes inside it; otherwise the destination is the new path. Overwritten files on the peer are backed up (`rollback <op_id>`); local files are overwritten by `get`.
 
 ## Exit codes

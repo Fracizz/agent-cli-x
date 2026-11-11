@@ -73,7 +73,9 @@ pub fn put<S: Read + Write>(ctx: &Ctx, len: u64, conn: &mut BufReader<S>) {
     match res {
         Ok(mut v) => {
             v["op_id"] = json!(op_id);
-            ctx.st.audit.log(&ctx.ip, "put", true, v.clone());
+            ctx.st
+                .audit
+                .log(&ctx.ip, &ctx.caller, "put", true, v.clone());
             let _ = http::write_json(w, 200, &v);
         }
         Err(mut e) => {
@@ -81,9 +83,13 @@ pub fn put<S: Read + Write>(ctx: &Ctx, len: u64, conn: &mut BufReader<S>) {
                 e.message
                     .push_str(&format!("（已写入的部分可用 rollback {id} 撤销）"));
             }
-            ctx.st
-                .audit
-                .log(&ctx.ip, "put", false, json!({"error": e.to_string()}));
+            ctx.st.audit.log(
+                &ctx.ip,
+                &ctx.caller,
+                "put",
+                false,
+                json!({"error": e.to_string()}),
+            );
             let _ = http::write_error(w, &e);
         }
     }
@@ -327,15 +333,20 @@ pub fn get<W: Write>(ctx: &Ctx, body: Value, w: &mut W) {
     match res {
         Ok((files, bytes)) => ctx.st.audit.log(
             &ctx.ip,
+            &ctx.caller,
             "get",
             true,
             json!({"files": files, "bytes": bytes, "name": name}),
         ),
         Err(e) => {
             let _ = frame::write_header(w, &http::error_json(&e));
-            ctx.st
-                .audit
-                .log(&ctx.ip, "get", false, json!({"error": e.to_string()}));
+            ctx.st.audit.log(
+                &ctx.ip,
+                &ctx.caller,
+                "get",
+                false,
+                json!({"error": e.to_string()}),
+            );
         }
     }
 }

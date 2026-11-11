@@ -12,6 +12,8 @@ struct Env {
     server_home: PathBuf,
     client_home: PathBuf,
     ws: PathBuf,
+    listen: String,
+    fp: String,
     _server: ServerGuard,
 }
 
@@ -55,6 +57,11 @@ fn free_port() -> u16 {
 }
 
 fn setup() -> Env {
+    setup_with(false)
+}
+
+/// `copy_bin` 为 true 时把二进制复制到临时目录再运行 serve（upgrade 测试会替换它）。
+fn setup_with(copy_bin: bool) -> Env {
     let base = std::env::temp_dir().join(format!(
         "agent-cli-x-e2e-{}-{}",
         std::process::id(),
@@ -92,9 +99,20 @@ fn setup() -> Env {
     let cfg = cfg.replacen("deny_paths = [", "deny_paths = [\n  \"secrets\",", 1);
     fs::write(&cfg_path, cfg).unwrap();
 
-    let child = Command::new(BIN)
+    let server_bin = if copy_bin {
+        let dir = base.join("bin");
+        fs::create_dir_all(&dir).unwrap();
+        let dst = dir.join(Path::new(BIN).file_name().unwrap());
+        fs::copy(BIN, &dst).unwrap();
+        dst
+    } else {
+        PathBuf::from(BIN)
+    };
+    let child = Command::new(&server_bin)
         .arg("serve")
         .env("AGENT_CLI_X_HOME", &server_home)
+        // CI 运行器本身可能在 systemd 下（带 INVOCATION_ID），强制用“自行拉起新进程”的重启方式
+        .env("AGENT_CLI_X_RESTART", "spawn")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -157,6 +175,8 @@ fn setup() -> Env {
         server_home,
         client_home,
         ws,
+        listen,
+        fp,
         _server: server,
     }
 }
@@ -550,4 +570,168 @@ fn identity_grep_transfer_jobs() {
     assert!(started.elapsed() < Duration::from_secs(20));
     let list = String::from_utf8_lossy(&run(c, &["job", "list", "b"]).stdout).to_string();
     assert!(list.contains(&id) && list.contains("killed"), "{list}");
+}
+
+fn json_of(o: &Output) -> serde_json::Value {
+    serde_json::from_slice(&o.stdout).unwrap_or_else(|e| panic!("不是 JSON（{e}）: {}", text(o)))
+}
+
+/// 反复执行直到退出码符合预期（等待 serve 热加载 token，最多 10 秒）。
+fn wait_code(home: &Path, args: &[&str], want: i32) -> Output {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let o = run(home, args);
+        if o.status.code() == Some(want) || Instant::now() > deadline {
+            return o;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+#[test]
+fn tokens_multi_peer_doctor() {
+    let env = setup();
+    let c = &env.client_home;
+    let s = &env.server_home;
+
+    // 配对命令
+    let o = run(s, &["whoami", "--pair"]);
+    assert!(text(&o).contains("peer add"), "{}", text(&o));
+
+    // 为调用方签发 token，用它登记第二个对端名
+    let o = run(s, &["token", "add", "caller1", "--json"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let tok = json_of(&o)["token"].as_str().unwrap().to_string();
+    assert_eq!(
+        run(s, &["token", "add", "caller1"]).status.code(),
+        Some(105)
+    );
+    let o = run(
+        c,
+        &[
+            "peer",
+            "add",
+            "b2",
+            &env.listen,
+            "--token",
+            &tok,
+            "--fingerprint",
+            &env.fp,
+        ],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    let o = run(c, &["exec", "b2", "echo via-caller1"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(run(c, &["exec", "b", "echo via-default"]).status.success());
+    // 审计日志记录调用方名称
+    let audit_dir = s.join("audit");
+    let audit: String = fs::read_dir(&audit_dir)
+        .unwrap()
+        .flatten()
+        .map(|e| fs::read_to_string(e.path()).unwrap())
+        .collect();
+    assert!(audit.contains("\"caller\":\"caller1\""), "{audit}");
+    assert!(audit.contains("\"caller\":\"default\""), "{audit}");
+
+    // 多对端 exec：并行执行、分组输出
+    let o = run(c, &["exec", "b,b2", "echo multi-ok"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let out = String::from_utf8_lossy(&o.stdout).to_string();
+    assert!(
+        out.contains("===== b ·") && out.contains("===== b2 ·"),
+        "{out}"
+    );
+    assert_eq!(out.matches("multi-ok").count(), 2, "{out}");
+    let o = run(c, &["exec", "@all", "exit 3"]);
+    assert_eq!(o.status.code(), Some(3), "{}", text(&o));
+    let o = run(c, &["exec", "@all", "--json", "echo j"]);
+    let v = json_of(&o);
+    assert_eq!(v["results"].as_array().unwrap().len(), 2, "{v}");
+    assert_eq!(
+        run(c, &["exec", "b,nope", "echo x"]).status.code(),
+        Some(109)
+    );
+    assert_eq!(run(c, &["read", "b,b2", "proj:x"]).status.code(), Some(110));
+    let o = run(c, &["info", "@all"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(
+        String::from_utf8_lossy(&o.stdout).contains("在线"),
+        "{}",
+        text(&o)
+    );
+
+    // 吊销后几秒内失效，另一个 token 不受影响
+    assert!(run(s, &["token", "remove", "caller1"]).status.success());
+    let o = wait_code(c, &["info", "b2"], 101);
+    assert_eq!(o.status.code(), Some(101), "{}", text(&o));
+    assert!(run(c, &["info", "b"]).status.success());
+
+    // 自检：本机服务正常
+    let o = run(s, &["doctor", "--json", "--no-peers"]);
+    let v = json_of(&o);
+    let svc = v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["check"] == "本机服务")
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(svc["status"], "ok", "{v}");
+    // 客户端视角检查对端
+    let o = run(c, &["doctor", "--json"]);
+    assert!(text(&o).contains("对端 b"), "{}", text(&o));
+
+    // serve 日志落盘
+    let logs: Vec<_> = fs::read_dir(s.join("serve-logs"))
+        .unwrap()
+        .flatten()
+        .collect();
+    assert!(!logs.is_empty());
+    let log = fs::read_to_string(logs[0].path()).unwrap();
+    assert!(log.contains("服务已启动"), "{log}");
+
+    // 更换默认 token：旧的立即作废
+    assert!(run(s, &["token", "rotate", "default"]).status.success());
+    let o = wait_code(c, &["info", "b"], 101);
+    assert_eq!(o.status.code(), Some(101), "{}", text(&o));
+}
+
+fn kill_pid(pid: u64) {
+    let pid = pid.to_string();
+    if cfg!(windows) {
+        let _ = Command::new("taskkill").args(["/PID", &pid, "/F"]).output();
+    } else {
+        let _ = Command::new("kill").args(["-9", &pid]).output();
+    }
+}
+
+#[test]
+fn upgrade_restarts_server() {
+    let env = setup_with(true);
+    let c = &env.client_home;
+    let pid0 = json_of(&run(c, &["info", "b", "--json"]))["pid"]
+        .as_u64()
+        .unwrap();
+
+    // 有后台任务时拒绝升级
+    let slow = if cfg!(windows) {
+        "Start-Sleep -Seconds 60"
+    } else {
+        "sleep 60"
+    };
+    let o = run(c, &["exec", "b", "--detach", "--json", slow]);
+    let id = json_of(&o)["job_id"].as_str().unwrap().to_string();
+    assert_eq!(run(c, &["upgrade", "b"]).status.code(), Some(105));
+    assert!(run(c, &["job", "kill", "b", &id]).status.success());
+
+    // 升级：替换二进制并以新进程重新上线
+    let o = run(c, &["upgrade", "b", "--json"]);
+    let v = json_of(&o);
+    assert!(o.status.success(), "{v}");
+    let pid1 = json_of(&run(c, &["info", "b", "--json"]))["pid"]
+        .as_u64()
+        .unwrap();
+    kill_pid(pid1);
+    assert_ne!(pid0, pid1);
+    assert_eq!(v["results"][0]["new_version"], env!("CARGO_PKG_VERSION"));
 }

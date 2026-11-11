@@ -1,7 +1,9 @@
 //! 客户端：短连接 HTTPS（证书指纹固定），一次调用一个请求。
 
+pub mod multi;
 pub mod output;
 pub mod transfer;
+pub mod upgrade;
 
 use crate::config::{self, Peer};
 use crate::error::{AppError, Result};
@@ -11,7 +13,17 @@ use rustls::{ClientConnection, StreamOwned};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
+
+/// 每个进程只提示一次版本不一致。
+static VERSION_WARN: AtomicBool = AtomicBool::new(true);
+
+/// 关闭版本不一致提示（upgrade / doctor 会自己报告版本）。
+pub fn disable_version_warning() {
+    VERSION_WARN.store(false, Ordering::SeqCst);
+}
 
 pub type Stream = StreamOwned<ClientConnection, TcpStream>;
 
@@ -74,11 +86,19 @@ fn map_io(e: std::io::Error) -> AppError {
 }
 
 pub struct Client {
+    pub name: String,
     peer: Peer,
+    /// 最近一次响应里对端报告的版本。
+    remote_version: Mutex<Option<String>>,
 }
 
 impl Client {
     pub fn load(name: &str) -> Result<Self> {
+        if multi::is_multi(name) {
+            return Err(AppError::bad_request(format!(
+                "`{name}`：此命令一次只能操作一个对端（多个对端仅支持 exec / info / upgrade）"
+            )));
+        }
         let peers = config::load_peers(&config::home_dir())?;
         let peer = peers.peers.get(name).cloned().ok_or_else(|| {
             let known: Vec<_> = peers.peers.keys().cloned().collect();
@@ -91,11 +111,53 @@ impl Client {
                 }
             ))
         })?;
-        Ok(Self { peer })
+        Ok(Self::from_peer(name, peer))
     }
 
-    pub fn from_peer(peer: Peer) -> Self {
-        Self { peer }
+    pub fn from_peer(name: &str, peer: Peer) -> Self {
+        Self {
+            name: name.to_string(),
+            peer,
+            remote_version: Mutex::new(None),
+        }
+    }
+
+    fn note_version(&self, head: &http::ResponseHead) {
+        let Some(v) = head.header(http::VERSION_HEADER) else {
+            return;
+        };
+        *self
+            .remote_version
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(v.to_string());
+        if v != http::VERSION && VERSION_WARN.swap(false, Ordering::SeqCst) {
+            eprintln!(
+                "[agent-cli-x: 版本不一致：本机 {}，对端 {} 为 {v}。建议执行 `agent-cli-x upgrade {}` 统一版本]",
+                http::VERSION,
+                self.name,
+                self.name
+            );
+        }
+    }
+
+    /// 把服务端错误还原为 AppError；对端不认识接口且版本不同时，提示升级。
+    fn remote_error(&self, v: &Value, status: u16) -> AppError {
+        let mut e = http::remote_error(v, status);
+        if e.code == "not_found" && e.message.starts_with("未知接口") {
+            let rv = self
+                .remote_version
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .unwrap_or_else(|| "?".into());
+            if rv != http::VERSION {
+                e.message.push_str(&format!(
+                    "（对端版本 {rv} 较旧，不支持此操作；本机 {}。请先升级对端）",
+                    http::VERSION
+                ));
+            }
+        }
+        e
     }
 
     fn send(
@@ -108,8 +170,9 @@ impl Client {
         let bytes = serde_json::to_vec(body).unwrap_or_default();
         http::write_request(&mut s, path, &self.peer.token, &bytes).map_err(map_io)?;
         let mut br = BufReader::new(s);
-        let status = http::read_response_head(&mut br)?;
-        Ok((status, br))
+        let head = http::read_response_head(&mut br)?;
+        self.note_version(&head);
+        Ok((head.status, br))
     }
 
     pub fn call(&self, path: &str, body: &Value, timeout: Duration) -> Result<Value> {
@@ -119,7 +182,7 @@ impl Client {
         let v: Value = serde_json::from_slice(&data)
             .map_err(|e| AppError::internal(format!("响应不是有效 JSON: {e}")))?;
         if status != 200 {
-            return Err(http::remote_error(&v, status));
+            return Err(self.remote_error(&v, status));
         }
         Ok(v)
     }
@@ -137,7 +200,7 @@ impl Client {
             let mut data = Vec::new();
             read_all(&mut br, &mut data)?;
             let v: Value = serde_json::from_slice(&data).unwrap_or(Value::Null);
-            return Err(http::remote_error(&v, status));
+            return Err(self.remote_error(&v, status));
         }
         let mut line = Vec::new();
         loop {
@@ -179,7 +242,10 @@ impl Client {
         // 服务端可能中途拒绝并关闭连接：即使写入失败，也优先读取它返回的错误
         let mut br = BufReader::new(s);
         let status = match http::read_response_head(&mut br) {
-            Ok(st) => st,
+            Ok(head) => {
+                self.note_version(&head);
+                head.status
+            }
             Err(e) => return Err(body_res.err().unwrap_or(e)),
         };
         let mut data = Vec::new();
@@ -187,7 +253,7 @@ impl Client {
         let v: Value = serde_json::from_slice(&data)
             .map_err(|e| AppError::internal(format!("响应不是有效 JSON: {e}")))?;
         if status != 200 {
-            return Err(http::remote_error(&v, status));
+            return Err(self.remote_error(&v, status));
         }
         body_res?;
         Ok(v)
@@ -205,7 +271,7 @@ impl Client {
             let mut data = Vec::new();
             read_all(&mut br, &mut data)?;
             let v: Value = serde_json::from_slice(&data).unwrap_or(Value::Null);
-            return Err(http::remote_error(&v, status));
+            return Err(self.remote_error(&v, status));
         }
         Ok(br)
     }

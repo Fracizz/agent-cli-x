@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use std::io::{BufRead, Read, Write};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const VERSION_HEADER: &str = "X-Agent-Cli-Version";
 const MAX_LINE: usize = 8 * 1024;
 const MAX_HEADERS: usize = 64;
 
@@ -169,15 +170,30 @@ pub fn write_request_head<W: Write>(
     )
 }
 
-pub fn read_response_head<R: BufRead>(r: &mut R) -> Result<u16> {
+/// 响应状态码与响应头。
+pub struct ResponseHead {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+}
+
+impl ResponseHead {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+pub fn read_response_head<R: BufRead>(r: &mut R) -> Result<ResponseHead> {
     let line = read_line(r)?;
     let status = line
         .split_whitespace()
         .nth(1)
         .and_then(|s| s.parse::<u16>().ok())
         .ok_or_else(|| AppError::internal(format!("无效的响应行: {line}")))?;
-    read_headers(r)?;
-    Ok(status)
+    let headers = read_headers(r)?;
+    Ok(ResponseHead { status, headers })
 }
 
 /// 把服务端返回的错误 JSON 还原为 AppError。

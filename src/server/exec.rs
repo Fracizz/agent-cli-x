@@ -213,9 +213,13 @@ pub fn run<W: Write>(ctx: &Ctx, body: Value, w: &mut W) {
     ) {
         Ok(p) => p,
         Err(e) => {
-            ctx.st
-                .audit
-                .log(&ctx.ip, "exec", false, json!({"error": e.to_string()}));
+            ctx.st.audit.log(
+                &ctx.ip,
+                &ctx.caller,
+                "exec",
+                false,
+                json!({"error": e.to_string()}),
+            );
             let _ = http::write_error(w, &e);
             return;
         }
@@ -226,6 +230,7 @@ pub fn run<W: Write>(ctx: &Ctx, body: Value, w: &mut W) {
             let err = AppError::io(format!("启动 {} 失败: {e}", p.shell.name()));
             ctx.st.audit.log(
                 &ctx.ip,
+                &ctx.caller,
                 "exec",
                 false,
                 json!({"cmd": p.cmd, "cwd": p.cwd_display, "error": err.message}),
@@ -317,7 +322,7 @@ pub fn run<W: Write>(ctx: &Ctx, body: Value, w: &mut W) {
         );
     }
     ctx.st.audit.log(
-        &ctx.ip,
+        &ctx.ip, &ctx.caller,
         "exec",
         !timed_out && code == 0,
         json!({"cmd": p.cmd, "cwd": p.cwd_display, "shell": p.shell.name(), "code": code, "ms": ms, "timed_out": timed_out, "client_gone": client_gone, "warm": warm}),
