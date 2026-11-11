@@ -1,0 +1,320 @@
+//! 命令执行：非交互、流式回传（NDJSON）、超时与断连时杀掉整棵进程树。
+
+use super::Ctx;
+use crate::decode::StreamDecoder;
+use crate::error::{AppError, Result};
+use crate::http;
+use crate::platform::{self, KillHandle, Shell};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+#[derive(Deserialize)]
+struct ExecReq {
+    cmd: String,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    shell: Option<String>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+}
+
+/// 主进程退出后，等待后台孙进程释放输出管道的最长时间。
+const DRAIN_AFTER_EXIT: Duration = Duration::from_secs(2);
+const POLL: Duration = Duration::from_millis(200);
+
+fn collapse_lower(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn is_boundary(c: Option<char>) -> bool {
+    match c {
+        None => true,
+        Some(c) => c.is_whitespace() || matches!(c, ';' | '|' | '&' | '(' | ')' | '`' | '"' | '\''),
+    }
+}
+
+/// 黑名单命令：合并空白、忽略大小写后按词边界匹配。
+pub fn denied_command(cmd: &str, rules: &[String]) -> Option<String> {
+    let text = collapse_lower(cmd);
+    for rule in rules {
+        let pat = collapse_lower(rule);
+        if pat.is_empty() {
+            continue;
+        }
+        let mut from = 0;
+        while let Some(pos) = text[from..].find(&pat) {
+            let s = from + pos;
+            let e = s + pat.len();
+            if is_boundary(text[..s].chars().last()) && is_boundary(text[e..].chars().next()) {
+                return Some(rule.clone());
+            }
+            from = s + pat.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        }
+    }
+    None
+}
+
+struct Prepared {
+    cmd: String,
+    cwd_display: String,
+    shell: Shell,
+    timeout: Duration,
+    command: Command,
+}
+
+fn prepare(ctx: &Ctx, body: Value) -> Result<Prepared> {
+    let req: ExecReq = serde_json::from_value(body)
+        .map_err(|e| AppError::bad_request(format!("参数错误: {e}")))?;
+    if req.cmd.trim().is_empty() {
+        return Err(AppError::bad_request("命令为空"));
+    }
+    let policy = &ctx.st.cfg.policy;
+    if let Some(rule) = denied_command(&req.cmd, &policy.deny_commands) {
+        return Err(AppError::denied(format!("命令命中黑名单规则 `{rule}`")));
+    }
+    let spec = req.cwd.unwrap_or_default();
+    if spec.is_empty() && ctx.st.ws.default_name().is_none() {
+        return Err(AppError::bad_request(
+            "未指定 --cwd，且服务端没有默认工作区",
+        ));
+    }
+    let cwd = ctx.st.ws.resolve(&spec)?;
+    if !cwd.abs.is_dir() {
+        return Err(AppError::not_found(format!(
+            "工作目录不存在: {}",
+            cwd.display()
+        )));
+    }
+    let shell = Shell::parse(req.shell.as_deref())?;
+    let timeout = req
+        .timeout_secs
+        .unwrap_or(policy.default_timeout_secs)
+        .clamp(1, policy.max_timeout_secs.max(1));
+    let mut command = platform::build_command(shell, &req.cmd)?;
+    command
+        .current_dir(&cwd.abs)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // 尽量让工具以非交互、无颜色、无分页的方式运行
+        .env("CI", "1")
+        .env("NO_COLOR", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_PAGER", "cat")
+        .env("PAGER", "cat")
+        .env("AGENT_CLI_X", "1");
+    if cfg!(unix) {
+        command.env("TERM", "dumb");
+    }
+    for (k, v) in &req.env {
+        command.env(k, v);
+    }
+    Ok(Prepared {
+        cmd: req.cmd,
+        cwd_display: cwd.display(),
+        shell,
+        timeout: Duration::from_secs(timeout),
+        command,
+    })
+}
+
+fn spawn_reader<R: Read + Send + 'static>(
+    mut r: R,
+    kind: u8,
+    tx: mpsc::Sender<(u8, Option<Vec<u8>>)>,
+) {
+    thread::spawn(move || {
+        let mut buf = vec![0u8; 8192];
+        loop {
+            match r.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.send((kind, Some(buf[..n].to_vec()))).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+        let _ = tx.send((kind, None));
+    });
+}
+
+fn send<W: Write>(w: &mut W, v: Value) -> std::io::Result<()> {
+    let mut line = serde_json::to_vec(&v).unwrap_or_default();
+    line.push(b'\n');
+    w.write_all(&line)?;
+    w.flush()
+}
+
+fn send_text<W: Write>(w: &mut W, kind: u8, text: String) -> std::io::Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    send(
+        w,
+        json!({"t": if kind == 0 { "out" } else { "err" }, "d": text}),
+    )
+}
+
+pub fn run<W: Write>(ctx: &Ctx, body: Value, w: &mut W) {
+    let started = Instant::now();
+    let mut p = match prepare(ctx, body) {
+        Ok(p) => p,
+        Err(e) => {
+            ctx.st
+                .audit
+                .log(&ctx.ip, "exec", false, json!({"error": e.to_string()}));
+            let _ = http::write_error(w, &e);
+            return;
+        }
+    };
+    let mut child: Child = match p.command.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let err = AppError::io(format!("启动 {} 失败: {e}", p.shell.name()));
+            ctx.st.audit.log(
+                &ctx.ip,
+                "exec",
+                false,
+                json!({"cmd": p.cmd, "cwd": p.cwd_display, "error": err.message}),
+            );
+            let _ = http::write_error(w, &err);
+            return;
+        }
+    };
+    let killer = KillHandle::attach(&child);
+    let (tx, rx) = mpsc::channel();
+    if let Some(out) = child.stdout.take() {
+        spawn_reader(out, 0, tx.clone());
+    }
+    if let Some(err) = child.stderr.take() {
+        spawn_reader(err, 1, tx.clone());
+    }
+    drop(tx);
+
+    let fallback = platform::fallback_encoding();
+    let mut decoders = [StreamDecoder::new(fallback), StreamDecoder::new(fallback)];
+    let mut open = 2;
+    let mut exited = None;
+    let mut drain_deadline: Option<Instant> = None;
+    let mut timed_out = false;
+    let mut client_gone = false;
+    let deadline = started + p.timeout;
+
+    let head_ok = http::write_head(w, 200, "application/x-ndjson").and_then(|_| w.flush());
+    if head_ok.is_err() {
+        client_gone = true;
+    }
+
+    while !client_gone && open > 0 {
+        let res = match rx.recv_timeout(POLL) {
+            Ok((k, Some(bytes))) => {
+                let text = decoders[k as usize].push(&bytes);
+                send_text(w, k, text)
+            }
+            Ok((k, None)) => {
+                open -= 1;
+                let text = decoders[k as usize].finish();
+                send_text(w, k, text)
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let a = decoders[0].flush_partial();
+                let b = decoders[1].flush_partial();
+                send_text(w, 0, a).and_then(|_| send_text(w, 1, b))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        if res.is_err() {
+            client_gone = true;
+            break;
+        }
+        if exited.is_none() {
+            if let Ok(Some(status)) = child.try_wait() {
+                exited = Some(status);
+                drain_deadline = Some(Instant::now() + DRAIN_AFTER_EXIT);
+            }
+        }
+        if drain_deadline.is_some_and(|d| Instant::now() > d) {
+            break;
+        }
+        if exited.is_none() && Instant::now() > deadline {
+            timed_out = true;
+            killer.kill(&mut child);
+            break;
+        }
+    }
+    if client_gone && exited.is_none() {
+        // 调用方断开：不留孤儿进程
+        killer.kill(&mut child);
+    }
+    let status = match exited {
+        Some(s) => Some(s),
+        None => child.wait().ok(),
+    };
+    let code = status.map(exit_code).unwrap_or(-1);
+    let code = if timed_out { 124 } else { code };
+    let ms = started.elapsed().as_millis() as u64;
+    if !client_gone {
+        let tail0 = decoders[0].finish();
+        let tail1 = decoders[1].finish();
+        let _ = send_text(w, 0, tail0);
+        let _ = send_text(w, 1, tail1);
+        let _ = send(
+            w,
+            json!({"t": "exit", "code": code, "ms": ms, "timed_out": timed_out, "shell": p.shell.name()}),
+        );
+    }
+    ctx.st.audit.log(
+        &ctx.ip,
+        "exec",
+        !timed_out && code == 0,
+        json!({"cmd": p.cmd, "cwd": p.cwd_display, "shell": p.shell.name(), "code": code, "ms": ms, "timed_out": timed_out, "client_gone": client_gone}),
+    );
+}
+
+fn exit_code(s: std::process::ExitStatus) -> i32 {
+    if let Some(c) = s.code() {
+        return c;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = s.signal() {
+            return 128 + sig;
+        }
+    }
+    -1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rules(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn deny_command_word_boundary() {
+        let r = rules(&["rm -rf /", "git push --force", "shutdown"]);
+        assert!(denied_command("rm  -rf   /", &r).is_some());
+        assert!(denied_command("cd x && RM -RF /", &r).is_some());
+        assert!(denied_command("rm -rf /tmp/x", &r).is_none());
+        assert!(denied_command("git push --force origin main", &r).is_some());
+        assert!(denied_command("git push --force-with-lease", &r).is_none());
+        assert!(denied_command("echo hi; shutdown", &r).is_some());
+        assert!(denied_command("cargo build", &r).is_none());
+    }
+}
