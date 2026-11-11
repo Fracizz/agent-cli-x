@@ -1,6 +1,7 @@
 //! 写操作前的备份与回滚：`<home>/backup/<op_id>/{meta.json, 0, 1, ...}`，默认保留 7 天。
-//! 一次操作（write / edit / put）可以涉及多个文件，rollback 一次全部撤销。
+//! 一次操作（write / edit / put / rm）可以涉及多个文件，rollback 一次全部撤销。
 
+use super::workspace::Access;
 use super::Ctx;
 use crate::error::{AppError, Result};
 use crate::util;
@@ -90,6 +91,37 @@ impl Op {
         self.save()
     }
 
+    /// 删除目录前调用：记录目录本身，回滚时重新创建。
+    pub fn add_removed_dir(&mut self, abs: &Path, display: &str) -> Result<()> {
+        let idx = self.entries.len();
+        self.entries.push(json!({
+            "path": abs.to_string_lossy(), "display": display, "existed": true, "dir": true, "idx": idx
+        }));
+        self.save()
+    }
+
+    /// 已移入系统回收站后调用：记录原路径与删除时间，回滚时从回收站还原。
+    pub fn add_trashed(&mut self, abs: &Path, display: &str, since: i64) -> Result<()> {
+        let idx = self.entries.len();
+        self.entries.push(json!({
+            "path": abs.to_string_lossy(), "display": display, "existed": true, "idx": idx,
+            "trash": true, "since": since
+        }));
+        self.save()
+    }
+
+    /// 删除符号链接前调用：记录链接目标，回滚时尽力重建（Windows 上可能需要权限）。
+    pub fn add_removed_link(&mut self, abs: &Path, display: &str) -> Result<()> {
+        let target = fs::read_link(abs)?;
+        let target_is_dir = abs.is_dir();
+        let idx = self.entries.len();
+        self.entries.push(json!({
+            "path": abs.to_string_lossy(), "display": display, "existed": true, "idx": idx,
+            "link": target.to_string_lossy(), "link_dir": target_is_dir
+        }));
+        self.save()
+    }
+
     fn save(&self) -> Result<()> {
         let meta = json!({"op_id": self.id, "ts": util::now_iso(), "entries": self.entries});
         fs::write(
@@ -138,7 +170,7 @@ pub fn rollback(ctx: &Ctx, body: Value) -> Result<Value> {
             .collect(),
         None => vec![(meta.clone(), dir.join("content"))],
     };
-    // 先整体校验，再动手，避免回滚到一半被拒
+    // 先整体校验，再动手，避免回滚到一半被拒。每条记录按回滚时的实际动作检查 CRUD 权限。
     let mut plan = Vec::new();
     for (e, backup_file) in entries.iter().rev() {
         let abs = PathBuf::from(e["path"].as_str().unwrap_or_default());
@@ -147,24 +179,64 @@ pub fn rollback(ctx: &Ctx, body: Value) -> Result<Value> {
             .ws
             .owner_of(&abs)
             .ok_or_else(|| AppError::denied("该操作的文件已不在任何工作区内"))?;
-        if let Some(rule) = ctx.st.ws.denied_by(&ws, &root, &abs) {
-            return Err(AppError::denied(format!(
-                "路径命中黑名单 `{rule}`，禁止回滚"
+        let existed = e["existed"].as_bool().unwrap_or(false);
+        let access = match (existed, abs.exists() || abs.is_symlink()) {
+            // 原本不存在：回滚 = 删除
+            (false, _) => Access::Delete,
+            // 原本存在、现在还在：恢复内容 = 修改（目录无需动作，只要可读）
+            (true, true) if e["dir"] == true => Access::Read,
+            (true, true) => Access::Update,
+            // 原本存在、现在没了（被 rm 删除）：重建 = 新建
+            (true, false) => Access::Create,
+        };
+        let display = e["display"].as_str().unwrap_or_default();
+        if e["trash"] == true && (abs.exists() || abs.is_symlink()) {
+            return Err(AppError::conflict(format!(
+                "{display} 处已存在同名文件或目录，无法从回收站还原；请先移走它"
             )));
         }
+        ctx.st
+            .ws
+            .check_abs(&ws, &root, &abs, display, access)
+            .map_err(|err| AppError::denied(format!("{}，无法回滚", err.message)))?;
         plan.push((e, abs, backup_file));
     }
     let mut files = Vec::new();
     for (e, abs, backup_file) in plan {
-        let action = if e["dir"] == true {
+        let existed = e["existed"].as_bool().unwrap_or(false);
+        let action = if e["trash"] == true {
+            super::recycle::restore(&abs, e["since"].as_i64().unwrap_or(0))?;
+            "untrashed"
+        } else if e["dir"] == true && !existed {
             // 只删空目录：回滚后目录里若还有别的文件（非本次操作写入），保留
             if abs.is_dir() && fs::remove_dir(&abs).is_ok() {
                 "rmdir"
             } else {
                 "kept_dir"
             }
-        } else if e["existed"].as_bool().unwrap_or(false) {
+        } else if e["dir"] == true {
+            if abs.is_dir() {
+                "kept_dir"
+            } else {
+                fs::create_dir_all(&abs)?;
+                "recreated_dir"
+            }
+        } else if let Some(target) = e["link"].as_str() {
+            if let Some(p) = abs.parent() {
+                fs::create_dir_all(p)?;
+            }
+            if abs.is_symlink() || abs.exists() {
+                "kept_link"
+            } else if make_symlink(Path::new(target), &abs, e["link_dir"] == true).is_ok() {
+                "relinked"
+            } else {
+                "link_failed"
+            }
+        } else if existed {
             let data = fs::read(backup_file)?;
+            if let Some(p) = abs.parent() {
+                fs::create_dir_all(p)?;
+            }
             util::atomic_write(&abs, &data)?;
             "restored"
         } else {
@@ -183,4 +255,18 @@ pub fn rollback(ctx: &Ctx, body: Value) -> Result<Value> {
         json!({"op_id": req.op_id, "files": files.len()}),
     );
     Ok(json!({"op_id": req.op_id, "files": files}))
+}
+
+#[cfg(unix)]
+fn make_symlink(target: &Path, link: &Path, _dir: bool) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn make_symlink(target: &Path, link: &Path, dir: bool) -> std::io::Result<()> {
+    if dir {
+        std::os::windows::fs::symlink_dir(target, link)
+    } else {
+        std::os::windows::fs::symlink_file(target, link)
+    }
 }

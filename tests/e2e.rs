@@ -83,6 +83,10 @@ fn setup_with(copy_bin: bool) -> Env {
     .unwrap();
     fs::write(ws.join("secrets/token.txt"), "TOP-SECRET").unwrap();
     fs::write(ws.join(".env"), "K=V").unwrap();
+    fs::create_dir_all(ws.join("docs")).unwrap();
+    fs::write(ws.join("docs/readme.md"), "ro").unwrap();
+    fs::create_dir_all(ws.join("drafts")).unwrap();
+    fs::write(ws.join("drafts/old.md"), "old").unwrap();
 
     let port = free_port();
     let listen = format!("127.0.0.1:{port}");
@@ -97,6 +101,13 @@ fn setup_with(copy_bin: bool) -> Env {
     let cfg_path = server_home.join("config.toml");
     let cfg = fs::read_to_string(&cfg_path).unwrap();
     let cfg = cfg.replacen("deny_paths = [", "deny_paths = [\n  \"secrets\",", 1);
+    // 预设只读规则（Windows 为整个 C 盘）会让临时目录里的工作区只读：
+    // 用更具体的规则放开工作区（顺带验证“最具体规则优先”），docs 只读、drafts 只能读和新建
+    let cfg = format!(
+        "{cfg}\n[[policy.paths]]\npath = \"proj:\"\nallow = \"rcud\"\n\n\
+         [[policy.paths]]\npath = \"proj:docs\"\nallow = \"r\"\n\n\
+         [[policy.paths]]\npath = \"proj:drafts\"\nallow = \"rc\"\n"
+    );
     fs::write(&cfg_path, cfg).unwrap();
 
     let server_bin = if copy_bin {
@@ -246,6 +257,19 @@ fn full_flow() {
             .status
             .code(),
         Some(102)
+    );
+    // 只读目录：可读、可作为 exec 工作目录，不可 write
+    let o = run(c, &["read", "b", "proj:docs/readme.md"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let o = run(c, &["exec", "b", "--cwd", "proj:docs", "echo x"]);
+    assert!(o.status.success(), "{}", text(&o));
+    for p in ["proj:docs/new.md", "proj:docs/readme.md"] {
+        let o = run(c, &["write", "b", p, "--content", "x"]);
+        assert_eq!(o.status.code(), Some(102), "{p}: {}", text(&o));
+    }
+    assert_eq!(
+        fs::read_to_string(env.ws.join("docs/readme.md")).unwrap(),
+        "ro"
     );
     let o = run(c, &["ls", "b", "proj:", "--depth", "3"]);
     assert!(o.status.success(), "{}", text(&o));
@@ -475,6 +499,17 @@ fn identity_grep_transfer_jobs() {
         ],
     );
     assert_eq!(o.status.code(), Some(102), "{}", text(&o));
+    // 只读目录不可写入
+    let o = run(
+        c,
+        &[
+            "put",
+            "b",
+            local.join("index.html").to_str().unwrap(),
+            "proj:docs",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(102), "{}", text(&o));
     // get 目录
     let down = env.server_home.parent().unwrap().join("download");
     fs::create_dir_all(&down).unwrap();
@@ -519,6 +554,94 @@ fn identity_grep_transfer_jobs() {
         .status
         .success());
     assert!(!env.ws.join("new1").exists());
+
+    // CRUD：drafts 只允许读和新建
+    let o = run(c, &["write", "b", "proj:drafts/new.md", "--content", "n"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let o = run(c, &["write", "b", "proj:drafts/old.md", "--content", "x"]);
+    assert_eq!(o.status.code(), Some(102), "{}", text(&o));
+    assert!(text(&o).contains("不允许修改"), "{}", text(&o));
+    let o = run(c, &["rm", "b", "proj:drafts/old.md"]);
+    assert_eq!(o.status.code(), Some(102), "{}", text(&o));
+    assert!(text(&o).contains("不允许删除"), "{}", text(&o));
+    assert!(env.ws.join("drafts/old.md").is_file());
+    // 只读目录与硬性禁止目录都不能删除
+    assert_eq!(
+        run(c, &["rm", "b", "proj:docs/readme.md"]).status.code(),
+        Some(102)
+    );
+    assert_eq!(
+        run(c, &["rm", "b", "-r", "proj:secrets"]).status.code(),
+        Some(102)
+    );
+    // 目录里有一项不可删除时整体拒绝，什么都不删
+    let o = run(c, &["rm", "b", "-r", "proj:"]);
+    assert_ne!(o.status.code(), Some(0), "{}", text(&o));
+    fs::create_dir_all(env.ws.join("mix")).unwrap();
+    fs::write(env.ws.join("mix/a.txt"), "a").unwrap();
+    fs::write(env.ws.join("mix/.env"), "SECRET").unwrap();
+    assert_eq!(
+        run(c, &["rm", "b", "-r", "proj:mix"]).status.code(),
+        Some(102)
+    );
+    assert!(env.ws.join("mix/a.txt").is_file());
+
+    // rm：目录需要 -r；删除后可 rollback 完整恢复
+    fs::create_dir_all(env.ws.join("trash/sub/empty")).unwrap();
+    fs::write(env.ws.join("trash/a.txt"), "A").unwrap();
+    fs::write(env.ws.join("trash/sub/b.txt"), "B").unwrap();
+    let o = run(c, &["rm", "b", "proj:trash"]);
+    assert_eq!(o.status.code(), Some(110), "{}", text(&o));
+    let o = run(c, &["rm", "b", "-r", "proj:trash", "--json"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let v = json_of(&o);
+    assert_eq!(v["files"], 2);
+    assert_eq!(v["dirs"], 3);
+    // 默认移入回收站；没有可用回收站的环境（如部分 CI）会退回备份方式，两者都能 rollback
+    let method = v["method"].as_str().unwrap();
+    assert!(method == "trash" || method == "backup", "{v}");
+    if cfg!(windows) {
+        assert_eq!(method, "trash", "{v}");
+    }
+    assert!(!env.ws.join("trash").exists());
+    let o = run(c, &["rollback", "b", v["op_id"].as_str().unwrap()]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert_eq!(fs::read_to_string(env.ws.join("trash/a.txt")).unwrap(), "A");
+    assert_eq!(
+        fs::read_to_string(env.ws.join("trash/sub/b.txt")).unwrap(),
+        "B"
+    );
+    assert!(env.ws.join("trash/sub/empty").is_dir());
+    // 回收站还原时原位置已有同名目录 → 冲突，不覆盖
+    let o = run(c, &["rm", "b", "-r", "proj:trash/sub", "--json"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let sub_op = json_of(&o)["op_id"].as_str().unwrap().to_string();
+    fs::create_dir_all(env.ws.join("trash/sub")).unwrap();
+    if json_of(&o)["method"] == "trash" {
+        let o = run(c, &["rollback", "b", &sub_op]);
+        assert_eq!(o.status.code(), Some(105), "{}", text(&o));
+    }
+    fs::remove_dir(env.ws.join("trash/sub")).unwrap();
+    assert!(run(c, &["rollback", "b", &sub_op]).status.success());
+    assert!(env.ws.join("trash/sub/b.txt").is_file());
+    // 彻底删除：不进回收站、不备份，没有 op_id
+    let o = run(c, &["rm", "b", "-r", "--permanent", "proj:trash", "--json"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let v = json_of(&o);
+    assert_eq!(v["method"], "permanent");
+    assert!(v["op_id"].is_null(), "{v}");
+    assert!(!env.ws.join("trash").exists());
+    fs::create_dir_all(env.ws.join("trash")).unwrap();
+    fs::write(env.ws.join("trash/a.txt"), "A").unwrap();
+    // 删除单个文件
+    let o = run(c, &["rm", "b", "--permanent", "proj:trash/a.txt"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains("已彻底删除"), "{}", text(&o));
+    assert!(!env.ws.join("trash/a.txt").exists());
+    assert_eq!(
+        run(c, &["rm", "b", "proj:trash/a.txt"]).status.code(),
+        Some(103)
+    );
 
     // init --json 输出可解析
     let tmp_home = env.server_home.parent().unwrap().join("init-json-home");

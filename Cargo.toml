@@ -25,6 +25,7 @@ globset = "0.4"
 dunce = "1"
 regex = "1"
 encoding_rs = "0.8"
+trash = "5"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

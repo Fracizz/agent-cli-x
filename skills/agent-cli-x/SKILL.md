@@ -24,7 +24,7 @@ Each machine has a `node_name` (human label) and a `node_id` (UUID). Use them to
 
 `workspace:relative/path`, e.g. `proj:src/main.rs`; workspace root is `proj:`.
 The prefix may be omitted when the peer has a single or default workspace.
-Absolute paths, `..`, anything outside a workspace and deny-listed paths are rejected (exit 102). Do not try to work around them.
+Absolute paths, `..`, anything outside a workspace and deny-listed paths are rejected (exit 102). Paths also carry CRUD permissions set by the peer owner (`info` shows them as `path=rcud`: r read, c create, u update, d delete); e.g. a read-only system drive refuses write/edit/rm with exit 102. Do not try to work around them (for example by deleting or overwriting through `exec`).
 
 ## Commands
 
@@ -43,7 +43,8 @@ agent-cli-x edit B proj:src/main.rs --old-file old.txt --new-file new.txt   # mu
 agent-cli-x write B proj:notes.md --content "..."      # or --from <local file>, or stdin
 agent-cli-x put B ./dist proj:web/dist --exclude node_modules   # upload file/dir (like cp -r)
 agent-cli-x get B proj:logs ./logs                     # download file/dir
-agent-cli-x rollback B <op_id>                         # undo a write/edit/put
+agent-cli-x rm B proj:build/tmp -r                     # delete file / dir (-r) into the recycle bin; undo with rollback
+agent-cli-x rollback B <op_id>                         # undo a write/edit/put/rm
 agent-cli-x exec B,C "git pull && cargo build"         # several peers in parallel, output grouped per peer
 agent-cli-x exec @all --json "uname -a"                # every registered peer; one result per peer
 agent-cli-x upgrade B                                  # push this binary to B and restart its serve
@@ -59,7 +60,7 @@ Add `--json` to any command for machine-readable output.
 - Long output shows the first and last ~200 lines; the full log path is printed to stderr and can be read locally.
 - `edit` needs `--old` to match **exactly once** (including indentation). Widen the context or use `--all`. CRLF/LF is handled.
 - `read` before `edit`. To guard against concurrent changes, take `sha256` from `read --json` and pass `--expect-sha`.
-- Every write/edit returns an `op_id`; use `rollback` if something goes wrong.
+- Every write/edit/put/rm returns an `op_id`; use `rollback` if something goes wrong. Prefer `rm` over `exec "rm ..."`: it checks permissions and can be undone. Use `rm --permanent` (no recycle bin, no undo) only when the user explicitly asks for permanent deletion.
 - Raise `--timeout` for long builds (capped by the peer). On timeout the whole process tree is killed (exit 104).
 - Anything longer than a few minutes (builds, test suites, servers): use `exec --detach`, then `job logs --follow`.
 - Prefer `grep` over `exec "grep ..."`: it respects .gitignore and deny rules and works the same on Windows.

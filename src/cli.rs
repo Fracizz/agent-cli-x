@@ -208,7 +208,18 @@ enum Cmd {
         #[arg(long)]
         exclude: Vec<String>,
     },
-    /// 撤销一次 write / edit / put
+    /// 删除文件或目录：默认移入对端回收站，可用 rollback 还原（需要对端路径权限含 d）
+    Rm {
+        peer: String,
+        path: String,
+        /// 删除目录及其下全部内容
+        #[arg(short = 'r', long)]
+        recursive: bool,
+        /// 彻底删除：不进回收站、不备份，无法恢复
+        #[arg(long)]
+        permanent: bool,
+    },
+    /// 撤销一次 write / edit / put / rm
     Rollback { peer: String, op_id: String },
 }
 
@@ -491,6 +502,50 @@ pub fn run() -> Result<i32> {
             }
             Ok(0)
         }
+        Cmd::Rm {
+            peer,
+            path,
+            recursive,
+            permanent,
+        } => {
+            let v = Client::load(&peer)?.call(
+                "/v1/fs/rm",
+                &json!({"path": path, "recursive": recursive, "permanent": permanent}),
+                CALL_TIMEOUT,
+            )?;
+            if json {
+                println!("{v}");
+            } else {
+                let mut parts = vec![format!(
+                    "{} 个文件（{}）",
+                    v["files"],
+                    human_size(v["bytes"].as_u64().unwrap_or(0))
+                )];
+                if v["dirs"].as_u64().unwrap_or(0) > 0 {
+                    parts.push(format!("{} 个目录", v["dirs"]));
+                }
+                if v["links"].as_u64().unwrap_or(0) > 0 {
+                    parts.push(format!("{} 个符号链接", v["links"]));
+                }
+                let how = match v["method"].as_str() {
+                    Some("trash") => "已移入回收站",
+                    Some("permanent") => "已彻底删除",
+                    _ => "已删除（已备份）",
+                };
+                println!(
+                    "{how} {}：{}",
+                    v["path"].as_str().unwrap_or_default(),
+                    parts.join("、")
+                );
+                if let Some(op) = v["op_id"].as_str() {
+                    println!("  op_id={op}（撤销: agent-cli-x rollback {peer} {op}）");
+                }
+                if let Some(e) = v["trash_error"].as_str() {
+                    eprintln!("[agent-cli-x: 回收站不可用（{e}），已改为备份后删除]");
+                }
+            }
+            Ok(0)
+        }
         Cmd::Rollback { peer, op_id } => {
             let v = Client::load(&peer)?.call(
                 "/v1/rollback",
@@ -504,7 +559,12 @@ pub fn run() -> Result<i32> {
                     let action = match f["action"].as_str() {
                         Some("deleted") => "已删除新建的文件",
                         Some("rmdir") => "已删除新建的目录",
-                        Some("kept_dir") => "保留非空目录",
+                        Some("kept_dir") => "保留已有目录",
+                        Some("recreated_dir") => "已重建被删除的目录",
+                        Some("untrashed") => "已从回收站还原",
+                        Some("relinked") => "已重建符号链接",
+                        Some("kept_link") => "保留已有符号链接",
+                        Some("link_failed") => "符号链接重建失败（可能缺少权限）",
                         _ => "已恢复为修改前内容",
                     };
                     println!("{action}: {}", f["path"].as_str().unwrap_or_default());
@@ -578,7 +638,7 @@ fn init(
     println!("  指纹:   {fp}");
     println!();
     println!("下一步:");
-    println!("  1. 编辑配置，在 [workspaces] 中登记允许访问的目录、按需调整 deny_paths 黑名单");
+    println!("  1. 编辑配置，在 [workspaces] 中登记允许访问的目录、按需调整 deny_paths / [[policy.paths]] / deny_commands 预设");
     println!("  2. 运行 `agent-cli-x serve`");
     println!("  3. 在要访问本机的机器上执行（为每个调用方单独签发 token 可用 `agent-cli-x token add <名称>`）:");
     println!("     {}", pair_command(&node_name, listen, &token, &fp));
@@ -1137,6 +1197,21 @@ fn print_info(name: &str, v: &Value) {
         .collect();
     if !deny.is_empty() {
         println!("  禁止访问: {}", deny.join(", "));
+    }
+    let rules: Vec<String> = v["path_rules"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|r| {
+            format!(
+                "{}={}",
+                r["path"].as_str().unwrap_or_default(),
+                r["allow"].as_str().unwrap_or_default()
+            )
+        })
+        .collect();
+    if !rules.is_empty() {
+        println!("  路径权限（r 读 c 建 u 改 d 删）: {}", rules.join(", "));
     }
 }
 

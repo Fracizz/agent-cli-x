@@ -352,6 +352,24 @@ mod tests {
     }
 
     #[test]
+    fn preset_blocks_system_deletes() {
+        let rules: Vec<String> = crate::config::policy_preset()
+            .deny_commands
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        if cfg!(windows) {
+            assert!(denied_command(r"rd /s /q C:\", &rules).is_some());
+            assert!(denied_command(r"Remove-Item -Recurse -Force C:\Windows", &rules).is_some());
+            assert!(denied_command(r"rd /s /q C:\Users\me\tmp", &rules).is_none());
+        } else {
+            assert!(denied_command("rm -rf /etc", &rules).is_some());
+            assert!(denied_command("rm -rf /etc/x.conf.bak", &rules).is_none());
+        }
+        assert!(denied_command("cargo build", &rules).is_none());
+    }
+
+    #[test]
     fn deny_command_word_boundary() {
         let r = rules(&["rm -rf /", "git push --force", "shutdown"]);
         assert!(denied_command("rm  -rf   /", &r).is_some());

@@ -44,11 +44,25 @@ pub struct Config {
     pub policy: Policy,
 }
 
+/// 一条路径权限规则：`allow` 由 r（读取）c（新建）u（修改）d（删除）组成，空串表示无权限。
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PathRule {
+    pub path: String,
+    pub allow: String,
+}
+
 #[derive(Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Policy {
     #[serde(default)]
     pub deny_paths: Vec<String>,
+    /// 只读路径（兼容旧配置）：等价于 `[[policy.paths]]` 中 `allow = "r"` 的规则。
+    #[serde(default)]
+    pub readonly_paths: Vec<String>,
+    /// 按 CRUD 细分的路径权限，最具体的规则优先。
+    #[serde(default)]
+    pub paths: Vec<PathRule>,
     #[serde(default)]
     pub deny_commands: Vec<String>,
     #[serde(default = "d_timeout")]
@@ -65,6 +79,9 @@ pub struct Policy {
     pub max_jobs: usize,
     #[serde(default = "d_job_timeout")]
     pub job_timeout_secs: u64,
+    /// rm 默认移入系统回收站；关闭后改为“备份到数据目录再删除”（同样可 rollback）。
+    #[serde(default = "d_true")]
+    pub rm_use_trash: bool,
     /// 预热的空闲 PowerShell 数量（仅默认 shell 为 pwsh / powershell 时生效），0 关闭。
     /// 不填时按内存自动决定，见 [`resolve_prewarm`]。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -75,6 +92,8 @@ impl Default for Policy {
     fn default() -> Self {
         Self {
             deny_paths: Vec::new(),
+            readonly_paths: Vec::new(),
+            paths: Vec::new(),
             deny_commands: Vec::new(),
             default_timeout_secs: d_timeout(),
             max_timeout_secs: d_max_timeout(),
@@ -83,6 +102,7 @@ impl Default for Policy {
             max_transfer_mb: d_transfer_mb(),
             max_jobs: d_max_jobs(),
             job_timeout_secs: d_job_timeout(),
+            rm_use_trash: true,
             prewarm_shells: None,
         }
     }
@@ -90,6 +110,9 @@ impl Default for Policy {
 
 fn default_listen() -> String {
     format!("0.0.0.0:{DEFAULT_PORT}")
+}
+fn d_true() -> bool {
+    true
 }
 fn d_timeout() -> u64 {
     600
@@ -234,6 +257,7 @@ pub fn template(
     for (n, p) in workspaces {
         ws.push_str(&format!("{n} = {}\n", toml_str(p)));
     }
+    let preset = policy_preset();
     format!(
         r#"# agent-cli-x 服务端配置（TOML）。修改后需重启 `agent-cli-x serve` 生效。
 # 本文件包含 token，请勿提交到仓库或分享给他人。
@@ -260,38 +284,34 @@ token = {token}
 [workspaces]
 {ws}
 [policy]
-# 黑名单路径（禁止访问）。规则：
+# 下面的路径与命令规则都是按本机系统（{os_label}）生成的预设，可按需增删。
+# 路径权限按 CRUD 区分（exec 执行的命令不在此列）：
+#   r 读取：ls / read / grep / get，以及作为 exec 的工作目录
+#   c 新建：write / put 写入不存在的文件、创建目录
+#   u 修改：write 覆盖已有文件、edit、put 覆盖
+#   d 删除：rm
+# rollback 按实际动作检查：恢复内容需 u，重建已删除的文件/目录需 c，删除新建的文件/目录需 d。
+#
+# 路径规则写法（deny_paths 与 [[policy.paths]] 通用）：
 #   - 相对模式：相对工作区根目录匹配，如 "secrets"、"**/.env"、"**/*.pem"
 #     （"secrets" 只匹配根目录下的 secrets；任意层级请写 "**/secrets"）
 #   - 加 "工作区:" 前缀：只作用于该工作区，如 "proj:config/prod"
-#   - 绝对模式：按真实路径匹配，如 "C:/Users/me/.ssh"、"/etc"
-#   - 命中目录时，目录下所有内容都禁止；支持 * ? ** [abc] 通配，Windows 不区分大小写
-# 对 ls / read / write / edit / rollback 以及 exec 的工作目录强制生效。
-# 注意：exec 运行的 shell 命令本身无法沙箱化（命令里写 `cat secrets/x` 仍能读到），
+#   - 绝对模式：按真实路径匹配，如 "C:/"、"C:/Users/me/.ssh"、"/etc"
+#   - 命中目录时，目录下所有内容都适用；支持 * ? ** [abc] 通配，Windows 不区分大小写
+# 注意：exec 运行的 shell 命令本身无法沙箱化（命令里写 `cat secrets/x`、`rm x` 仍然有效），
 # 需要强隔离时请用专门的低权限系统账户运行 `agent-cli-x serve`，并用文件系统权限保护目录。
 # agent-cli-x 自己的数据目录（含 token、私钥）始终禁止访问。
+
+# 硬性禁止（无任何权限）：命中自身或任一父目录即拒绝，且不能被 [[policy.paths]] 放开。
+# 适合放私钥、密码库这类绝不能碰的文件。
 deny_paths = [
-  "**/.env",
-  "**/*.pem",
-  "**/*.key",
-  "**/id_rsa*",
-  "**/id_ed25519*",
-]
+{deny_paths}]
 
 # 黑名单命令：合并空白、忽略大小写后按“完整词边界”匹配，
 # 例如 "rm -rf /" 会拦截 `rm -rf /` 但不会拦截 `rm -rf /tmp/x`。
 # 这是防误操作护栏，不是安全边界。
 deny_commands = [
-  "rm -rf /",
-  "rm -rf /*",
-  "rm -rf ~",
-  "mkfs",
-  "shutdown",
-  "reboot",
-  "format c:",
-  "git push --force",
-  "git push -f",
-]
+{deny_commands}]
 
 # exec 默认超时与上限（秒）。
 default_timeout_secs = 600
@@ -308,18 +328,186 @@ max_transfer_mb = 2048
 max_jobs = 16
 job_timeout_secs = 86400
 
+# rm 默认把文件移入系统回收站（Windows 回收站 / Linux ~/.local/share/Trash / macOS 废纸篓），
+# rollback 时从回收站还原（macOS 需手动从废纸篓恢复）。回收站不可用时自动改为
+# “备份到数据目录再删除”（受 max_transfer_mb 限制）。设为 false 则始终使用备份方式。
+# `rm --permanent` 彻底删除，不进回收站也不备份，无法恢复。
+rm_use_trash = true
+
 # 预热的空闲 shell 数量：仅当默认 shell 是 pwsh / powershell 时生效（sh / bash / cmd 启动本来就快）。
 # 每条命令仍在全新进程中执行、互不影响，只是省掉 PowerShell 的冷启动时间（pwsh 约 0.3 秒，5.1 约 2 秒）。
 # 每个空闲进程约占 25～55 MB 内存；并发超过此数量时自动退回冷启动。
 # 不填时按物理内存自动决定：每 4 GB 一个，最少 1、最多 4。
 # 手动指定时可以超过 4，但不会超过内存的 GB 数（如 64 GB 最多 64 个）；设为 0 关闭。
 # prewarm_shells = 2
-"#,
+
+# 路径权限（CRUD）：allow 由 r c u d 组成，如 "r" 只读、"rc" 可读可新建、"rcu" 不可删除、"" 无权限。
+# 没有任何规则命中的路径拥有全部权限（rcud）。
+# 多条规则命中时，离目标最近（最具体）的一层生效，例如 "C:/" 为 r、"C:/Users/me/code" 为 rcud 时，
+# C:/Users/me/code 下可以增删改，C 盘其他位置只读；同一层命中多条时取交集。
+# 工作区落在只读目录下时整个工作区只读，需要写入时添加更具体的规则（见下方示例）或删掉对应预设。
+# 注意：本段必须放在 [policy] 的末尾（TOML 中 [[policy.paths]] 之后的普通键会被归到最后一条规则里）。
+{path_rules}"#,
         node_name = toml_str(node_name),
         node_id = toml_str(node_id),
         listen = toml_str(listen),
         token = toml_str(token),
+        os_label = preset.label,
+        deny_paths = toml_list(preset.deny_paths),
+        path_rules = path_rules_toml(&preset),
+        deny_commands = toml_list(preset.deny_commands),
     )
+}
+
+/// 按操作系统区分的默认策略预设（仅用于 `init` 生成配置模板）。
+pub struct PolicyPreset {
+    pub label: &'static str,
+    pub deny_paths: &'static [&'static str],
+    /// 预设为只读（allow = "r"）的系统目录
+    pub readonly_paths: &'static [&'static str],
+    pub deny_commands: &'static [&'static str],
+    /// 模板里注释掉的“放开更具体目录”示例
+    pub example_path: &'static str,
+}
+
+/// 渲染预设的 `[[policy.paths]]` 规则以及一条注释掉的示例。
+fn path_rules_toml(preset: &PolicyPreset) -> String {
+    let mut s = String::new();
+    for p in preset.readonly_paths {
+        s.push_str(&format!(
+            "[[policy.paths]]\npath = {}\nallow = \"r\"\n\n",
+            toml_str(p)
+        ));
+    }
+    s.push_str(&format!(
+        "# 示例：放开某个具体目录的新建 / 修改权限（不允许删除）\n\
+         # [[policy.paths]]\n# path = {}\n# allow = \"rcu\"\n",
+        toml_str(preset.example_path)
+    ));
+    s
+}
+
+pub fn policy_preset() -> PolicyPreset {
+    if cfg!(windows) {
+        PolicyPreset {
+            label: "Windows",
+            deny_paths: &[
+                "**/.env",
+                "**/*.pem",
+                "**/*.key",
+                "**/id_rsa*",
+                "**/id_ed25519*",
+                // 注册表配置单元（含 SAM 账户数据库）
+                "C:/Windows/System32/config",
+            ],
+            // 系统盘整体只读：工作区放在 C 盘时也只能读，需要写入请删掉此条或改成更具体的目录
+            readonly_paths: &["C:/"],
+            deny_commands: &[
+                "format c:",
+                "diskpart",
+                "bcdedit",
+                "vssadmin delete shadows",
+                r"rd /s /q c:\",
+                r"rmdir /s /q c:\",
+                r"del /f /s /q c:\",
+                r"del /s /q c:\",
+                r"rd /s /q c:\windows",
+                r"rmdir /s /q c:\windows",
+                r"remove-item -recurse -force c:\",
+                r"remove-item c:\ -recurse -force",
+                r"remove-item -recurse -force c:\windows",
+                "shutdown",
+                "restart-computer",
+                "stop-computer",
+                "git push --force",
+                "git push -f",
+            ],
+            example_path: "C:/Users/me/code",
+        }
+    } else if cfg!(target_os = "macos") {
+        PolicyPreset {
+            label: "macOS",
+            deny_paths: &[
+                "**/.env",
+                "**/*.pem",
+                "**/*.key",
+                "**/id_rsa*",
+                "**/id_ed25519*",
+                "/private/etc/master.passwd",
+                "/private/etc/sudoers",
+                "/private/etc/sudoers.d",
+            ],
+            // /etc、/var 在 macOS 上是 /private 下的符号链接，规则按真实路径匹配
+            readonly_paths: &[
+                "/System",
+                "/Library",
+                "/bin",
+                "/sbin",
+                "/usr",
+                "/private/etc",
+                "/private/var/db",
+                "/Applications",
+            ],
+            deny_commands: UNIX_DENY_COMMANDS,
+            example_path: "/usr/local/etc",
+        }
+    } else {
+        PolicyPreset {
+            label: "Linux",
+            deny_paths: &[
+                "**/.env",
+                "**/*.pem",
+                "**/*.key",
+                "**/id_rsa*",
+                "**/id_ed25519*",
+                "/etc/shadow",
+                "/etc/gshadow",
+                "/etc/sudoers",
+                "/etc/sudoers.d",
+                "/root/.ssh",
+            ],
+            readonly_paths: &[
+                "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/usr", "/etc", "/boot", "/var/lib",
+                "/proc", "/sys", "/dev",
+            ],
+            deny_commands: UNIX_DENY_COMMANDS,
+            example_path: "/etc/nginx",
+        }
+    }
+}
+
+const UNIX_DENY_COMMANDS: &[&str] = &[
+    "rm -rf /",
+    "rm -rf /*",
+    "rm -fr /",
+    "rm -rf ~",
+    "--no-preserve-root",
+    "rm -rf /etc",
+    "rm -rf /usr",
+    "rm -rf /bin",
+    "rm -rf /sbin",
+    "rm -rf /lib",
+    "rm -rf /boot",
+    "rm -rf /var",
+    "rm -rf /home",
+    "chmod -r 777 /",
+    "mkfs",
+    "shutdown",
+    "reboot",
+    "halt",
+    "poweroff",
+    "init 0",
+    "init 6",
+    "git push --force",
+    "git push -f",
+];
+
+/// 渲染成 TOML 数组的多行内容（每项一行、两空格缩进、末尾逗号）。
+fn toml_list(items: &[&str]) -> String {
+    items
+        .iter()
+        .map(|i| format!("  {},\n", toml_str(i)))
+        .collect()
 }
 
 // ---------------- peers.toml ----------------
@@ -540,6 +728,14 @@ mod tests {
         let cfg: Config = toml::from_str(&t).unwrap();
         assert_eq!(cfg.workspaces["proj"], r"D:\code\x");
         assert!(cfg.policy.deny_paths.iter().any(|p| p == "**/.env"));
+        // 预设与模板渲染结果一致
+        let preset = policy_preset();
+        let ro: Vec<&str> = cfg.policy.paths.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(ro, preset.readonly_paths);
+        assert!(cfg.policy.paths.iter().all(|r| r.allow == "r"));
+        assert_eq!(cfg.policy.deny_commands, preset.deny_commands);
+        // [[policy.paths]] 之后的键不能误入规则表（deny_unknown_fields 会报错），这里确认其他字段仍在 [policy]
+        assert_eq!(cfg.policy.max_jobs, 16);
     }
 
     #[test]

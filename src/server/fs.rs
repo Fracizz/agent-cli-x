@@ -1,4 +1,4 @@
-//! 文件接口：ls / read / write / edit。所有路径都经过 Workspaces::resolve（边界 + 黑名单）。
+//! 文件接口：ls / read / write / edit / rm。所有路径都经过 Workspaces 解析（边界 + CRUD 权限）。
 
 use super::{backup, Ctx};
 use crate::error::{AppError, Result};
@@ -342,7 +342,7 @@ pub fn write(ctx: &Ctx, body: Value) -> Result<Value> {
             "内容超过 max_write_kb（{max} 字节）"
         )));
     }
-    let r = ctx.st.ws.resolve(&req.path)?;
+    let r = ctx.st.ws.resolve_write(&req.path)?;
     if r.rel.is_empty() || r.abs.is_dir() {
         return Err(AppError::bad_request(format!("{} 是目录", r.display())));
     }
@@ -440,7 +440,7 @@ pub fn apply_edit(original: &str, old: &str, new: &str, replace_all: bool) -> Re
 
 pub fn edit(ctx: &Ctx, body: Value) -> Result<Value> {
     let req: EditReq = parse(body)?;
-    let r = ctx.st.ws.resolve(&req.path)?;
+    let r = ctx.st.ws.resolve_write(&req.path)?;
     if !r.exists || !r.abs.is_file() {
         return Err(AppError::not_found(format!("文件不存在: {}", r.display())));
     }
@@ -488,6 +488,192 @@ pub fn edit(ctx: &Ctx, body: Value) -> Result<Value> {
         "replacements": out.replacements,
         "line": out.first_line,
     }))
+}
+
+// ---------------- rm ----------------
+
+#[derive(Deserialize)]
+struct RmReq {
+    path: String,
+    /// 删除目录（含其下全部内容）时必须为 true
+    #[serde(default)]
+    recursive: bool,
+    /// 彻底删除：不进回收站、不备份，无法 rollback
+    #[serde(default)]
+    permanent: bool,
+}
+
+/// 单次 rm 最多涉及的条目数（权限检查与备份都要逐个处理）。
+const RM_MAX_ENTRIES: usize = 100_000;
+
+enum RmKind {
+    File,
+    Dir,
+    Link,
+}
+
+/// 删除文件或目录。先逐个检查删除权限（任何一项不允许就整体拒绝），再按方式删除：
+/// - 默认移入系统回收站，rollback 时从回收站还原；
+/// - 回收站不可用（或配置关闭）时退回“备份后删除”，同样可 rollback；
+/// - `permanent` 时直接彻底删除，不可恢复。
+///
+/// 符号链接只删除链接本身，不跟随。
+pub fn rm(ctx: &Ctx, body: Value) -> Result<Value> {
+    let req: RmReq = parse(body)?;
+    let ws = &ctx.st.ws;
+    let r = ws.resolve_entry(&req.path)?;
+    if r.rel.is_empty() {
+        return Err(AppError::bad_request("不能删除工作区根目录"));
+    }
+    if !r.exists {
+        return Err(AppError::not_found(format!("路径不存在: {}", r.display())));
+    }
+    let meta = fs::symlink_metadata(&r.abs)?;
+    let top_is_dir = meta.is_dir();
+    if top_is_dir && !req.recursive {
+        return Err(AppError::bad_request(format!(
+            "{} 是目录，删除目录请加 --recursive（-r）",
+            r.display()
+        )));
+    }
+
+    // 收集要删除的全部条目（目录在前、先父后子），同时检查删除权限
+    let mut items: Vec<(std::path::PathBuf, String, RmKind)> = Vec::new();
+    let mut total: u64 = 0;
+    let mut stack = vec![(r.abs.clone(), r.rel.clone(), meta)];
+    while let Some((abs, rel, m)) = stack.pop() {
+        let display = format!("{}:{rel}", r.ws);
+        ws.check_abs(
+            &r.ws,
+            &r.root,
+            &abs,
+            &display,
+            super::workspace::Access::Delete,
+        )?;
+        let kind = if m.file_type().is_symlink() {
+            RmKind::Link
+        } else if m.is_dir() {
+            let mut children: Vec<_> = fs::read_dir(&abs)?.flatten().collect();
+            children.sort_by_key(|e| e.file_name());
+            for c in children.into_iter().rev() {
+                let cm = fs::symlink_metadata(c.path())?;
+                let crel = format!("{rel}/{}", c.file_name().to_string_lossy());
+                stack.push((c.path(), crel, cm));
+            }
+            RmKind::Dir
+        } else {
+            total += m.len();
+            RmKind::File
+        };
+        items.push((abs, display, kind));
+        if items.len() > RM_MAX_ENTRIES {
+            return Err(AppError::bad_request(format!(
+                "要删除的条目超过 {RM_MAX_ENTRIES} 个，请缩小范围"
+            )));
+        }
+    }
+    let count = |k: fn(&RmKind) -> bool| items.iter().filter(|(_, _, x)| k(x)).count() as u64;
+    let files = count(|k| matches!(k, RmKind::File));
+    let dirs = count(|k| matches!(k, RmKind::Dir));
+    let links = count(|k| matches!(k, RmKind::Link));
+
+    let mut op_id: Option<String> = None;
+    let mut trash_error: Option<String> = None;
+    let method = if req.permanent {
+        delete_items(&items)?;
+        "permanent"
+    } else {
+        let trashed = if ctx.st.cfg.policy.rm_use_trash {
+            let since = super::recycle::now_secs();
+            match super::recycle::move_to_trash(&r.abs) {
+                Ok(()) => {
+                    let mut op = backup::Op::new(&ctx.st.home)?;
+                    op.add_trashed(&r.abs, &r.display(), since)?;
+                    op_id = Some(op.id.clone());
+                    op.finish();
+                    true
+                }
+                Err(e) => {
+                    trash_error = Some(e);
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        if trashed {
+            "trash"
+        } else {
+            // 回收站不可用：先备份全部条目再删除
+            let max_bytes = ctx.st.cfg.policy.max_transfer_mb * 1024 * 1024;
+            if total > max_bytes {
+                return Err(AppError::bad_request(format!(
+                    "回收站不可用{}，且要删除的文件总量超过 max_transfer_mb（{} MB）无法备份；\
+                     请缩小范围、调大该配置，或确认后使用 --permanent 彻底删除",
+                    trash_error
+                        .as_deref()
+                        .map(|e| format!("（{e}）"))
+                        .unwrap_or_default(),
+                    ctx.st.cfg.policy.max_transfer_mb
+                )));
+            }
+            let mut op = backup::Op::new(&ctx.st.home)?;
+            for (abs, display, kind) in &items {
+                match kind {
+                    RmKind::Dir => op.add_removed_dir(abs, display)?,
+                    RmKind::Link => op.add_removed_link(abs, display)?,
+                    RmKind::File => op.add(abs, display)?,
+                }
+            }
+            op_id = Some(op.id.clone());
+            delete_items(&items)?;
+            op.finish();
+            "backup"
+        }
+    };
+    ctx.st.audit.log(
+        &ctx.ip,
+        &ctx.caller,
+        "rm",
+        true,
+        json!({"path": r.display(), "method": method, "op_id": op_id, "files": files, "dirs": dirs, "bytes": total}),
+    );
+    Ok(json!({
+        "path": r.display(),
+        "method": method,
+        "op_id": op_id,
+        "trash_error": trash_error,
+        "files": files,
+        "dirs": dirs,
+        "links": links,
+        "bytes": total,
+    }))
+}
+
+/// 直接删除收集到的条目：先删文件与链接，再从最深处删目录。
+fn delete_items(items: &[(std::path::PathBuf, String, RmKind)]) -> Result<()> {
+    for (abs, _, kind) in items {
+        match kind {
+            RmKind::File => fs::remove_file(abs)?,
+            RmKind::Link => remove_link(abs)?,
+            RmKind::Dir => {}
+        }
+    }
+    for (abs, _, kind) in items.iter().rev() {
+        if let RmKind::Dir = kind {
+            fs::remove_dir(abs)?;
+        }
+    }
+    Ok(())
+}
+
+/// 删除符号链接 / junction 本身。Windows 上指向目录的链接要用 remove_dir。
+fn remove_link(abs: &std::path::Path) -> std::io::Result<()> {
+    match fs::remove_file(abs) {
+        Ok(()) => Ok(()),
+        Err(e) if cfg!(windows) => fs::remove_dir(abs).map_err(|_| e),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]

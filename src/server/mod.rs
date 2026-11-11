@@ -7,6 +7,7 @@ mod exec;
 mod fs;
 mod jobs;
 pub mod log;
+mod recycle;
 pub mod transfer;
 mod upgrade;
 mod warm;
@@ -132,8 +133,9 @@ fn serve_inner(home: &Path, wait_port_secs: u64) -> Result<()> {
     );
     crate::slog!("  日志:   {}", log::dir(home).display());
     crate::slog!(
-        "  黑名单: {} 条路径规则，{} 条命令规则",
+        "  黑名单: {} 条禁止路径，{} 条路径权限规则，{} 条命令规则",
         ws.deny_rules().len(),
+        ws.perm_rules().len(),
         cfg.policy.deny_commands.len()
     );
 
@@ -259,6 +261,7 @@ fn dispatch(st: &Arc<State>, ip: String, req: http::Request, conn: &mut Conn) {
         "/v1/fs/read" => fs::read(&ctx, body),
         "/v1/fs/write" => fs::write(&ctx, body),
         "/v1/fs/edit" => fs::edit(&ctx, body),
+        "/v1/fs/rm" => fs::rm(&ctx, body),
         "/v1/fs/grep" => fs::grep(&ctx, body),
         "/v1/fs/get" => {
             transfer::get(&ctx, body, w);
@@ -315,6 +318,9 @@ fn info(ctx: &Ctx) -> Value {
         "workspaces": ws,
         "default_workspace": ctx.st.ws.default_name(),
         "deny_paths": ctx.st.ws.deny_rules(),
+        "path_rules": ctx.st.ws.perm_rules().into_iter()
+            .map(|(path, allow)| json!({"path": path, "allow": allow}))
+            .collect::<Vec<_>>(),
         "deny_commands": ctx.st.cfg.policy.deny_commands,
         "default_timeout_secs": ctx.st.cfg.policy.default_timeout_secs,
         "max_timeout_secs": ctx.st.cfg.policy.max_timeout_secs,

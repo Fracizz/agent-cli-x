@@ -2,6 +2,7 @@
 //! 语义同 `cp -r`：目标是已存在目录时，源放到它下面；否则目标就是源的新路径。
 
 use super::backup::Op;
+use super::workspace::Access;
 use super::Ctx;
 use crate::error::{AppError, Result};
 use crate::{frame, http, util};
@@ -9,7 +10,7 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::fs::{self, File};
-use std::io::{BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 fn join_rel(a: &str, b: &str) -> String {
@@ -64,7 +65,13 @@ fn set_exec(_p: &Path) {}
 
 pub fn put<S: Read + Write>(ctx: &Ctx, len: u64, conn: &mut BufReader<S>) {
     let mut op: Option<Op> = None;
-    let res = put_inner(ctx, len, conn, &mut op);
+    let mut body = conn.by_ref().take(len);
+    let res = put_inner(ctx, len, &mut body, &mut op);
+    // 读完剩余请求体再回错误：否则连接带着未读数据关闭会触发 TCP RST，
+    // 客户端可能在读到错误响应之前就收到“连接被重置”。超过传输上限的请求不读，直接断开。
+    if res.is_err() && len <= max_put_bytes(ctx) {
+        let _ = std::io::copy(&mut body, &mut std::io::sink());
+    }
     let op_id = op.as_ref().filter(|o| !o.is_empty()).map(|o| o.id.clone());
     if let Some(o) = op {
         o.finish();
@@ -95,25 +102,30 @@ pub fn put<S: Read + Write>(ctx: &Ctx, len: u64, conn: &mut BufReader<S>) {
     }
 }
 
-fn put_inner<S: Read>(
+/// put 请求体上限：max_transfer_mb 再留 1 MB 给帧头。
+fn max_put_bytes(ctx: &Ctx) -> u64 {
+    ctx.st.cfg.policy.max_transfer_mb * 1024 * 1024 + 1024 * 1024
+}
+
+fn put_inner<R: BufRead>(
     ctx: &Ctx,
     len: u64,
-    conn: &mut BufReader<S>,
+    mut body: &mut R,
     op: &mut Option<Op>,
 ) -> Result<Value> {
     let max = ctx.st.cfg.policy.max_transfer_mb * 1024 * 1024;
-    if len > max + 1024 * 1024 {
+    if len > max_put_bytes(ctx) {
         return Err(AppError::bad_request(format!(
             "传输量超过 max_transfer_mb（{} MB）",
             ctx.st.cfg.policy.max_transfer_mb
         )));
     }
-    let mut body = conn.by_ref().take(len);
     let meta = frame::read_header(&mut body)?;
     let dest = meta["dest"].as_str().unwrap_or_default().to_string();
     let kind = meta["kind"].as_str().unwrap_or_default().to_string();
     let name = single_name(&meta["name"])?;
-    let dest_r = ctx.st.ws.resolve(&dest)?;
+    // 目标本身只做路径解析，权限按下面每个条目实际是新建还是覆盖逐个检查
+    let dest_r = ctx.st.ws.resolve_unchecked(&dest)?;
     let base_rel = if dest_r.exists && dest_r.abs.is_dir() {
         join_rel(&dest_r.rel, &name)
     } else {
@@ -137,9 +149,12 @@ fn put_inner<S: Read>(
         let r = ctx
             .st
             .ws
-            .resolve(&format!("{ws}:{}", join_rel(&base_rel, &parts.join("/"))))?;
+            .resolve_unchecked(&format!("{ws}:{}", join_rel(&base_rel, &parts.join("/"))))?;
         match h["k"].as_str() {
             Some("d") => {
+                if !r.exists {
+                    ctx.st.ws.check(&r, Access::Create)?;
+                }
                 if r.abs.is_file() {
                     return Err(AppError::conflict(format!(
                         "{} 已存在同名文件",
@@ -163,6 +178,12 @@ fn put_inner<S: Read>(
                 if r.abs.is_dir() {
                     return Err(AppError::conflict(format!("{} 是目录", r.display())));
                 }
+                let access = if r.exists {
+                    Access::Update
+                } else {
+                    Access::Create
+                };
+                ctx.st.ws.check(&r, access)?;
                 let parent = r
                     .abs
                     .parent()

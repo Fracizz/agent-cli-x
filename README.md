@@ -71,8 +71,9 @@ Then teach your agent the tool: copy [`skills/agent-cli-x/SKILL.md`](skills/agen
 | `upgrade <peer> [--binary <file>] [--force]` | replace the peer's binary and restart its `serve` (`A,B` / `@all` allowed) |
 | `exec <peer> --detach <cmd>`, `job list\|logs\|kill` | background jobs (`job logs --follow` exits with the job's code) |
 | `ls` / `grep` / `read` / `write` / `edit` | file operations inside workspaces |
+| `rm <peer> <path> [-r] [--permanent]` | delete a file or directory: moved to the peer's recycle bin by default (undo with `rollback`); `--permanent` deletes for good |
 | `put <peer> <local> <dest>` / `get <peer> <src> <local>` | transfer files or directories (`--exclude`) |
-| `rollback <peer> <op_id>` | undo a write/edit/put |
+| `rollback <peer> <op_id>` | undo a write/edit/put/rm |
 | `skill` | print the agent guide |
 
 Paths use `workspace:relative/path`. See `agent-cli-x --help`.
@@ -104,7 +105,7 @@ token = "..."
 proj = "D:/code/proj"
 
 [policy]
-deny_paths = [             # forbidden paths (dirs block everything below them)
+deny_paths = [             # hard deny: no access at all, cannot be re-opened by [[policy.paths]]
   "secrets",               # relative to each workspace root
   "**/.env",               # glob, any depth
   "proj:config/prod",      # only in workspace `proj`
@@ -116,8 +117,33 @@ max_timeout_secs = 3600
 max_transfer_mb = 2048     # per put/get
 max_jobs = 16              # concurrent background jobs
 job_timeout_secs = 86400
+rm_use_trash = true        # rm moves to the recycle bin; false = back up to ~/.agent-cli-x/backup then delete
 # prewarm_shells = 2       # idle PowerShell kept ready for exec; unset = 1 per 4 GB RAM (1–4), set = capped at RAM in GB, 0 = off
+
+# CRUD permissions per path (keep these at the end of [policy]).
+# allow: r = read (ls/read/grep/get, exec cwd), c = create, u = update (overwrite/edit), d = delete (rm); "" = none
+[[policy.paths]]
+path = "C:/"               # Windows preset: system drive read-only
+allow = "r"
+
+[[policy.paths]]
+path = "C:/Users/me/code"  # more specific rule wins: full access here
+allow = "rcud"
+
+[[policy.paths]]
+path = "proj:releases"     # may add new files, never overwrite or delete
+allow = "rc"
 ```
+
+Path rules (`deny_paths` and `[[policy.paths]]`): relative to each workspace root (`secrets`, `**/.env`), scoped (`proj:config/prod`; `proj:` alone is the workspace root), or absolute (`C:/`, `/etc`); `* ? ** [abc]` globs, case-insensitive on Windows.
+
+How permissions are resolved for a path:
+
+1. The agent-cli-x data folder, or a `deny_paths` match on the path or any parent → no access.
+2. Otherwise walk from the path up to the root; the first level with a matching `[[policy.paths]]` rule decides. At that level, rules without wildcards win over glob rules; several rules of the same kind are intersected. (A glob like `**/*.lock` matches the file itself, so it is more specific than a rule on its directory.)
+3. No match → full access (`rcud`).
+
+`readonly_paths = [...]` from older configs still works and equals `allow = "r"`. `exec` commands are not covered by path permissions.
 
 ### Performance
 
@@ -130,11 +156,16 @@ Intended for machines you own on a trusted network.
 - Traffic is TLS. Clients pin the server certificate fingerprint; a changed fingerprint is a hard error (exit 106).
 - Access requires a token: the `default` one from `config.toml`, or a per-caller token from `token add`. Tokens are compared in constant time, and failures are delayed and audited.
 - File operations are confined to workspaces: canonicalized paths, no `..`, no absolute paths, no symlink/junction escapes, deny-list checked on every ancestor. The agent-cli-x data folder is always denied.
-- `deny_paths` applies to `ls`/`read`/`write`/`edit`/`rollback` and to the `exec` working directory. **A shell command itself cannot be sandboxed**: `exec "cat secrets/x"` can still read the file. For hard isolation, run `serve` as a dedicated low-privilege OS user and protect directories with file-system permissions.
+- Path permissions are enforced per operation: `ls`/`read`/`grep`/`get` and the `exec` working directory need `r`; `write`/`put` need `c` for new files and `u` for existing ones; `edit` needs `u`; `rm` needs `d` on **every** entry it would remove (otherwise nothing is deleted); `rollback` checks the action it performs (restore = `u`, re-create = `c`, remove = `d`). **A shell command itself cannot be sandboxed**: `exec "cat secrets/x"` or `exec "rm x"` still works. For hard isolation, run `serve` as a dedicated low-privilege OS user and protect directories with file-system permissions.
+- `init` writes OS-specific presets, which you are free to edit:
+  - Windows: `C:/` read-only, `C:/Windows/System32/config` denied; commands such as `rd /s /q c:\`, `Remove-Item -Recurse -Force C:\Windows`, `format c:`, `diskpart`, `bcdedit` blocked. **If your workspaces live on `C:`, add a more specific `[[policy.paths]]` rule for them (e.g. `allow = "rcud"`) to allow writes.**
+  - Linux: `/bin`, `/sbin`, `/lib*`, `/usr`, `/etc`, `/boot`, `/var/lib`, `/proc`, `/sys`, `/dev` read-only; `/etc/shadow`, `/etc/gshadow`, `/etc/sudoers*`, `/root/.ssh` denied; `rm -rf /etc` (and other system dirs), `--no-preserve-root`, `mkfs`, `reboot` etc. blocked.
+  - macOS: `/System`, `/Library`, `/usr`, `/bin`, `/sbin`, `/private/etc`, `/private/var/db`, `/Applications` read-only.
 - `deny_commands` is a guard rail against accidents, not a security boundary.
-- `grep`, `get` and `ls` skip deny-listed paths; `put` refuses to write into them.
+- `grep`, `get` and `ls` skip unreadable paths; `put` refuses to write where it lacks `c`/`u`.
 - Background jobs run as the same user; their output lives in `~/.agent-cli-x/jobs/` (7 days). Jobs still running when `serve` restarts are marked `lost`.
 - Every write/edit/put is backed up to `~/.agent-cli-x/backup/` (7 days). All requests are logged to `~/.agent-cli-x/audit/YYYY-MM-DD.jsonl` with the client IP and token name.
+- `rm` moves files to the system recycle bin (Windows Recycle Bin, freedesktop Trash on Linux, Trash on macOS), so it is fast and has no size cap; `rollback` restores them from there (Windows/Linux; on macOS restore from the Trash by hand). It refuses to restore over a path that exists again. If the recycle bin is unavailable (e.g. a Linux mount without a writable `.Trash` dir) or `rm_use_trash = false`, it falls back to backing up to `~/.agent-cli-x/backup/` and deleting, limited to `max_transfer_mb`. `rm --permanent` skips both and cannot be undone.
 - `serve` writes its own log (startup, token reloads, upgrades, internal errors, panics) to `~/.agent-cli-x/serve-logs/` (7 days) as well as to stderr. When it runs at boot with no console, check this log first.
 
 ## Start at boot (recommended)
