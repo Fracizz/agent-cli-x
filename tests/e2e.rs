@@ -381,6 +381,36 @@ fn identity_grep_transfer_jobs() {
     let list = String::from_utf8_lossy(&run(c, &["peer", "list"]).stdout).to_string();
     assert!(list.contains(&node_id), "{list}");
 
+    // peer add 时缓存了对端系统/架构/shell，peer list 无需联网即可给出
+    let cached = |c: &Path| -> serde_json::Value {
+        let list = json_of(&run(c, &["peer", "list", "--json"]));
+        list.as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == "b")
+            .cloned()
+            .unwrap()
+    };
+    let b = cached(c);
+    assert_eq!(b["os"], info["os"]);
+    assert_eq!(b["arch"], info["arch"]);
+    assert_eq!(b["shell"], info["shell"]);
+    assert!(b["os"].is_string(), "{b}");
+
+    // 旧版登记的对端没有这些字段：info 之后应自动补齐
+    let peers_toml = c.join("peers.toml");
+    let old: String = fs::read_to_string(&peers_toml)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.starts_with("os =") && !l.starts_with("arch =") && !l.starts_with("shell ="))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    fs::write(&peers_toml, old).unwrap();
+    assert!(cached(c)["os"].is_null());
+    assert!(run(c, &["info", "b"]).status.success());
+    assert_eq!(cached(c)["os"], info["os"]);
+    assert_eq!(cached(c)["shell"], info["shell"]);
+
     // grep：命中正常文件，跳过黑名单目录
     let o = run(c, &["grep", "b", "println", "proj:"]);
     assert!(o.status.success(), "{}", text(&o));

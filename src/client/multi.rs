@@ -335,6 +335,12 @@ pub fn probe(peer: &str) -> Result<(Value, u64)> {
 pub fn info_many(peers: &[String], json: bool) -> i32 {
     super::disable_version_warning();
     let results = parallel(peers, |p| (p.to_string(), probe(p)));
+    // 并行探测结束后一次性刷新缓存，避免并发读写 peers.toml
+    let fresh: Vec<(&str, &Value)> = results
+        .iter()
+        .filter_map(|(p, r)| r.as_ref().ok().map(|(v, _)| (p.as_str(), v)))
+        .collect();
+    let _ = config::remember_peer_infos(&config::home_dir(), &fresh);
     let overall = results
         .iter()
         .find_map(|(_, r)| r.as_ref().err().map(|e| e.exit_code()))

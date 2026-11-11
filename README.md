@@ -65,7 +65,7 @@ Then teach your agent the tool: copy [`skills/agent-cli-x/SKILL.md`](skills/agen
 | `init` / `serve` / `whoami [--pair]` / `fingerprint` | set up, run and identify this machine |
 | `doctor [--no-peers]` | check config, local service, start at boot, firewall, peers and their versions |
 | `token add\|list\|remove\|rotate` | per-caller tokens for this machine (`rotate default` replaces the config token) |
-| `peer add\|list\|remove` | manage peers (`~/.agent-cli-x/peers.toml`) |
+| `peer add\|list\|remove` | manage peers (`~/.agent-cli-x/peers.toml`); `list` shows the cached OS/arch and shell, refreshed by `peer add`, `info` and `upgrade` |
 | `info <peer>` | OS, shell, workspaces, deny rules; `info @all` is a one-line-per-peer overview |
 | `exec <peer> [--cwd] [--shell] [--timeout] [--env K=V] <cmd>` | run a command, streamed; `A,B` or `@all` runs on several peers in parallel |
 | `upgrade <peer> [--binary <file>] [--force]` | replace the peer's binary and restart its `serve` (`A,B` / `@all` allowed) |

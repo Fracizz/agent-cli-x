@@ -255,8 +255,7 @@ pub fn run(json: bool, check_peers: bool) -> Result<i32> {
                         addr: addr.clone(),
                         token: cfg.token.clone(),
                         fingerprint: fp,
-                        node_name: None,
-                        node_id: None,
+                        ..Default::default()
                     },
                 );
                 match me.call("/v1/info", &json!({}), Duration::from_secs(10)) {

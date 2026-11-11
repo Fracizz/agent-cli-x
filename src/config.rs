@@ -311,7 +311,7 @@ pub struct Peers {
     pub peers: BTreeMap<String, Peer>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Peer {
     pub addr: String,
     pub token: String,
@@ -321,6 +321,37 @@ pub struct Peer {
     pub node_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_id: Option<String>,
+    /// 对端系统、架构与默认 shell 的缓存，让调用方不必每次先请求 info。
+    /// 在 `peer add`、`info`、`upgrade` 成功后刷新；旧版登记的对端可能缺失。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
+}
+
+impl Peer {
+    /// 用对端 `/v1/info` 的结果更新缓存字段，返回是否有变化。
+    /// info 中缺失的字段（如旧版本对端）保留原值，不会被清空。
+    pub fn absorb_info(&mut self, info: &serde_json::Value) -> bool {
+        let mut changed = false;
+        for (slot, key) in [
+            (&mut self.node_name, "node_name"),
+            (&mut self.node_id, "node_id"),
+            (&mut self.os, "os"),
+            (&mut self.arch, "arch"),
+            (&mut self.shell, "shell"),
+        ] {
+            if let Some(v) = info[key].as_str() {
+                if slot.as_deref() != Some(v) {
+                    *slot = Some(v.to_string());
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
 }
 
 pub fn peers_path(home: &Path) -> PathBuf {
@@ -335,6 +366,22 @@ pub fn load_peers(home: &Path) -> Result<Peers> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Peers::default()),
         Err(e) => Err(e.into()),
     }
+}
+
+/// 把若干对端最新的 info 写回 `peers.toml`（只在有变化时写盘）。
+/// 属于顺带刷新缓存，调用方应忽略其错误，不影响主流程。
+pub fn remember_peer_infos(home: &Path, items: &[(&str, &serde_json::Value)]) -> Result<()> {
+    let mut peers = load_peers(home)?;
+    let mut changed = false;
+    for (name, info) in items {
+        if let Some(p) = peers.peers.get_mut(*name) {
+            changed |= p.absorb_info(info);
+        }
+    }
+    if changed {
+        save_peers(home, &peers)?;
+    }
+    Ok(())
 }
 
 pub fn save_peers(home: &Path, peers: &Peers) -> Result<()> {

@@ -12,8 +12,8 @@ Install the binary on `PATH` (see README) so it can be called as `agent-cli-x` f
 
 ```bash
 agent-cli-x whoami             # which machine am I (node name + id)
-agent-cli-x peer list          # registered peers with their node name + id
-agent-cli-x info <peer>        # node name/id, OS, default shell, workspaces, deny rules
+agent-cli-x peer list          # registered peers: node name + id, OS/arch, default shell (cached, no network)
+agent-cli-x info <peer>        # live: workspaces, deny rules, jobs (also refreshes the cached OS/shell)
 agent-cli-x info @all          # every peer: online?, version, latency
 agent-cli-x doctor             # local service, start at boot, firewall, peers
 ```
@@ -54,7 +54,7 @@ Add `--json` to any command for machine-readable output.
 ## Rules of thumb
 
 - Commands run non-interactively (empty stdin, `CI=1`). Anything that prompts will hang until timeout: pass `-y` / `--yes` / `--no-edit`.
-- Default shell: `pwsh` (fallback `powershell`) on Windows, `sh` on Linux. Check `info` and use matching syntax.
+- Default shell: `pwsh` (fallback `powershell`) on Windows, `sh` on Linux. `peer list` already shows each peer's OS and shell, so you do not need `info` just for that. If it shows `-` (peer registered by an older version), run `info <peer>` once to fill it in.
 - Every `exec` is a fresh shell: `cd`, variables and env changes do not carry over to the next call. Use `--cwd` / `--env`, or chain steps in one command.
 - Long output shows the first and last ~200 lines; the full log path is printed to stderr and can be read locally.
 - `edit` needs `--old` to match **exactly once** (including indentation). Widen the context or use `--all`. CRLF/LF is handled.

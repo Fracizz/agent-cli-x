@@ -303,6 +303,7 @@ pub fn run() -> Result<i32> {
         }
         Cmd::Info { peer } => {
             let v = Client::load(&peer)?.call("/v1/info", &json!({}), CALL_TIMEOUT)?;
+            let _ = config::remember_peer_infos(&config::home_dir(), &[(peer.as_str(), &v)]);
             if json {
                 println!("{v}");
             } else {
@@ -809,13 +810,11 @@ fn peer(cmd: PeerCmd, json: bool) -> Result<i32> {
                 addr: addr.clone(),
                 token,
                 fingerprint: seen,
-                node_name: None,
-                node_id: None,
+                ..Default::default()
             };
             let info =
                 Client::from_peer(&name, p.clone()).call("/v1/info", &json!({}), CALL_TIMEOUT)?;
-            p.node_name = info["node_name"].as_str().map(|s| s.to_string());
-            p.node_id = info["node_id"].as_str().map(|s| s.to_string());
+            p.absorb_info(&info);
             let mut peers = config::load_peers(&home)?;
             if let Some(id) = &p.node_id {
                 if let Some((other, _)) = peers
@@ -850,6 +849,9 @@ fn peer(cmd: PeerCmd, json: bool) -> Result<i32> {
                             "addr": p.addr,
                             "node_name": p.node_name,
                             "node_id": p.node_id,
+                            "os": p.os,
+                            "arch": p.arch,
+                            "shell": p.shell,
                             "fingerprint": p.fingerprint,
                         })
                     })
@@ -861,11 +863,18 @@ fn peer(cmd: PeerCmd, json: bool) -> Result<i32> {
                 );
             } else {
                 for (n, p) in &peers.peers {
+                    // 系统/架构与 shell 来自登记或最近一次 info 的缓存；缺失时显示 -
+                    let platform = match (&p.os, &p.arch) {
+                        (Some(o), Some(a)) => format!("{o}/{a}"),
+                        (Some(o), None) => o.clone(),
+                        _ => "-".into(),
+                    };
                     println!(
-                        "{n}\t{}\t{} ({})",
+                        "{n}\t{}\t{} ({})\t{platform}\t{}",
                         p.addr,
                         p.node_name.as_deref().unwrap_or("-"),
-                        p.node_id.as_deref().unwrap_or("-")
+                        p.node_id.as_deref().unwrap_or("-"),
+                        p.shell.as_deref().unwrap_or("-")
                     );
                 }
             }

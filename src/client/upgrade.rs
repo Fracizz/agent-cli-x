@@ -100,6 +100,11 @@ pub fn upgrade(client: &Client, binary: Option<&Path>, force: bool) -> Result<Va
             resp["path"].as_str().unwrap_or("?")
         )));
     }
+    // 升级后顺带刷新本地缓存的对端系统信息（失败不影响升级结果）
+    let _ = crate::config::remember_peer_infos(
+        &crate::config::home_dir(),
+        &[(client.name.as_str(), &after)],
+    );
     Ok(json!({
         "peer": client.name,
         "old_version": old_version,
