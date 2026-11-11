@@ -33,11 +33,16 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           if command -v musl-gcc >/dev/null 2>&1; then exit 0; fi
-          sudo timeout 90 apt-get -o Acquire::Retries=1 \
-            -o Acquire::http::Timeout=8 -o Acquire::https::Timeout=8 update || true
-          sudo timeout 150 apt-get install -y --no-install-recommends \
-            -o Acquire::Retries=1 -o Acquire::http::Timeout=8 -o Acquire::https::Timeout=8 \
-            musl-tools || true
+          # 先探测 DNS，解析不了就别在 apt 上耗时间
+          if timeout 10 getent hosts archive.ubuntu.com >/dev/null 2>&1; then
+            sudo timeout 90 apt-get -o Acquire::Retries=1 \
+              -o Acquire::http::Timeout=8 -o Acquire::https::Timeout=8 update || true
+            sudo timeout 150 apt-get install -y --no-install-recommends \
+              -o Acquire::Retries=1 -o Acquire::http::Timeout=8 -o Acquire::https::Timeout=8 \
+              musl-tools || true
+          else
+            echo "runner 无法解析 ubuntu 归档源，跳过 apt"
+          fi
           command -v musl-gcc >/dev/null 2>&1 && echo "musl-gcc ready" || echo "musl-gcc unavailable, will use cross image"
       - name: Build
         if: runner.os != 'Linux'
@@ -50,9 +55,14 @@ jobs:
             CC_x86_64_unknown_linux_musl=musl-gcc \
               cargo build --locked --release --target ${{ matrix.target }}
           else
-            docker run --rm -v "$PWD":/project -w /project \
+            # cross 镜像只提供 musl 交叉工具链，Rust 工具链仍然挂载 runner 上已装好的那份
+            docker run --rm \
+              -v "$PWD":/project -w /project \
+              -v "$HOME/.cargo":/cargo -v "$HOME/.rustup":/rustup \
+              -e CARGO_HOME=/cargo -e RUSTUP_HOME=/rustup \
+              --entrypoint /cargo/bin/cargo \
               ghcr.io/cross-rs/${{ matrix.target }}:edge \
-              cargo build --locked --release --target ${{ matrix.target }}
+              build --locked --release --target ${{ matrix.target }}
             sudo chown -R "$(id -u):$(id -g)" target
           fi
       - name: Package (Linux)
