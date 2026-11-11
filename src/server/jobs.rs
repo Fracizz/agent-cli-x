@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 
 pub const RETAIN_DAYS: u64 = 7;
 const HEARTBEAT: Duration = Duration::from_secs(15);
+/// job kill 等待任务真正结束的最长时间
+const KILL_WAIT: Duration = Duration::from_secs(5);
 
 pub struct Jobs {
     dir: PathBuf,
@@ -269,7 +271,16 @@ pub fn kill(ctx: &Ctx, body: Value) -> Result<Value> {
             ctx.st
                 .audit
                 .log(&ctx.ip, "job_kill", true, json!({"id": req.id}));
-            Ok(json!({"id": req.id, "status": "killing"}))
+            // 等任务线程真正终止进程并写回状态，避免紧接着的 job logs / list 仍显示 running
+            let deadline = Instant::now() + KILL_WAIT;
+            while ctx.st.jobs.running_flag(&req.id).is_some() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(50));
+            }
+            let status = read_meta(&dir.join("meta.json"))
+                .and_then(|m| m["status"].as_str().map(|s| s.to_string()))
+                .filter(|s| s != "running")
+                .unwrap_or_else(|| "killing".into());
+            Ok(json!({"id": req.id, "status": status}))
         }
         None => {
             let status = read_meta(&dir.join("meta.json"))

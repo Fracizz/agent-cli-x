@@ -1,7 +1,6 @@
 //! 平台差异：shell 选择、进程树终止、输出回退编码、主机名。
 
 use crate::error::{AppError, Result};
-use base64::Engine;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::OnceLock;
@@ -86,18 +85,20 @@ if ($LASTEXITCODE) { exit $LASTEXITCODE }
 exit 1
 ";
 
+/// PowerShell 脚本经此环境变量传给子进程。
+const PS_SCRIPT_ENV: &str = "AGENT_CLI_X_PS_SCRIPT";
+
 pub fn build_command(shell: Shell, cmd: &str) -> Result<Command> {
     let mut c = match shell {
         Shell::Pwsh | Shell::PowerShell => {
             let script = PS_WRAPPER.replace("__AGENT_CLI_CMD__", cmd);
-            let utf16: Vec<u8> = script
-                .encode_utf16()
-                .flat_map(|u| u.to_le_bytes())
-                .collect();
-            let encoded = base64::engine::general_purpose::STANDARD.encode(utf16);
-            if encoded.len() > 30_000 {
+            // 不用 -EncodedCommand：Windows PowerShell 5.1 在该模式下会把 stderr
+            // 序列化成 `#< CLIXML` 格式。改为经环境变量传入脚本、-Command 里 Invoke-Expression：
+            // 错误输出保持纯文本，且报错回显的调用行很短；exit 退出码照常透传。
+            // 环境变量值上限 32767 个 UTF-16 字符。
+            if script.encode_utf16().count() > 30_000 {
                 return Err(AppError::bad_request(
-                    "命令过长（超过约 10000 字符），请先用 write 写入脚本文件再执行",
+                    "命令过长（超过约 30000 字符），请先用 write 写入脚本文件再执行",
                 ));
             }
             let mut c = Command::new(if shell == Shell::Pwsh {
@@ -109,7 +110,14 @@ pub fn build_command(shell: Shell, cmd: &str) -> Result<Command> {
             if cfg!(windows) {
                 c.args(["-ExecutionPolicy", "Bypass"]);
             }
-            c.args(["-EncodedCommand", &encoded]);
+            c.env(PS_SCRIPT_ENV, &script);
+            // 读出后立即删除该变量，避免泄漏给用户命令启动的子进程
+            c.args([
+                "-Command",
+                &format!(
+                    "$__s=$env:{PS_SCRIPT_ENV}; Remove-Item Env:{PS_SCRIPT_ENV}; Invoke-Expression $__s"
+                ),
+            ]);
             c
         }
         Shell::Cmd => {

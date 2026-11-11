@@ -116,7 +116,7 @@ Run `serve` **as your own user**, not as SYSTEM/root, so commands see your toolc
 
 ## Exit codes
 
-Remote exit codes pass through. agent-cli-x's own errors: 100 connect, 101 auth, 102 policy denied, 103 not found, 104 timeout, 105 conflict, 106 fingerprint, 110 bad arguments, 111 busy. `grep` exits 1 when nothing matches; `job logs` exits 137 for a killed job.
+Remote exit codes pass through. agent-cli-x's own errors: 100 connect, 101 auth, 102 policy denied, 103 not found, 104 timeout, 105 conflict, 106 fingerprint, 107 local/remote I/O error, 108 other, 109 config (e.g. unknown peer, missing config), 110 bad arguments, 111 busy. `grep` exits 1 when nothing matches; `job logs` exits 137 for a killed job.
 
 ## License
 

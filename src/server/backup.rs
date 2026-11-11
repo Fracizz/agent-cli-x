@@ -59,6 +59,37 @@ impl Op {
         self.save()
     }
 
+    /// 创建目录 `abs`（含缺失的上级，不越过工作区根 `root`），并记录本次新建的目录，
+    /// 回滚时在删除新建文件之后删除这些目录（仅当已为空）。
+    pub fn create_dirs(&mut self, root: &Path, abs: &Path, ws: &str) -> Result<()> {
+        let mut missing = Vec::new();
+        let mut cur = abs;
+        while !cur.exists() && cur.starts_with(root) && cur != root {
+            missing.push(cur.to_path_buf());
+            match cur.parent() {
+                Some(p) => cur = p,
+                None => break,
+            }
+        }
+        fs::create_dir_all(abs)?;
+        // 外层先记录：回滚时逆序处理，内层目录先删
+        for d in missing.into_iter().rev() {
+            let path = d.to_string_lossy().to_string();
+            if self.entries.iter().any(|e| e["path"] == path) {
+                continue;
+            }
+            let rel = d
+                .strip_prefix(root)
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            let idx = self.entries.len();
+            self.entries.push(json!({
+                "path": path, "display": format!("{ws}:{rel}"), "existed": false, "dir": true, "idx": idx
+            }));
+        }
+        self.save()
+    }
+
     fn save(&self) -> Result<()> {
         let meta = json!({"op_id": self.id, "ts": util::now_iso(), "entries": self.entries});
         fs::write(
@@ -125,7 +156,14 @@ pub fn rollback(ctx: &Ctx, body: Value) -> Result<Value> {
     }
     let mut files = Vec::new();
     for (e, abs, backup_file) in plan {
-        let action = if e["existed"].as_bool().unwrap_or(false) {
+        let action = if e["dir"] == true {
+            // 只删空目录：回滚后目录里若还有别的文件（非本次操作写入），保留
+            if abs.is_dir() && fs::remove_dir(&abs).is_ok() {
+                "rmdir"
+            } else {
+                "kept_dir"
+            }
+        } else if e["existed"].as_bool().unwrap_or(false) {
             let data = fs::read(backup_file)?;
             util::atomic_write(&abs, &data)?;
             "restored"

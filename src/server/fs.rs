@@ -347,18 +347,19 @@ pub fn write(ctx: &Ctx, body: Value) -> Result<Value> {
         .abs
         .parent()
         .ok_or_else(|| AppError::bad_request("无效路径"))?;
-    if !parent.is_dir() {
-        if req.mkdir {
-            fs::create_dir_all(parent)?;
-        } else {
-            return Err(AppError::not_found(format!(
-                "父目录不存在: {}（加 --mkdir 自动创建）",
-                r.display()
-            )));
-        }
+    let need_mkdir = !parent.is_dir();
+    if need_mkdir && !req.mkdir {
+        return Err(AppError::not_found(format!(
+            "父目录不存在: {}（加 --mkdir 自动创建）",
+            r.display()
+        )));
     }
     check_expect_sha(&r.abs, &req.expect_sha)?;
     let mut op = backup::Op::new(&ctx.st.home)?;
+    if need_mkdir {
+        // 记录新建的目录，rollback 时一并删除
+        op.create_dirs(&r.root, parent, &r.ws)?;
+    }
     op.add(&r.abs, &r.display())?;
     let op_id = op.id.clone();
     util::atomic_write(&r.abs, req.content.as_bytes())?;

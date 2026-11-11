@@ -71,6 +71,9 @@ Add `--json` to any command for machine-readable output.
 | 104 | timeout |
 | 105 | conflict (edit no/multiple match, sha mismatch) |
 | 106 | certificate fingerprint mismatch: ask a human, never re-register on your own |
+| 107 | I/O error (disk, permissions) |
+| 108 | other internal error |
+| 109 | config problem (unknown peer, missing/invalid config): run `agent-cli-x peer list` |
 | 110 | bad arguments |
 | 111 | busy (too many connections or jobs) |
 | 137 | job was killed |

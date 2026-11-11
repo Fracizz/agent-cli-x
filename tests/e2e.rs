@@ -447,6 +447,51 @@ fn identity_grep_transfer_jobs() {
     let op = v["op_id"].as_str().unwrap();
     assert!(run(c, &["rollback", "b", op]).status.success());
     assert!(!env.ws.join("dist/index.html").exists());
+    // dist/sub 里还有第二次 put 的文件，非空目录保留；其余新建目录删除
+    assert!(env.ws.join("dist/sub/index.html").is_file());
+    assert!(!env.ws.join("dist/sub/app.bin").exists());
+    // write --mkdir 新建的多级目录，rollback 时一并删除
+    let o = run(
+        c,
+        &[
+            "write",
+            "b",
+            "proj:new1/new2/f.txt",
+            "--content",
+            "x",
+            "--mkdir",
+            "--json",
+        ],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    let w: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert!(run(c, &["rollback", "b", w["op_id"].as_str().unwrap()])
+        .status
+        .success());
+    assert!(!env.ws.join("new1").exists());
+
+    // init --json 输出可解析
+    let tmp_home = env.server_home.parent().unwrap().join("init-json-home");
+    let o = Command::new(env!("CARGO_BIN_EXE_agent-cli-x"))
+        .env("AGENT_CLI_X_HOME", &tmp_home)
+        .args(["init", "--name", "jsontest", "--json"])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", text(&o));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["node_name"], "jsontest");
+    assert!(v["fingerprint"].as_str().unwrap().starts_with("sha256:"));
+
+    // Windows PowerShell 的错误输出应为纯文本，而非 CLIXML
+    if cfg!(windows) {
+        let o = run(c, &["exec", "b", "Write-Error boom; exit 4"]);
+        assert_eq!(o.status.code(), Some(4), "{}", text(&o));
+        let all = text(&o);
+        assert!(all.contains("boom") && !all.contains("CLIXML"), "{all}");
+        // 传脚本用的环境变量不泄漏给用户命令
+        let o = run(c, &["exec", "b", "\"[$env:AGENT_CLI_X_PS_SCRIPT]\""]);
+        assert_eq!(text(&o).trim(), "[]", "{}", text(&o));
+    }
 
     // 后台任务：启动 → follow 拿到输出与退出码
     // pwsh 与 sh 都支持这段语法
@@ -474,6 +519,9 @@ fn identity_grep_transfer_jobs() {
     let o = run(c, &["job", "logs", "b", &id2]);
     assert_eq!(o.status.code(), Some(0), "{}", text(&o));
     assert!(run(c, &["job", "kill", "b", &id2]).status.success());
+    // kill 返回时任务已结束，紧接着查看即为 killed
+    let o = run(c, &["job", "logs", "b", &id2]);
+    assert_eq!(o.status.code(), Some(137), "{}", text(&o));
     let started = Instant::now();
     let o = run(c, &["job", "logs", "b", &id2, "--follow"]);
     assert_eq!(o.status.code(), Some(137), "{}", text(&o));

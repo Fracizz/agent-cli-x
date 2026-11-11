@@ -140,7 +140,10 @@ fn put_inner<S: Read>(
                         r.display()
                     )));
                 }
-                fs::create_dir_all(&r.abs)?;
+                match op.as_mut() {
+                    Some(o) => o.create_dirs(&r.root, &r.abs, &r.ws)?,
+                    None => fs::create_dir_all(&r.abs)?,
+                }
                 dirs += 1;
             }
             Some("f") => {
@@ -159,7 +162,10 @@ fn put_inner<S: Read>(
                     .parent()
                     .ok_or_else(|| AppError::bad_request("无效路径"))?
                     .to_path_buf();
-                fs::create_dir_all(&parent)?;
+                match op.as_mut() {
+                    Some(o) => o.create_dirs(&r.root, &parent, &r.ws)?,
+                    None => fs::create_dir_all(&parent)?,
+                }
                 let fname = r
                     .abs
                     .file_name()

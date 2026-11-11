@@ -235,7 +235,7 @@ pub fn run() -> Result<i32> {
             listen,
             workspaces,
             force,
-        } => init(name, &listen, &workspaces, force),
+        } => init(name, &listen, &workspaces, force, json),
         Cmd::Serve => server::serve(&config::home_dir()).map(|_| 0),
         Cmd::Whoami => whoami(json),
         Cmd::Fingerprint => {
@@ -444,10 +444,11 @@ pub fn run() -> Result<i32> {
                 println!("{v}");
             } else {
                 for f in v["files"].as_array().into_iter().flatten() {
-                    let action = if f["action"] == "deleted" {
-                        "已删除新建的文件"
-                    } else {
-                        "已恢复为修改前内容"
+                    let action = match f["action"].as_str() {
+                        Some("deleted") => "已删除新建的文件",
+                        Some("rmdir") => "已删除新建的目录",
+                        Some("kept_dir") => "保留非空目录",
+                        _ => "已恢复为修改前内容",
                     };
                     println!("{action}: {}", f["path"].as_str().unwrap_or_default());
                 }
@@ -457,7 +458,13 @@ pub fn run() -> Result<i32> {
     }
 }
 
-fn init(name: Option<String>, listen: &str, workspaces: &[String], force: bool) -> Result<i32> {
+fn init(
+    name: Option<String>,
+    listen: &str,
+    workspaces: &[String],
+    force: bool,
+    json: bool,
+) -> Result<i32> {
     let home = config::home_dir();
     let cfg_path = config::config_path(&home);
     if cfg_path.exists() && !force {
@@ -488,6 +495,24 @@ fn init(name: Option<String>, listen: &str, workspaces: &[String], force: bool) 
     )?;
     util::restrict_permissions(&cfg_path);
     let port = listen.rsplit(':').next().unwrap_or("7700");
+    if json {
+        let ws_map: serde_json::Map<String, Value> =
+            ws.iter().map(|(n, p)| (n.clone(), json!(p))).collect();
+        println!(
+            "{}",
+            json!({
+                "home": home.display().to_string(),
+                "config": cfg_path.display().to_string(),
+                "node_name": node_name,
+                "node_id": node_id,
+                "listen": listen,
+                "token": token,
+                "fingerprint": fp,
+                "workspaces": ws_map,
+            })
+        );
+        return Ok(0);
+    }
     println!("已初始化 {}", home.display());
     println!("  机器:   {node_name} ({node_id})");
     println!("  配置:   {}", cfg_path.display());
@@ -735,7 +760,12 @@ fn job(cmd: JobCmd, json: bool) -> Result<i32> {
             if json {
                 println!("{v}");
             } else {
-                println!("已发送终止请求: {id}");
+                match v["status"].as_str() {
+                    Some("killing") => {
+                        println!("已发送终止请求: {id}（尚未确认结束，稍后用 job list 查看）")
+                    }
+                    _ => println!("已终止任务: {id}"),
+                }
             }
             Ok(0)
         }
