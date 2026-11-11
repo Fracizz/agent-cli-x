@@ -15,6 +15,8 @@ Machine B: Codex       ──> agent-cli-x ──TLS──> Machine A: agent-cli
 
 ## Install
 
+Prebuilt binaries for Linux (x86_64, statically linked) and Windows (x86_64) are on the [releases page](https://github.com/Fracizz/agent-cli-x/releases).
+
 ```bash
 cargo install --git https://github.com/Fracizz/agent-cli-x
 ```

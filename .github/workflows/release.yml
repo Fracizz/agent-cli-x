@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive: agent-cli-x-${{ github.ref_name }}-x86_64-linux-musl.tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: agent-cli-x-${{ github.ref_name }}-x86_64-windows-msvc.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          tar czf "${{ matrix.archive }}" -C "target/${{ matrix.target }}/release" agent-cli-x
+          sha256sum "${{ matrix.archive }}" > "${{ matrix.archive }}.sha256"
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "target/${{ matrix.target }}/release/agent-cli-x.exe" -DestinationPath "${{ matrix.archive }}"
+          "$((Get-FileHash -Algorithm SHA256 '${{ matrix.archive }}').Hash.ToLower())  ${{ matrix.archive }}" |
+            Out-File -Encoding ascii "${{ matrix.archive }}.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: |
+            ${{ matrix.archive }}
+            ${{ matrix.archive }}.sha256
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > release-notes.md <<EOF
+          First public release of agent-cli-x.
+
+          - \`agent-cli-x-${{ github.ref_name }}-x86_64-linux-musl.tar.gz\` – Linux x86_64, statically linked (musl)
+          - \`agent-cli-x-${{ github.ref_name }}-x86_64-windows-msvc.zip\` – Windows x86_64
+
+          Unpack the archive and put \`agent-cli-x\` (\`agent-cli-x.exe\` on Windows) on your \`PATH\`,
+          or run \`cargo install --git https://github.com/${{ github.repository }}\`.
+          EOF
+          gh release create "${{ github.ref_name }}" dist/* \
+            --repo "${{ github.repository }}" \
+            --title "agent-cli-x ${{ github.ref_name }}" \
+            --notes-file release-notes.md \
+            --verify-tag
