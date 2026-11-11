@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const DEFAULT_PORT: u16 = 7700;
+pub const DEFAULT_PORT: u16 = 47821;
 
 /// 数据目录：优先 `AGENT_CLI_X_HOME`，否则 `~/.agent-cli-x`。
 pub fn home_dir() -> PathBuf {
@@ -348,7 +348,7 @@ pub fn save_peers(home: &Path, peers: &Peers) -> Result<()> {
     Ok(())
 }
 
-/// `10.0.0.5` → `10.0.0.5:7700`
+/// `10.0.0.5` → `10.0.0.5:47821`
 pub fn normalize_addr(addr: &str) -> String {
     let a = addr.trim();
     let has_port = if let Some(rest) = a.strip_prefix('[') {
@@ -372,7 +372,7 @@ mod tests {
         let t = template(
             "dev-01",
             "00000000-0000-4000-8000-000000000000",
-            "0.0.0.0:7700",
+            "0.0.0.0:47821",
             "0123456789abcdef0123",
             &[("proj".into(), r"D:\code\x".into())],
         );
@@ -383,7 +383,7 @@ mod tests {
 
     #[test]
     fn addr_normalize() {
-        assert_eq!(normalize_addr("10.0.0.5"), "10.0.0.5:7700");
+        assert_eq!(normalize_addr("10.0.0.5"), "10.0.0.5:47821");
         assert_eq!(normalize_addr("10.0.0.5:9000"), "10.0.0.5:9000");
         assert_eq!(normalize_addr("[::1]:9000"), "[::1]:9000");
     }

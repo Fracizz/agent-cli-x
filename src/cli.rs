@@ -39,7 +39,7 @@ enum Cmd {
         #[arg(long)]
         name: Option<String>,
         /// 监听地址
-        #[arg(long, default_value = "0.0.0.0:7700")]
+        #[arg(long, default_value = "0.0.0.0:47821")]
         listen: String,
         /// 工作区，可重复：--workspace proj=D:/code/proj
         #[arg(long = "workspace", value_name = "NAME=PATH")]
@@ -190,7 +190,7 @@ enum PeerCmd {
     /// 登记对端。首次不带 --fingerprint 只显示指纹供核对
     Add {
         name: String,
-        /// IP:端口（端口默认 7700）
+        /// IP:端口（端口默认 47821）
         addr: String,
         #[arg(long)]
         token: String,
@@ -494,7 +494,7 @@ fn init(
         config::template(&node_name, &node_id, listen, &token, &ws).as_bytes(),
     )?;
     util::restrict_permissions(&cfg_path);
-    let port = listen.rsplit(':').next().unwrap_or("7700");
+    let port = listen.rsplit(':').next().unwrap_or("47821");
     if json {
         let ws_map: serde_json::Map<String, Value> =
             ws.iter().map(|(n, p)| (n.clone(), json!(p))).collect();
