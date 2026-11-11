@@ -66,8 +66,9 @@ pub struct Policy {
     #[serde(default = "d_job_timeout")]
     pub job_timeout_secs: u64,
     /// 预热的空闲 PowerShell 数量（仅默认 shell 为 pwsh / powershell 时生效），0 关闭。
-    #[serde(default = "d_prewarm")]
-    pub prewarm_shells: usize,
+    /// 不填时按内存自动决定，见 [`resolve_prewarm`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prewarm_shells: Option<usize>,
 }
 
 impl Default for Policy {
@@ -82,7 +83,7 @@ impl Default for Policy {
             max_transfer_mb: d_transfer_mb(),
             max_jobs: d_max_jobs(),
             job_timeout_secs: d_job_timeout(),
-            prewarm_shells: d_prewarm(),
+            prewarm_shells: None,
         }
     }
 }
@@ -108,9 +109,25 @@ fn d_transfer_mb() -> u64 {
 fn d_max_jobs() -> usize {
     16
 }
-fn d_prewarm() -> usize {
-    1
+/// 自动预热数量：每多少 GB 内存一个，以及上下限。
+const PREWARM_GB_PER_SHELL: u64 = 4;
+const PREWARM_AUTO_MIN: usize = 1;
+const PREWARM_AUTO_MAX: usize = 4;
+
+/// 计算实际预热数量。`configured` 为配置值（None 表示自动），`mem_gb` 为物理内存 GB 数（取不到为 None）。
+/// - 自动：每 4 GB 一个，限制在 1～4；内存未知时取 1。
+/// - 手动：按配置，但不超过内存 GB 数（至少允许 1 个）；内存未知时不做限制。
+pub fn resolve_prewarm(configured: Option<usize>, mem_gb: Option<u64>) -> usize {
+    match (configured, mem_gb) {
+        (None, Some(gb)) => {
+            ((gb / PREWARM_GB_PER_SHELL) as usize).clamp(PREWARM_AUTO_MIN, PREWARM_AUTO_MAX)
+        }
+        (None, None) => PREWARM_AUTO_MIN,
+        (Some(n), Some(gb)) => n.min((gb as usize).max(1)),
+        (Some(n), None) => n,
+    }
 }
+
 fn d_job_timeout() -> u64 {
     86_400
 }
@@ -293,8 +310,10 @@ job_timeout_secs = 86400
 
 # 预热的空闲 shell 数量：仅当默认 shell 是 pwsh / powershell 时生效（sh / bash / cmd 启动本来就快）。
 # 每条命令仍在全新进程中执行、互不影响，只是省掉 PowerShell 的冷启动时间（pwsh 约 0.3 秒，5.1 约 2 秒）。
-# 每个空闲进程约占几十 MB 内存；并发超过此数量时自动退回冷启动。设为 0 关闭。
-prewarm_shells = 1
+# 每个空闲进程约占 25～55 MB 内存；并发超过此数量时自动退回冷启动。
+# 不填时按物理内存自动决定：每 4 GB 一个，最少 1、最多 4。
+# 手动指定时可以超过 4，但不会超过内存的 GB 数（如 64 GB 最多 64 个）；设为 0 关闭。
+# prewarm_shells = 2
 "#,
         node_name = toml_str(node_name),
         node_id = toml_str(node_id),
@@ -488,6 +507,25 @@ pub fn normalize_addr(addr: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prewarm_auto_and_cap() {
+        use super::resolve_prewarm as r;
+        // 自动：每 4 GB 一个，1～4
+        assert_eq!(r(None, Some(2)), 1);
+        assert_eq!(r(None, Some(4)), 1);
+        assert_eq!(r(None, Some(8)), 2);
+        assert_eq!(r(None, Some(12)), 3);
+        assert_eq!(r(None, Some(16)), 4);
+        assert_eq!(r(None, Some(64)), 4);
+        assert_eq!(r(None, None), 1);
+        // 手动：可超过 4，但不超过内存 GB 数
+        assert_eq!(r(Some(0), Some(64)), 0);
+        assert_eq!(r(Some(10), Some(64)), 10);
+        assert_eq!(r(Some(100), Some(64)), 64);
+        assert_eq!(r(Some(3), Some(0)), 1);
+        assert_eq!(r(Some(7), None), 7);
+    }
+
     use super::*;
 
     #[test]

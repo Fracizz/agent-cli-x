@@ -101,14 +101,18 @@ fn serve_inner(home: &Path, wait_port_secs: u64) -> Result<()> {
     crate::slog!("  监听:   {}", cfg.listen);
     crate::slog!("  指纹:   {fp}");
     let shell = platform::default_shell();
-    let warm = warm::WarmPool::new(shell, cfg.policy.prewarm_shells);
+    let mem_gb = platform::total_memory_gb();
+    let configured = cfg.policy.prewarm_shells;
+    let warm = warm::WarmPool::new(shell, config::resolve_prewarm(configured, mem_gb));
     crate::slog!("  shell:  {}", shell.name());
     if warm.size() > 0 {
-        crate::slog!(
-            "  预热:   {} 个空闲 {}（policy.prewarm_shells）",
-            warm.size(),
-            shell.name()
-        );
+        let mem = mem_gb.map_or("内存未知".to_string(), |g| format!("内存 {g} GB"));
+        let how = match configured {
+            None => format!("自动，{mem}"),
+            Some(n) if n > warm.size() => format!("配置 {n}，超过{mem}，已限制"),
+            Some(_) => "policy.prewarm_shells".to_string(),
+        };
+        crate::slog!("  预热:   {} 个空闲 {}（{how}）", warm.size(), shell.name());
     }
     if shell == platform::Shell::PowerShell {
         crate::slog!("  提示:   未找到 pwsh，正在使用 Windows PowerShell 5.1（冷启动约 2 秒）；安装 PowerShell 7 可明显加快 exec");
@@ -317,6 +321,7 @@ fn info(ctx: &Ctx) -> Value {
         "prewarm": {
             "shell": ctx.st.warm.shell().map(|s| s.name()),
             "size": ctx.st.warm.size(),
+            "auto": ctx.st.cfg.policy.prewarm_shells.is_none(),
             "idle": ctx.st.warm.idle_count(),
         },
     })

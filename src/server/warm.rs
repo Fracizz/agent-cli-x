@@ -5,16 +5,21 @@
 
 use crate::platform::{self, Shell};
 use std::process::{Child, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 
 pub struct WarmPool {
     /// 预热的 shell 类型；None 表示不预热（非 PowerShell 或配置为 0）
     shell: Option<Shell>,
     size: usize,
-    idle: Mutex<Vec<Child>>,
-    filling: AtomicBool,
+    state: Mutex<State>,
+}
+
+/// 空闲进程与正在启动中的数量放在同一把锁里，计算缺口时不会重复补充。
+#[derive(Default)]
+struct State {
+    idle: Vec<Child>,
+    starting: usize,
 }
 
 impl WarmPool {
@@ -23,8 +28,7 @@ impl WarmPool {
         Arc::new(Self {
             shell: enabled.then_some(shell),
             size: if enabled { size } else { 0 },
-            idle: Mutex::new(Vec::new()),
-            filling: AtomicBool::new(false),
+            state: Mutex::new(State::default()),
         })
     }
 
@@ -37,7 +41,11 @@ impl WarmPool {
     }
 
     pub fn idle_count(&self) -> usize {
-        self.idle.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.lock().idle.len()
+    }
+
+    fn lock(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// 取一个存活的预热 shell；无论是否取到，都触发后台补充。
@@ -46,9 +54,9 @@ impl WarmPool {
             return None;
         }
         let got = {
-            let mut idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
+            let mut st = self.lock();
             let mut got = None;
-            while let Some(mut c) = idle.pop() {
+            while let Some(mut c) = st.idle.pop() {
                 if matches!(c.try_wait(), Ok(None)) {
                     got = Some(c);
                     break;
@@ -61,29 +69,27 @@ impl WarmPool {
         got
     }
 
-    /// 后台补满到 size。同一时刻只有一个补充线程；启动失败即停止，等下次 take 再试。
+    /// 后台补满到 size：缺几个就同时启动几个（多个会话同时取空池子时，尽快全部补回）。
+    /// 启动失败的不重试，等下次 take 再补。
     pub fn refill(self: &Arc<Self>) {
         let Some(shell) = self.shell else { return };
-        if self.filling.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        let me = Arc::clone(self);
-        thread::spawn(move || loop {
-            while me.idle_count() < me.size {
-                match spawn_warm(shell) {
-                    Some(c) => me.idle.lock().unwrap_or_else(|e| e.into_inner()).push(c),
-                    None => {
-                        me.filling.store(false, Ordering::SeqCst);
-                        return;
-                    }
+        let missing = {
+            let mut st = self.lock();
+            let missing = self.size.saturating_sub(st.idle.len() + st.starting);
+            st.starting += missing;
+            missing
+        };
+        for _ in 0..missing {
+            let me = Arc::clone(self);
+            thread::spawn(move || {
+                let child = spawn_warm(shell);
+                let mut st = me.lock();
+                st.starting -= 1;
+                if let Some(c) = child {
+                    st.idle.push(c);
                 }
-            }
-            me.filling.store(false, Ordering::SeqCst);
-            // 退出前复查：期间若有 take 发生且未能抢到补充权，由本线程继续补
-            if me.idle_count() >= me.size || me.filling.swap(true, Ordering::SeqCst) {
-                return;
-            }
-        });
+            });
+        }
     }
 }
 

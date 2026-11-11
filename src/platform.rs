@@ -313,3 +313,27 @@ pub fn hostname() -> String {
         })
         .unwrap_or_default()
 }
+
+/// 物理内存总量（字节）；取不到时返回 None。
+#[cfg(windows)]
+pub fn total_memory_bytes() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut st: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    st.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    let ok = unsafe { GlobalMemoryStatusEx(&mut st) } != 0;
+    (ok && st.ullTotalPhys > 0).then_some(st.ullTotalPhys)
+}
+
+/// 物理内存总量（字节）；取不到时返回 None。
+#[cfg(unix)]
+pub fn total_memory_bytes() -> Option<u64> {
+    let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    (pages > 0 && size > 0).then(|| pages as u64 * size as u64)
+}
+
+/// 物理内存的 GB 数（四舍五入：系统保留部分内存，16 GB 机器常报告 15.8 GB）。
+pub fn total_memory_gb() -> Option<u64> {
+    const GB: u64 = 1 << 30;
+    total_memory_bytes().map(|b| (b + GB / 2) / GB)
+}

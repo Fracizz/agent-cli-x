@@ -116,7 +116,7 @@ max_timeout_secs = 3600
 max_transfer_mb = 2048     # per put/get
 max_jobs = 16              # concurrent background jobs
 job_timeout_secs = 86400
-prewarm_shells = 1         # idle PowerShell kept ready for exec; 0 = off
+# prewarm_shells = 2       # idle PowerShell kept ready for exec; unset = 1 per 4 GB RAM (1–4), set = capped at RAM in GB, 0 = off
 ```
 
 ### Performance

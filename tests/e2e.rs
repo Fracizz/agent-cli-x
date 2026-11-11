@@ -562,7 +562,10 @@ fn identity_grep_transfer_jobs() {
         assert_eq!(parts[3], "[]", "{out}");
         let o = run(c, &["info", "b", "--json"]);
         let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
-        assert_eq!(v["prewarm"]["size"], 1, "{}", text(&o));
+        // init 模板不写 prewarm_shells → 按内存自动决定，范围 1～4
+        let size = v["prewarm"]["size"].as_u64().unwrap_or(0);
+        assert!((1..=4).contains(&size), "{}", text(&o));
+        assert_eq!(v["prewarm"]["auto"], true, "{}", text(&o));
     }
 
     // 后台任务：启动 → follow 拿到输出与退出码
