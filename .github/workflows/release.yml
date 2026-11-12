@@ -75,8 +75,9 @@ jobs:
         shell: pwsh
         run: |
           Compress-Archive -Path "target/${{ matrix.target }}/release/agent-cli-x.exe" -DestinationPath "${{ matrix.archive }}"
-          "$((Get-FileHash -Algorithm SHA256 '${{ matrix.archive }}').Hash.ToLower())  ${{ matrix.archive }}" |
-            Out-File -Encoding ascii "${{ matrix.archive }}.sha256"
+          # 用 LF 行尾：Out-File 写的 CRLF 会让 Linux 上的 `sha256sum -c` 把 \r 当成文件名的一部分
+          $hash = (Get-FileHash -Algorithm SHA256 '${{ matrix.archive }}').Hash.ToLower()
+          [IO.File]::WriteAllText("$PWD/${{ matrix.archive }}.sha256", "$hash  ${{ matrix.archive }}`n")
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.archive }}
