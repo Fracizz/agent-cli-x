@@ -1,5 +1,6 @@
 //! 服务端：TLS 监听，每个连接一个线程、一个请求。
 
+mod admin;
 pub mod audit;
 mod auth;
 mod backup;
@@ -32,7 +33,8 @@ const MAX_CONNECTIONS: usize = 64;
 /// 本版本服务端支持的可选能力，客户端据此决定是否使用新接口（info 返回）。
 /// - put_stream：put 接受长度未知的帧流（cp 在两个对端之间直接中转）
 /// - purge：按 op_id 彻底清除回收站条目与备份
-pub const FEATURES: &[&str] = &["put_stream", "purge"];
+/// - restart / set_port：`/v1/restart` 与 `/v1/port`
+pub const FEATURES: &[&str] = &["put_stream", "purge", "restart", "set_port"];
 
 pub struct State {
     pub cfg: Config,
@@ -44,6 +46,10 @@ pub struct State {
     pub auth: auth::Auth,
     /// 本进程启动时间（info 返回，供 upgrade 判断服务是否已重启）。
     pub started: String,
+    /// config.toml 有误、已回退到 last-good 运行时的错误信息（info 返回）。
+    pub config_error: Option<String>,
+    tls: Arc<ServerConfig>,
+    net: admin::Net,
     active: AtomicUsize,
 }
 
@@ -56,9 +62,16 @@ pub struct Ctx {
     pub caller: String,
     /// 该调用方被禁止借道（`token add --no-relay`）：exec 子进程会带上标记环境变量。
     pub no_relay: bool,
+    /// 本次连接到达的本机端口（换端口时确认请求必须来自新端口）。
+    pub local_port: u16,
 }
 
 /// 启动服务端。`wait_port_secs > 0` 时端口被占用会重试这么久（升级后新进程等待旧进程退出）。
+/// 后台任务执行进程入口（`agent-cli-x job-run <目录>`，由 serve 启动）。
+pub fn job_run(dir: &Path) -> Result<i32> {
+    jobs::run(dir)
+}
+
 pub fn serve(home: &Path, wait_port_secs: u64) -> Result<()> {
     log::init(home);
     let r = serve_inner(home, wait_port_secs);
@@ -86,14 +99,57 @@ fn bind(listen: &str, wait_secs: u64) -> Result<TcpListener> {
     }
 }
 
-fn serve_inner(home: &Path, wait_port_secs: u64) -> Result<()> {
-    config::ensure_node_id(home)?;
-    let cfg = config::load_config(home)?;
+/// 读取并完整校验一份配置文件（与启动时相同的检查）。
+fn load_full(home: &Path, path: &Path) -> Result<(Config, Workspaces)> {
+    let cfg = config::load_config_file(path)?;
     let ws = Workspaces::new(&cfg, home)?;
+    Ok((cfg, ws))
+}
+
+/// `serve --check`：校验 config.toml 与证书，返回监听地址。
+pub fn check(home: &Path) -> Result<String> {
+    let (cfg, _) = load_full(home, &config::config_path(home))?;
+    tls::server_config(home)?;
+    Ok(cfg.listen)
+}
+
+/// 加载配置；config.toml 有误但存在 last-good 时回退运行（返回原错误信息），避免机器失联。
+fn load_or_fallback(home: &Path) -> Result<(Config, Workspaces, Option<String>)> {
+    let cfg_path = config::config_path(home);
+    match load_full(home, &cfg_path) {
+        Ok((cfg, ws)) => {
+            config::save_last_good(home);
+            Ok((cfg, ws, None))
+        }
+        Err(e) => {
+            let lg = config::last_good_path(home);
+            // 配置文件不存在（未 init 或被删除）不回退
+            if !cfg_path.exists() || !lg.exists() {
+                return Err(e);
+            }
+            let Ok((cfg, ws)) = load_full(home, &lg) else {
+                return Err(e);
+            };
+            crate::slog!(
+                "警告: {}；已回退到上次可用的配置 {} 运行。修复后重启 serve（其他机器可执行 `agent-cli-x restart <本机>`）",
+                e.message,
+                lg.display()
+            );
+            Ok((cfg, ws, Some(e.message)))
+        }
+    }
+}
+
+fn serve_inner(home: &Path, wait_port_secs: u64) -> Result<()> {
+    // config.toml 有误时这里会失败，交给 load_or_fallback 处理
+    let _ = config::ensure_node_id(home);
+    let (cfg, ws, config_error) = load_or_fallback(home)?;
     let (tls_cfg, fp) = tls::server_config(home)?;
-    util::prune_older_than(&home.join("backup"), backup::RETAIN_DAYS);
     upgrade::cleanup_leftovers();
     let listener = bind(&cfg.listen, wait_port_secs)?;
+    // 清理过期备份可能较慢，放到后台，不拖慢重新上线
+    let backup_dir = home.join("backup");
+    thread::spawn(move || util::prune_older_than(&backup_dir, backup::RETAIN_DAYS));
     let auth = auth::Auth::new(home, &cfg.token);
 
     crate::slog!(
@@ -146,6 +202,7 @@ fn serve_inner(home: &Path, wait_port_secs: u64) -> Result<()> {
         cfg.policy.deny_commands.len()
     );
 
+    let listen = cfg.listen.clone();
     let st = Arc::new(State {
         audit: audit::Audit::new(home.join("audit")),
         jobs: jobs::Jobs::new(home.join("jobs")),
@@ -153,18 +210,20 @@ fn serve_inner(home: &Path, wait_port_secs: u64) -> Result<()> {
         home: home.to_path_buf(),
         auth,
         started: util::now_iso(),
+        config_error,
+        tls: tls_cfg,
+        net: admin::Net::default(),
         cfg,
         ws,
         active: AtomicUsize::new(0),
     });
     warm.refill();
-    for stream in listener.incoming() {
-        let Ok(tcp) = stream else { continue };
-        let st = Arc::clone(&st);
-        let tls_cfg = Arc::clone(&tls_cfg);
-        thread::spawn(move || handle_conn(st, tls_cfg, tcp));
+    // 监听器在独立线程上运行（换端口时会被替换），主线程只需保持进程存活
+    let h = admin::spawn_accept(&st, listener, &listen)?;
+    st.net.set_active(h);
+    loop {
+        thread::park();
     }
-    Ok(())
 }
 
 struct ActiveGuard<'a>(&'a AtomicUsize);
@@ -174,15 +233,16 @@ impl Drop for ActiveGuard<'_> {
     }
 }
 
-fn handle_conn(st: Arc<State>, tls_cfg: Arc<ServerConfig>, tcp: TcpStream) {
+fn handle_conn(st: Arc<State>, tcp: TcpStream) {
     let ip = tcp
         .peer_addr()
         .map(|a| a.ip().to_string())
         .unwrap_or_default();
+    let local_port = tcp.local_addr().map(|a| a.port()).unwrap_or_default();
     let _ = tcp.set_read_timeout(Some(Duration::from_secs(30)));
     let _ = tcp.set_write_timeout(Some(Duration::from_secs(120)));
     let _ = tcp.set_nodelay(true);
-    let Ok(conn) = ServerConnection::new(tls_cfg) else {
+    let Ok(conn) = ServerConnection::new(Arc::clone(&st.tls)) else {
         return;
     };
     let mut conn: Conn = BufReader::new(StreamOwned::new(conn, tcp));
@@ -207,7 +267,7 @@ fn handle_conn(st: Arc<State>, tls_cfg: Arc<ServerConfig>, tcp: TcpStream) {
                 &AppError::new("busy", "服务端并发连接已满，请稍后重试"),
             );
         }
-        Ok(req) => dispatch(&st, ip, req, &mut conn),
+        Ok(req) => dispatch(&st, ip, local_port, req, &mut conn),
     }
     let s = conn.get_mut();
     s.conn.send_close_notify();
@@ -228,7 +288,7 @@ fn authorize(st: &State, req: &http::Request) -> Option<auth::Caller> {
     st.auth.check(got)
 }
 
-fn dispatch(st: &Arc<State>, ip: String, req: http::Request, conn: &mut Conn) {
+fn dispatch(st: &Arc<State>, ip: String, local_port: u16, req: http::Request, conn: &mut Conn) {
     let Some(caller) = authorize(st, &req) else {
         st.audit
             .log(&ip, "", "auth_fail", false, json!({"path": req.path}));
@@ -241,6 +301,7 @@ fn dispatch(st: &Arc<State>, ip: String, req: http::Request, conn: &mut Conn) {
         ip,
         caller: caller.name,
         no_relay: caller.no_relay,
+        local_port,
     };
     match req.path.as_str() {
         "/v1/fs/put" => {
@@ -289,6 +350,11 @@ fn dispatch(st: &Arc<State>, ip: String, req: http::Request, conn: &mut Conn) {
             jobs::log(&ctx, body, w);
             return;
         }
+        "/v1/restart" => {
+            admin::restart(&ctx, body, w);
+            return;
+        }
+        "/v1/port" => admin::port(&ctx, body),
         "/v1/rollback" => backup::rollback(&ctx, body),
         "/v1/purge" => backup::purge(&ctx, body),
         other => Err(AppError::not_found(format!("未知接口 {other}"))),
@@ -314,6 +380,15 @@ fn dispatch(st: &Arc<State>, ip: String, req: http::Request, conn: &mut Conn) {
 }
 
 fn info(ctx: &Ctx) -> Value {
+    let mut v = info_base(ctx);
+    // 只在异常时出现，正常情况下不占 token
+    if let Some(e) = &ctx.st.config_error {
+        v["config_error"] = json!(e);
+    }
+    v
+}
+
+fn info_base(ctx: &Ctx) -> Value {
     let ws: Vec<Value> = ctx
         .st
         .ws
@@ -327,6 +402,8 @@ fn info(ctx: &Ctx) -> Value {
         "pid": std::process::id(),
         "started": ctx.st.started,
         "running_jobs": ctx.st.jobs.running_count(),
+        // 重启/升级时后台任务能否继续运行（upgrade 据此决定是否需要 --force）
+        "jobs_survive_restart": upgrade::jobs_survive_restart(),
         "hostname": platform::hostname(),
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,

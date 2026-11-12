@@ -1,5 +1,6 @@
 //! 客户端：短连接 HTTPS（证书指纹固定），一次调用一个请求。
 
+pub mod admin;
 pub mod multi;
 pub mod output;
 pub mod transfer;
@@ -58,13 +59,29 @@ pub fn connect(addr: &str, pin: Option<&str>, read_timeout: Duration) -> Result<
 请在对端执行 `agent-cli-x fingerprint` 核对后，用 `agent-cli-x peer add` 重新登记"
                 )));
             }
-            return Err(AppError::connect(format!(
-                "与 {addr} 的 TLS 握手失败: {msg}"
-            )));
+            return Err(AppError::connect(handshake_error(addr, &e)));
         }
     }
     let fp = verifier.seen.lock().unwrap().clone().unwrap_or_default();
     Ok((s, fp))
+}
+
+/// TCP 已连上但 TLS 握手失败：按错误类型说明可能原因与下一步。
+fn handshake_error(addr: &str, e: &std::io::Error) -> String {
+    let base = format!("与 {addr} 的 TLS 握手失败: {e}");
+    let hint = match e.kind() {
+        ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted => {
+            "TCP 已连上，但对方没完成握手就断开：这个端口上可能不是 agent-cli-x serve（例如端口转发/代理还在而后端 serve 已退出）"
+        }
+        ErrorKind::WouldBlock | ErrorKind::TimedOut => {
+            "TCP 已连上，但对方一直没有回应 TLS：端口上可能是其他程序，或对端 serve 卡住了"
+        }
+        ErrorKind::InvalidData => "对方返回的数据不是 TLS：这个端口很可能被其他程序占用",
+        _ => return base,
+    };
+    format!(
+        "{base}。{hint}。在对端查看 ~/.agent-cli-x/serve-logs/ 最新日志（配置有误时 serve 会写明原因），或在对端执行 `agent-cli-x doctor`"
+    )
 }
 
 /// 读到 EOF；对端未发送 close_notify 导致的 UnexpectedEof 视为正常结束。
@@ -96,7 +113,7 @@ impl Client {
     pub fn load(name: &str) -> Result<Self> {
         if multi::is_multi(name) {
             return Err(AppError::bad_request(format!(
-                "`{name}`：此命令一次只能操作一个对端（多个对端仅支持 exec / info / upgrade）"
+                "`{name}`：此命令一次只能操作一个对端（多个对端仅支持 exec / info / upgrade / restart）"
             )));
         }
         let peers = config::load_peers(&config::home_dir())?;
@@ -120,6 +137,17 @@ impl Client {
             peer,
             remote_version: Mutex::new(None),
         }
+    }
+
+    pub fn addr(&self) -> &str {
+        &self.peer.addr
+    }
+
+    /// 同一对端（同一 token 与证书指纹）换一个地址。
+    pub fn with_addr(&self, addr: &str) -> Self {
+        let mut peer = self.peer.clone();
+        peer.addr = addr.to_string();
+        Self::from_peer(&self.name, peer)
     }
 
     fn note_version(&self, head: &http::ResponseHead) {

@@ -74,8 +74,8 @@ pub(super) struct Prepared {
     pub timeout: Duration,
     /// 冷启动命令（未取到预热 shell 时使用）
     pub command: Command,
-    cwd: PathBuf,
-    env: BTreeMap<String, String>,
+    pub cwd: PathBuf,
+    pub env: BTreeMap<String, String>,
 }
 
 /// 所有命令共用的环境：尽量让工具以非交互、无颜色、无分页的方式运行。

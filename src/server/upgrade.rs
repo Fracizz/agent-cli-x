@@ -44,11 +44,7 @@ pub fn handle<S: Read + Write>(ctx: &Ctx, len: u64, conn: &mut BufReader<S>) {
             );
             let _ = http::write_json(w, 200, &v);
             let _ = w.flush();
-            // 留出时间让响应发送完、连接正常关闭，再重启
-            thread::spawn(|| {
-                thread::sleep(Duration::from_millis(500));
-                restart();
-            });
+            schedule_restart();
         }
         Err(e) => {
             ctx.st.audit.log(
@@ -78,13 +74,10 @@ fn handle_inner<R: std::io::BufRead>(ctx: &Ctx, len: u64, body: &mut R) -> Resul
         .to_ascii_lowercase();
     let force = meta["force"].as_bool().unwrap_or(false);
 
-    let running = ctx.st.jobs.running_count();
-    if running > 0 && !force {
-        return Err(AppError::conflict(format!(
-            "对端有 {running} 个后台任务正在运行，升级重启会中断它们（状态变为 lost）。\
-等任务结束后再升级，或加 --force 强制升级"
-        )));
-    }
+    let (interrupted, kept) = jobs_on_restart(ctx, force, "升级")?;
+
+    // 先确认当前配置能让新进程正常启动，否则替换后会失联
+    super::admin::preflight(&ctx.st.home)?;
 
     let exe = current_exe()?;
     let dir = exe
@@ -113,12 +106,45 @@ fn handle_inner<R: std::io::BufRead>(ctx: &Ctx, len: u64, body: &mut R) -> Resul
         "new_version": new_version,
         "path": exe.to_string_lossy(),
         "restart": restart_mode(),
-        "interrupted_jobs": running,
+        "interrupted_jobs": interrupted,
+        "kept_jobs": kept,
     }))
 }
 
+/// 重启后后台任务能否继续运行。任务由脱离 serve 的执行进程托管，自行拉起新进程时不受影响；
+/// 由服务管理器重启时，只有 systemd 的 KillMode 为 process/none 才不会连同任务一起杀掉。
+pub fn jobs_survive_restart() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        restart_mode() == "spawn"
+            || matches!(
+                platform::systemd_kill_mode().as_deref(),
+                Some("process" | "none")
+            )
+    })
+}
+
+/// 重启前检查后台任务，返回（会被中断的数量，会继续运行的数量）。
+pub fn jobs_on_restart(ctx: &Ctx, force: bool, verb: &str) -> Result<(usize, usize)> {
+    let running = ctx.st.jobs.running_count();
+    if running == 0 {
+        return Ok((0, 0));
+    }
+    if jobs_survive_restart() {
+        return Ok((0, running));
+    }
+    if !force {
+        return Err(AppError::conflict(format!(
+            "对端有 {running} 个后台任务正在运行。该机器由服务管理器重启，且 systemd 的 KillMode 不是 process，\
+{verb}会连同任务一起终止（状态变为 lost）。在 unit 的 [Service] 中加 KillMode=process 并执行 \
+`systemctl --user daemon-reload` 后再试；或等任务结束（job list 查看）；或加 --force"
+        )));
+    }
+    Ok((running, 0))
+}
+
 /// 当前可执行文件路径（Linux 上被替换过的文件路径会带 ` (deleted)` 后缀，需去掉）。
-fn current_exe() -> Result<PathBuf> {
+pub fn current_exe() -> Result<PathBuf> {
     let p = std::env::current_exe()
         .map_err(|e| AppError::internal(format!("无法确定可执行文件路径: {e}")))?;
     let s = p.to_string_lossy();
@@ -243,7 +269,15 @@ fn replace(exe: &Path, new: &Path) -> Result<()> {
     }
 }
 
-fn restart_mode() -> &'static str {
+/// 稍后重启自身：留出时间让响应发送完、连接正常关闭。
+pub fn schedule_restart() {
+    thread::spawn(|| {
+        thread::sleep(Duration::from_millis(500));
+        restart();
+    });
+}
+
+pub fn restart_mode() -> &'static str {
     let forced = std::env::var("AGENT_CLI_X_RESTART").unwrap_or_default();
     if forced == "exit" || (forced != "spawn" && std::env::var_os("INVOCATION_ID").is_some()) {
         "exit"
@@ -270,43 +304,15 @@ fn restart() -> ! {
 
 fn spawn_detached() -> Result<u32> {
     let exe = current_exe()?;
-    let build = |breakaway: bool| {
+    let child = platform::spawn_detached(|| {
         let mut c = Command::new(&exe);
         c.args(["serve", "--wait-port", "30"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-            const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
-            let mut flags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP;
-            if breakaway {
-                flags |= CREATE_BREAKAWAY_FROM_JOB;
-            }
-            c.creation_flags(flags);
-        }
-        #[cfg(unix)]
-        {
-            let _ = breakaway;
-            use std::os::unix::process::CommandExt;
-            // 新会话：不随当前终端/进程组的信号一起退出
-            unsafe {
-                c.pre_exec(|| {
-                    libc::setsid();
-                    Ok(())
-                });
-            }
-        }
         c
-    };
-    // 所在 Job Object 不允许脱离时，退回普通方式启动
-    let child = build(true)
-        .spawn()
-        .or_else(|_| build(false).spawn())
-        .map_err(|e| AppError::io(format!("启动新进程失败: {e}")))?;
+    })
+    .map_err(|e| AppError::io(format!("启动新进程失败: {e}")))?;
     Ok(child.id())
 }
 

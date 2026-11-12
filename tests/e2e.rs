@@ -871,27 +871,64 @@ fn upgrade_restarts_server() {
         .as_u64()
         .unwrap();
 
-    // 有后台任务时拒绝升级
+    // 后台任务由独立的执行进程托管：升级不需要 --force，任务跨重启继续运行
     let slow = if cfg!(windows) {
-        "Start-Sleep -Seconds 60"
+        "echo before-upgrade; Start-Sleep -Seconds 60"
     } else {
-        "sleep 60"
+        "echo before-upgrade; sleep 60"
     };
     let o = run(c, &["exec", "b", "--detach", "--json", slow]);
     let id = json_of(&o)["job_id"].as_str().unwrap().to_string();
-    assert_eq!(run(c, &["upgrade", "b"]).status.code(), Some(105));
-    assert!(run(c, &["job", "kill", "b", &id]).status.success());
+    let v = json_of(&run(c, &["info", "b", "--json"]));
+    assert_eq!(v["running_jobs"], 1, "{v}");
+    assert_eq!(v["jobs_survive_restart"], true, "{v}");
 
     // 升级：替换二进制并以新进程重新上线
     let o = run(c, &["upgrade", "b", "--json"]);
     let v = json_of(&o);
     assert!(o.status.success(), "{v}");
+    assert_eq!(v["results"][0]["kept_jobs"], 1, "{v}");
+    assert_eq!(v["results"][0]["interrupted_jobs"], 0, "{v}");
     let pid1 = json_of(&run(c, &["info", "b", "--json"]))["pid"]
         .as_u64()
         .unwrap();
-    kill_pid(pid1);
+    let _guard = PidGuard(std::cell::Cell::new(pid1));
     assert_ne!(pid0, pid1);
     assert_eq!(v["results"][0]["new_version"], env!("CARGO_PKG_VERSION"));
+
+    // 新进程仍能看到、读取并终止升级前启动的任务
+    let o = run(c, &["job", "logs", "b", &id]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    assert!(text(&o).contains("before-upgrade"), "{}", text(&o));
+    assert!(text(&o).contains("仍在运行"), "{}", text(&o));
+    assert!(run(c, &["job", "kill", "b", &id]).status.success());
+    let o = run(c, &["job", "logs", "b", &id]);
+    assert_eq!(o.status.code(), Some(137), "{}", text(&o));
+
+    // restart 同样保留任务
+    let o = run(c, &["exec", "b", "--detach", "--json", slow]);
+    let id = json_of(&o)["job_id"].as_str().unwrap().to_string();
+    let o = run(c, &["restart", "b"]);
+    assert!(text(&o).contains("1 个后台任务继续运行"), "{}", text(&o));
+    let pid2 = json_of(&run(c, &["info", "b", "--json"]))["pid"]
+        .as_u64()
+        .unwrap();
+    _guard.0.set(pid2);
+    let o = run(c, &["job", "logs", "b", &id]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+
+    // 执行进程被杀（机器重启等）：任务显示为 lost
+    let meta = env.server_home.join("jobs").join(&id).join("meta.json");
+    let m: serde_json::Value = serde_json::from_slice(&fs::read(meta).unwrap()).unwrap();
+    kill_pid(m["runner_pid"].as_u64().unwrap());
+    kill_pid(m["pid"].as_u64().unwrap());
+    let o = wait_code(c, &["job", "logs", "b", &id], 1);
+    assert_eq!(o.status.code(), Some(1), "{}", text(&o));
+    assert!(text(&o).contains("执行进程已不在"), "{}", text(&o));
+    assert_eq!(
+        json_of(&run(c, &["info", "b", "--json"]))["running_jobs"],
+        0
+    );
 }
 
 #[test]
@@ -1191,4 +1228,205 @@ fn peer_list_offline_not_retried() {
     let o = run(c, &["peer", "list"]);
     assert!(o.status.success(), "{}", text(&o));
     assert_eq!(fs::read_to_string(&peers_toml).unwrap(), body);
+}
+
+#[test]
+fn output_limits_save_context() {
+    let env = setup();
+    let c = &env.client_home;
+
+    // exec：长输出头尾截断，--json 同样截断，完整日志留在本地
+    let many = if cfg!(windows) {
+        "1..1000 | % { \"line$_\" }"
+    } else {
+        "seq 1 1000 | sed 's/^/line/'"
+    };
+    let o = run(c, &["exec", "b", many]);
+    assert!(o.status.success(), "{}", text(&o));
+    let out = String::from_utf8_lossy(&o.stdout).to_string();
+    assert_eq!(out.lines().count(), 200, "{out}");
+    assert!(
+        out.starts_with("line1\n") || out.starts_with("line1\r\n"),
+        "{out}"
+    );
+    assert!(out.trim_end().ends_with("line1000"), "{out}");
+    assert!(text(&o).contains("中间省略 800 行"), "{}", text(&o));
+
+    let o = run(c, &["exec", "b", "--json", many]);
+    assert!(o.status.success(), "{}", text(&o));
+    let v = json_of(&o);
+    assert_eq!(v["truncated"], true, "{v}");
+    assert_eq!(v["omitted_lines"], 800, "{v}");
+    let stdout = v["stdout"].as_str().unwrap();
+    assert!(stdout.contains("中间省略 800 行"), "{stdout}");
+    assert!(stdout.lines().count() < 210, "{stdout}");
+    let log = v["log"].as_str().unwrap();
+    let full = fs::read_to_string(log).unwrap();
+    assert_eq!(full.lines().count(), 1000);
+
+    let o = run(c, &["exec", "b", "--json", "--full", many]);
+    assert_eq!(
+        json_of(&o)["stdout"].as_str().unwrap().lines().count(),
+        1000
+    );
+
+    // read：不给结束行时只读一个窗口，并提示下一段的范围
+    let big: String = (1..=2500).map(|i| format!("row{i}\n")).collect();
+    fs::write(env.ws.join("big.txt"), big).unwrap();
+    let o = run(c, &["read", "b", "proj:big.txt"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let out = String::from_utf8_lossy(&o.stdout).to_string();
+    assert_eq!(out.lines().count(), 2000);
+    assert!(text(&o).contains("--lines 2001:4000"), "{}", text(&o));
+    let o = run(c, &["read", "b", "proj:big.txt", "--lines", "2001:"]);
+    let out = String::from_utf8_lossy(&o.stdout).to_string();
+    assert_eq!(out.lines().count(), 500);
+    assert!(out.starts_with("row2001\n"), "{out}");
+    let o = run(c, &["read", "b", "proj:big.txt", "--lines", "1:2500"]);
+    assert_eq!(String::from_utf8_lossy(&o.stdout).lines().count(), 2500);
+
+    // read：单次窗口还受 64KB 限制
+    let wide: String = (1..=1000).map(|i| format!("{i:0>200}\n")).collect();
+    fs::write(env.ws.join("wide.txt"), wide).unwrap();
+    let o = run(c, &["read", "b", "proj:wide.txt", "--json"]);
+    let v = json_of(&o);
+    assert_eq!(v["truncated"], true, "{v}");
+    assert!(v["content"].as_str().unwrap().len() <= 64 * 1024);
+
+    // ls：--max 限制条目数
+    fs::create_dir_all(env.ws.join("many")).unwrap();
+    for i in 0..30 {
+        fs::write(env.ws.join(format!("many/f{i}.txt")), "x").unwrap();
+    }
+    let o = run(c, &["ls", "b", "proj:many", "--max", "10"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert_eq!(String::from_utf8_lossy(&o.stdout).lines().count(), 10);
+    assert!(text(&o).contains("--max 10"), "{}", text(&o));
+}
+
+/// 测试结束（含断言失败）时结束 restart 拉起的脱离进程。
+struct PidGuard(std::cell::Cell<u64>);
+
+impl Drop for PidGuard {
+    fn drop(&mut self) {
+        kill_pid(self.0.get());
+    }
+}
+
+fn server_pid(c: &Path) -> u64 {
+    let o = run(c, &["info", "b", "--json"]);
+    json_of(&o)["pid"].as_u64().unwrap()
+}
+
+/// 等到地址不再接受连接（最多 10 秒）。
+fn wait_closed(addr: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while TcpStream::connect(addr).is_ok() {
+        if Instant::now() > deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    true
+}
+
+#[test]
+fn restart_set_port_config_fallback() {
+    let env = setup();
+    let c = &env.client_home;
+    let s = &env.server_home;
+    let cfg_path = s.join("config.toml");
+    let pid0 = server_pid(c);
+
+    // restart：不替换二进制，以新进程重新上线
+    let o = run(c, &["restart", "b", "--json"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let pid1 = server_pid(c);
+    let guard = PidGuard(std::cell::Cell::new(pid1));
+    assert_ne!(pid0, pid1);
+
+    // 配置改坏：serve --check 报错，restart 被拒（109），服务不受影响
+    let good = fs::read_to_string(&cfg_path).unwrap();
+    fs::write(&cfg_path, format!("{good}\nbogus_key = 1\n")).unwrap();
+    assert_eq!(run(s, &["serve", "--check"]).status.code(), Some(109));
+    let o = run(c, &["restart", "b"]);
+    assert_eq!(o.status.code(), Some(109), "{}", text(&o));
+    assert!(text(&o).contains("已取消"), "{}", text(&o));
+    assert_eq!(server_pid(c), pid1);
+    fs::write(&cfg_path, &good).unwrap();
+    assert!(run(s, &["serve", "--check"]).status.success());
+
+    // set-port：不重启，经新端口确认后切换，写入配置并更新本机登记的地址
+    let port = free_port();
+    let new_listen = format!("127.0.0.1:{port}");
+    let o = run(c, &["set-port", "b", &port.to_string()]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains("peer set"), "{}", text(&o));
+    let peers = fs::read_to_string(c.join("peers.toml")).unwrap();
+    assert!(peers.contains(&new_listen), "{peers}");
+    let cfg = fs::read_to_string(&cfg_path).unwrap();
+    assert!(cfg.contains(&format!("listen = \"{new_listen}\"")), "{cfg}");
+    assert_eq!(server_pid(c), pid1);
+    assert!(wait_closed(&env.listen), "旧端口仍在监听");
+
+    // peer set：连不上新地址时不保存；连得上才保存
+    let o = run(c, &["peer", "set", "b", "--addr", &env.listen]);
+    assert_eq!(o.status.code(), Some(100), "{}", text(&o));
+    let peers = fs::read_to_string(c.join("peers.toml")).unwrap();
+    assert!(peers.contains(&new_listen), "{peers}");
+    let o = run(c, &["peer", "set", "b", "--addr", &new_listen]);
+    assert!(o.status.success(), "{}", text(&o));
+
+    // 配置改坏后启动：回退到上次可用的配置运行，info 报告异常，restart / set-port 被拒
+    let good = fs::read_to_string(&cfg_path).unwrap();
+    fs::write(&cfg_path, format!("{good}\nbogus_key = 1\n")).unwrap();
+    kill_pid(pid1);
+    assert!(wait_closed(&new_listen), "serve 未退出");
+    let mut child = Command::new(BIN)
+        .arg("serve")
+        .env("AGENT_CLI_X_HOME", s)
+        .env("AGENT_CLI_X_RESTART", "spawn")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    guard.0.set(u64::from(child.id()));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while TcpStream::connect(&new_listen).is_err() {
+        assert!(Instant::now() < deadline, "回退配置后 serve 未启动");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let v = json_of(&run(c, &["info", "b", "--json"]));
+    assert!(
+        v["config_error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("bogus_key"),
+        "{v}"
+    );
+    assert!(text(&run(c, &["info", "b"])).contains("配置异常"));
+    assert!(text(&run(c, &["info", "@all"])).contains("配置异常"));
+    assert_eq!(run(c, &["restart", "b"]).status.code(), Some(109));
+    let o = run(c, &["set-port", "b", &free_port().to_string()]);
+    assert_eq!(o.status.code(), Some(105), "{}", text(&o));
+    let o = run(s, &["doctor", "--no-peers"]);
+    assert!(text(&o).contains("last-good"), "{}", text(&o));
+
+    // 端口上不是 serve（接受连接后立即关闭）：握手失败要说明可能原因
+    let fake = TcpListener::bind("127.0.0.1:0").unwrap();
+    let fake_addr = fake.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        for st in fake.incoming() {
+            drop(st);
+        }
+    });
+    let peers = fs::read_to_string(c.join("peers.toml"))
+        .unwrap()
+        .replace(&new_listen, &fake_addr);
+    fs::write(c.join("peers.toml"), peers).unwrap();
+    let o = run(c, &["info", "b"]);
+    assert_eq!(o.status.code(), Some(100), "{}", text(&o));
+    assert!(text(&o).contains("TCP 已连上"), "{}", text(&o));
+    let _ = child.kill();
+    let _ = child.wait();
 }

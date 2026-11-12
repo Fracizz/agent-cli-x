@@ -62,15 +62,17 @@ Then teach your agent the tool: copy [`skills/agent-cli-x/SKILL.md`](skills/agen
 
 | Command | Purpose |
 |---|---|
-| `init` / `serve` / `whoami [--pair]` / `fingerprint` | set up, run and identify this machine |
+| `init` / `serve` / `whoami [--pair]` / `fingerprint` | set up, run and identify this machine; `serve --check` only validates `config.toml` and the certificate (run it after editing the config by hand) |
 | `doctor [--no-peers]` | check config, local service, start at boot, firewall, peers and their versions |
 | `token add\|list\|set\|remove\|rotate` | per-caller tokens for this machine (`rotate default` replaces the config token); `add <name> --no-relay` / `set <name> --no-relay\|--allow-relay` stops that caller from hopping to other machines through this one |
-| `peer add\|list\|remove` | manage peers (`~/.agent-cli-x/peers.toml`); `list` shows the cached OS/arch and shell, refreshed by `peer add`, `info`, `upgrade` and `cp`; peers with no cached OS (registered by an older version) are looked up automatically (an unreachable one is retried at most once a day) |
+| `peer add\|set\|list\|remove` | manage peers (`~/.agent-cli-x/peers.toml`); `list` shows the cached OS/arch and shell, refreshed by `peer add`, `info`, `upgrade` and `cp`; `set <name> --addr <ip:port>` / `--token <t>` changes a peer's address or token after checking it against the registered fingerprint; peers with no cached OS (registered by an older version) are looked up automatically (an unreachable one is retried at most once a day) |
 | `info <peer>` | OS, shell, the user `exec` runs as, workspaces, deny rules; `info @all` is a one-line-per-peer overview |
 | `exec <peer> [--cwd] [--shell] [--timeout] [--env K=V] <cmd>` | run a command, streamed; `A,B` or `@all` runs on several peers in parallel |
 | `exec <peer> --script <file>` | run the contents of a local script file (`-` = stdin) with the peer's shell: no nested quoting; CRLF and BOM are normalized |
 | `upgrade <peer> [--binary <file>] [--force]` | replace the peer's binary and restart its `serve` (`A,B` / `@all` allowed) |
-| `exec <peer> --detach <cmd>`, `job list\|logs\|kill` | background jobs (`job logs --follow` exits with the job's code) |
+| `restart <peer> [--force]` | restart the peer's `serve` without replacing the binary (`A,B` / `@all` allowed) |
+| `set-port <peer> <port>` | move the peer to another listen port without restarting it; also updates this machine's `peers.toml` |
+| `exec <peer> --detach <cmd>`, `job list\|logs\|kill` | background jobs (`job logs --follow` exits with the job's code); they keep running across `restart` / `upgrade` of the peer |
 | `ls` / `grep` / `read` / `write` / `edit` | file operations inside workspaces |
 | Output limits | `exec` / `job logs` keep the first and last 100 lines (at most 16 KB each, lines cut at 2000 chars); each peer of a multi-peer `exec` keeps 50 + 50 lines (8 KB each). `--json` applies the same limits and reports `truncated`, `omitted_lines` and the local `log`; `--full` turns trimming off. `read` without an end line returns at most 2000 lines / 64 KB and prints the next `--lines` range; an explicit range is capped by `max_read_kb`. `ls` lists at most 500 entries (`--max`), `grep` 200 matches (`--max`) |
 | `rm <peer> <path> [-r] [--permanent]` | delete a file or directory: moved to the peer's recycle bin by default (undo with `rollback`); `--permanent` deletes for good |
@@ -89,10 +91,17 @@ Every machine runs `serve` and registers the others as peers, so A, B and C can 
 - **One command, many peers.** `exec A,B,C <cmd>` or `exec @all <cmd>` runs in parallel and prints the output grouped by peer, followed by a summary line. The exit code is 0 when every peer succeeded, otherwise the first failing peer's code. `--json` returns one result per peer. `info @all` shows which peers are online, their versions and latency.
 - **Per-caller tokens.** `token add <name>` issues a token for one caller. `token remove <name>` revokes it without affecting the others, and `token rotate <name>` replaces it. Only the sha256 of these tokens is stored, in `~/.agent-cli-x/tokens.toml`. Changes take effect immediately, with no `serve` restart. The audit log records which token made each request (`"caller"`). The original `token` in `config.toml` remains valid under the name `default`.
 - **Version check.** Every response carries the server version. When a peer runs a different version, the client prints a one-time hint to run `agent-cli-x upgrade <peer>`.
-- **Remote upgrade.** `upgrade <peer>` uploads the local binary, or `--binary <file>` for a peer with a different OS or architecture. The peer checks the sha256, runs the new file's `--version`, swaps it into place, and restarts. The client waits until the new process answers. If background jobs are running, the upgrade is refused unless you pass `--force`. Peers on 0.0.2 or earlier have no upgrade endpoint and must be upgraded by hand once.
+- **Remote upgrade.** `upgrade <peer>` uploads the local binary, or `--binary <file>` for a peer with a different OS or architecture. The peer checks the sha256, runs the new file's `--version`, swaps it into place, and restarts. The client waits until the new process answers. Background jobs keep running (see below). Peers on 0.0.2 or earlier have no upgrade endpoint and must be upgraded by hand once.
   - Under **systemd**, `serve` exits with code 75 and the unit's `Restart=on-failure` brings it back.
   - Everywhere else (Task Scheduler, a terminal, `nohup`), it starts the new `serve` detached and exits.
   - Set `AGENT_CLI_X_RESTART=exit` to force the exit-and-restart behaviour for another supervisor.
+  - The client waits up to 60 seconds for the new process (150 seconds for a Windows peer, because Task Scheduler restarts a task no sooner than one minute after it exits), then checks once more. If the peer still isn't back it exits with 104: the restart was issued but not confirmed yet, so check later with `info`.
+- **Restart.** `restart <peer>` restarts `serve` the same way without uploading anything.
+- **Background jobs survive restarts.** Each `exec --detach` job runs under its own small supervisor process (`agent-cli-x job-run`, started detached from `serve`). The supervisor runs the command, writes its output and result into `~/.agent-cli-x/jobs/<id>/` and enforces the timeout. `serve` only reads those files, so a restarted or upgraded `serve` keeps showing, following and killing jobs started before. A job shows as `lost` only if its supervisor is gone (the machine rebooted, or someone killed it). The one exception is systemd with the default `KillMode=control-group`: when `serve` exits for a restart, systemd kills every process in the unit, jobs included. Add `KillMode=process` to the unit as shown in [Start at boot](#start-at-boot-recommended). Until you do, `upgrade` / `restart` refuse while jobs are running unless you pass `--force`, and `doctor` warns about it.
+- **Config check before restarting.** Before `upgrade` or `restart`, the peer validates its own `config.toml`, workspaces and certificate exactly as a fresh `serve` would. If anything is wrong it refuses with exit 109 and says why, instead of restarting into a process that can't start.
+- **Broken config at startup.** Every time `serve` starts successfully it saves a copy as `~/.agent-cli-x/config.toml.last-good`. If `config.toml` later fails to parse or validate, `serve` logs the error and runs on that copy instead of exiting, so the machine stays reachable. `info` then shows a `配置异常` line (`config_error` in `--json`), `info @all` marks the peer, and `doctor` on the machine reports the config as failed. Fix the file and run `restart <peer>`. Note that the old copy may carry looser rules than the ones you were trying to set. A missing `config.toml` does not fall back.
+- **Change the listen port.** `set-port <peer> <port>` asks the peer to listen on the new port as well, confirms through the new port that this machine can reach it, and only then writes `listen` into the peer's `config.toml` and closes the old port. No restart is needed. If the new port can't be reached (a firewall or cloud security group), the change is rolled back and the old port keeps working. Other machines that registered the peer must run `peer set <name> --addr <ip:new-port>`, and the command prints that line for you. The Windows firewall rule only needs changing if it allows a port rather than the program (see [Start at boot](#start-at-boot-recommended)). On Linux, open the new port in ufw/firewalld yourself first.
+- **Handshake failures.** When TCP connects but TLS fails, the error says why. A dropped connection usually means something other than `serve` is on that port, for example a port forwarder whose backend `serve` has exited. Check the peer's `~/.agent-cli-x/serve-logs/`.
 - **Not supported:** relaying through another machine (A → B → C) or automatic discovery. Every pair of machines must reach each other directly on the listen port.
 
 ### One-way access
@@ -204,6 +213,8 @@ After=network-online.target
 ExecStart=%h/.local/bin/agent-cli-x serve
 Restart=on-failure
 RestartSec=5
+# keep background jobs running when serve restarts or is upgraded
+KillMode=process
 
 [Install]
 WantedBy=default.target
@@ -228,8 +239,8 @@ $settings  = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero)
 Register-ScheduledTask -TaskName agent-cli-x -Action $action -Trigger $trigger -Principal $principal -Settings $settings
 Start-ScheduledTask -TaskName agent-cli-x
 
-# allow the port once
-netsh advfirewall firewall add rule name="agent-cli-x" dir=in action=allow protocol=TCP localport=47821
+# allow the program once (unlike a port rule, it keeps working after `set-port`; upgrades keep the same path)
+netsh advfirewall firewall add rule name="agent-cli-x" dir=in action=allow program="$exe" enable=yes
 ```
 
 Why these settings: Task Scheduler's defaults stop a task after 3 days and skip or stop it on battery power. `S4U` runs it at boot without anyone logged in, with no console window and no stored password. The trade-off is that the task has no network credentials, so mapped drives and Credential Manager logins are unavailable to `exec`. If you need them, use `-AtLogOn` with `-LogonType Interactive` instead. That variant only starts after you log in and shows a console window, and closing the window stops `serve`.
@@ -238,7 +249,7 @@ After a reboot, run `agent-cli-x doctor` on the machine. On Windows it flags a t
 
 ## Exit codes
 
-Remote exit codes pass through. agent-cli-x's own errors: 100 connect, 101 auth, 102 policy denied, 103 not found, 104 timeout, 105 conflict, 106 fingerprint, 107 local/remote I/O error, 108 other, 109 config (e.g. unknown peer, missing config), 110 bad arguments, 111 busy. `grep` exits 1 when nothing matches; `job logs` exits 137 for a killed job.
+Remote exit codes pass through. agent-cli-x's own errors: 100 connect, 101 auth, 102 policy denied, 103 not found, 104 timeout, 105 conflict, 106 fingerprint, 107 local/remote I/O error, 108 other, 109 config (e.g. unknown peer, missing config), 110 bad arguments, 111 busy. `grep` exits 1 when nothing matches; `job logs` exits 137 for a killed job. `upgrade` / `restart` exit 104 when the restart was issued but the peer hasn't come back yet.
 
 ## License
 

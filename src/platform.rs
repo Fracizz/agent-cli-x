@@ -258,6 +258,9 @@ impl KillHandle {
     pub fn kill(&self, child: &mut Child) {
         #[cfg(windows)]
         unsafe {
+            // Job Object 并不总能管住子孙进程（例如 Microsoft Store 版 pwsh 的子进程不在 Job 里），
+            // 先按父子关系找出整棵进程树逐个结束，Job Object 作为兜底
+            kill_descendants(child.id());
             if !self.job.is_null() {
                 windows_sys::Win32::System::JobObjects::TerminateJobObject(self.job, 1);
             }
@@ -267,6 +270,81 @@ impl KillHandle {
             libc::kill(-self.pgid, libc::SIGKILL);
         }
         let _ = child.kill();
+    }
+}
+
+/// 结束 `root` 的所有子孙进程（不含 `root` 本身）。按进程快照里的父子关系展开，
+/// 并要求子进程的创建时间不早于父进程，避免父进程退出后 PID 被复用导致误杀。
+#[cfg(windows)]
+fn kill_descendants(root: u32) {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_TERMINATE,
+    };
+    // (pid, ppid)
+    let mut procs: Vec<(u32, u32)> = Vec::new();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return;
+        }
+        let mut e: PROCESSENTRY32W = std::mem::zeroed();
+        e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        if Process32FirstW(snap, &mut e) != 0 {
+            loop {
+                procs.push((e.th32ProcessID, e.th32ParentProcessID));
+                if Process32NextW(snap, &mut e) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+    }
+    let created = |pid: u32| -> Option<u64> {
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                return None;
+            }
+            let mut t: [FILETIME; 4] = std::mem::zeroed();
+            let [c, x, k, u] = &mut t;
+            let ok = GetProcessTimes(h, c, x, k, u);
+            CloseHandle(h);
+            (ok != 0)
+                .then(|| (u64::from(t[0].dwHighDateTime) << 32) | u64::from(t[0].dwLowDateTime))
+        }
+    };
+    let mut tree: Vec<(u32, Option<u64>)> = vec![(root, created(root))];
+    let mut i = 0;
+    while i < tree.len() {
+        let (parent, parent_created) = tree[i];
+        for &(pid, ppid) in &procs {
+            if ppid != parent || pid == parent || pid == 0 || tree.iter().any(|t| t.0 == pid) {
+                continue;
+            }
+            let c = created(pid);
+            if let (Some(p), Some(c)) = (parent_created, c) {
+                if c < p {
+                    continue;
+                }
+            }
+            tree.push((pid, c));
+        }
+        i += 1;
+    }
+    for &(pid, _) in tree.iter().skip(1) {
+        unsafe {
+            let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if !h.is_null() {
+                TerminateProcess(h, 1);
+                CloseHandle(h);
+            }
+        }
     }
 }
 
@@ -394,4 +472,120 @@ pub fn total_memory_bytes() -> Option<u64> {
 pub fn total_memory_gb() -> Option<u64> {
     const GB: u64 = 1 << 30;
     total_memory_bytes().map(|b| (b + GB / 2) / GB)
+}
+
+/// 运行外部命令，返回 (是否成功, 标准输出)。命令不存在时返回 None。
+pub fn run_cmd(prog: &str, args: &[&str]) -> Option<(bool, String)> {
+    let mut c = Command::new(prog);
+    c.args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    apply_spawn_flags(&mut c);
+    let o = c.output().ok()?;
+    // schtasks 等可能输出 UTF-16 或本地代码页；只关心 ASCII 标签和数字，去掉 NUL 即可
+    let text = String::from_utf8_lossy(&o.stdout).replace('\0', "");
+    Some((o.status.success(), text))
+}
+
+/// 启动一个脱离当前进程的子进程（重启后的新 serve、后台任务的执行进程）：
+/// Windows 尝试脱离所在的 Job Object（不允许时退回普通方式）、不弹窗口；Unix 新建会话，
+/// 不随当前进程组的信号一起退出。`build` 每次返回一个新的、未设置这些标志的命令。
+pub fn spawn_detached(build: impl Fn() -> Command) -> std::io::Result<Child> {
+    let make = |breakaway: bool| {
+        let mut c = build();
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+            let mut flags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP;
+            if breakaway {
+                flags |= CREATE_BREAKAWAY_FROM_JOB;
+            }
+            c.creation_flags(flags);
+        }
+        #[cfg(unix)]
+        {
+            let _ = breakaway;
+            use std::os::unix::process::CommandExt;
+            unsafe {
+                c.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+        }
+        c
+    };
+    make(true).spawn().or_else(|_| make(false).spawn())
+}
+
+/// 对文件加排他锁。`wait` 为 false 时不等待：已被其他进程锁住返回 `Ok(false)`。
+/// 锁随文件句柄关闭或进程退出（包括崩溃）自动释放，用来判断持锁进程是否还活着。
+pub fn lock_exclusive(f: &std::fs::File, wait: bool) -> std::io::Result<bool> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+        use windows_sys::Win32::Storage::FileSystem::{
+            LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+        };
+        let mut flags = LOCKFILE_EXCLUSIVE_LOCK;
+        if !wait {
+            flags |= LOCKFILE_FAIL_IMMEDIATELY;
+        }
+        let ok = unsafe {
+            let mut ov: windows_sys::Win32::System::IO::OVERLAPPED = std::mem::zeroed();
+            LockFileEx(f.as_raw_handle() as _, flags, 0, 1, 0, &mut ov)
+        };
+        if ok != 0 {
+            return Ok(true);
+        }
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+            return Ok(false);
+        }
+        Err(e)
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let mut op = libc::LOCK_EX;
+        if !wait {
+            op |= libc::LOCK_NB;
+        }
+        if unsafe { libc::flock(f.as_raw_fd(), op) } == 0 {
+            return Ok(true);
+        }
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return Ok(false);
+        }
+        Err(e)
+    }
+}
+
+/// 当前进程所在 systemd 服务的 KillMode（不在 systemd 服务里时为 None）。
+/// 默认的 control-group 会在服务停止/重启时杀掉 cgroup 内所有进程，包括后台任务。
+pub fn systemd_kill_mode() -> Option<String> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let cg = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let path = cg
+        .lines()
+        .find(|l| l.starts_with("0::") || l.contains("name=systemd:"))?
+        .rsplit(':')
+        .next()?
+        .to_string();
+    let unit = path.rsplit('/').find(|s| s.ends_with(".service"))?;
+    let mut args = vec!["show", "-p", "KillMode", "--value", unit];
+    if path.contains("/user@") {
+        args.insert(0, "--user");
+    }
+    let (ok, out) = run_cmd("systemctl", &args)?;
+    let mode = out.trim().to_string();
+    (ok && !mode.is_empty()).then_some(mode)
 }

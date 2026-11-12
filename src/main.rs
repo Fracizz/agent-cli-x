@@ -4,6 +4,7 @@ mod config;
 mod decode;
 mod doctor;
 mod error;
+mod firewall;
 mod frame;
 mod http;
 mod platform;

@@ -11,7 +11,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+/// 等待重新上线的时间。Windows 任务计划的重启间隔最短 1 分钟：自行拉起新进程失败、
+/// 退回由任务计划重启时，新进程要 60 多秒才出现，所以 Windows 对端多等一些。
 const RESTART_WAIT: Duration = Duration::from_secs(60);
+const RESTART_WAIT_WINDOWS: Duration = Duration::from_secs(150);
 
 fn file_sha256(p: &Path) -> Result<(u64, String)> {
     let mut f =
@@ -54,7 +57,8 @@ pub fn upgrade(client: &Client, binary: Option<&Path>, force: bool) -> Result<Va
         }
     };
     let jobs = info["running_jobs"].as_u64().unwrap_or(0);
-    if jobs > 0 && !force {
+    // 新版本服务端的后台任务由独立进程托管，重启不受影响；旧版本或 systemd 杀整个 cgroup 时才需要 --force
+    if jobs > 0 && !force && info["jobs_survive_restart"] != true {
         return Err(AppError::conflict(format!(
             "{} 有 {jobs} 个后台任务正在运行，升级重启会中断它们（状态变为 lost）。等任务结束后再升级（job list 查看），或加 --force 强制升级",
             client.name
@@ -72,25 +76,11 @@ pub fn upgrade(client: &Client, binary: Option<&Path>, force: bool) -> Result<Va
     })?;
     let new_version = resp["new_version"].as_str().unwrap_or("?").to_string();
 
-    // 等待对端以新进程重新上线（pid 变化即说明已重启）
-    let old_pid = info["pid"].clone();
-    let deadline = Instant::now() + RESTART_WAIT;
-    let after = loop {
-        thread::sleep(Duration::from_millis(500));
-        if let Ok(v) = client.call("/v1/info", &json!({}), Duration::from_secs(10)) {
-            if v["pid"] != old_pid {
-                break v;
-            }
-        }
-        if Instant::now() > deadline {
-            return Err(AppError::connect(format!(
-                "{} 已替换为 {new_version}，但服务 {} 秒内没有重新上线。\
-请检查对端的开机自启/服务管理器配置，以及对端 ~/.agent-cli-x/serve-logs/ 下的日志",
-                client.name,
-                RESTART_WAIT.as_secs()
-            )));
-        }
-    };
+    let after = wait_back(
+        client,
+        &info,
+        &format!("{} 已替换为 {new_version}", client.name),
+    )?;
     let running = after["version"].as_str().unwrap_or("?").to_string();
     if running != new_version {
         return Err(AppError::internal(format!(
@@ -112,6 +102,47 @@ pub fn upgrade(client: &Client, binary: Option<&Path>, force: bool) -> Result<Va
         "local_version": http::VERSION,
         "restart": resp["restart"],
         "interrupted_jobs": resp["interrupted_jobs"],
+        "kept_jobs": resp["kept_jobs"],
         "ms": started.elapsed().as_millis() as u64,
     }))
+}
+
+/// 等待对端以新进程重新上线（pid 与重启前的 `before` 不同）。超时后再复查一次，
+/// 仍未确认则返回 timeout（104）：重启已发出，只是还没确认，稍后用 info 查看即可。
+pub fn wait_back(client: &Client, before: &Value, done: &str) -> Result<Value> {
+    let old_pid = &before["pid"];
+    let wait = if before["os"] == "windows" {
+        RESTART_WAIT_WINDOWS
+    } else {
+        RESTART_WAIT
+    };
+    let deadline = Instant::now() + wait;
+    let probe = |timeout| {
+        client
+            .call("/v1/info", &json!({}), timeout)
+            .ok()
+            .filter(|v| v["pid"] != *old_pid)
+    };
+    loop {
+        thread::sleep(Duration::from_millis(500));
+        if let Some(v) = probe(Duration::from_secs(10)) {
+            return Ok(v);
+        }
+        if Instant::now() > deadline {
+            break;
+        }
+    }
+    // 复查：慢的机器可能刚好在截止时间之后上线
+    thread::sleep(Duration::from_secs(5));
+    if let Some(v) = probe(Duration::from_secs(20)) {
+        return Ok(v);
+    }
+    Err(AppError::new(
+        "timeout",
+        format!(
+            "{done}，但 {} 秒内没有确认重新上线（可能仍在启动）。稍后执行 `agent-cli-x info {}` 确认；仍连不上时检查对端的开机自启/服务管理器与 ~/.agent-cli-x/serve-logs/ 下的日志",
+            wait.as_secs() + 5,
+            client.name
+        ),
+    ))
 }

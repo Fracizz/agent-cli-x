@@ -28,7 +28,7 @@ fn one() -> usize {
     1
 }
 fn max_entries() -> usize {
-    2000
+    500
 }
 
 pub fn ls(ctx: &Ctx, body: Value) -> Result<Value> {
@@ -226,6 +226,9 @@ struct ReadReq {
     start: Option<usize>,
     #[serde(default)]
     end: Option<usize>,
+    /// 本次最多返回的 KB 数（不超过 max_read_kb）；旧版客户端不传
+    #[serde(default)]
+    max_kb: Option<u64>,
 }
 
 /// 统计总行数 / 计算 sha256 时最多扫描的文件大小。
@@ -237,7 +240,11 @@ pub fn read(ctx: &Ctx, body: Value) -> Result<Value> {
     if !r.exists || !r.abs.is_file() {
         return Err(AppError::not_found(format!("文件不存在: {}", r.display())));
     }
-    let max_bytes = (ctx.st.cfg.policy.max_read_kb * 1024) as usize;
+    let max_kb = match req.max_kb {
+        Some(k) => k.clamp(1, ctx.st.cfg.policy.max_read_kb),
+        None => ctx.st.cfg.policy.max_read_kb,
+    };
+    let max_bytes = (max_kb * 1024) as usize;
     let size = fs::metadata(&r.abs)?.len();
     let mut file = fs::File::open(&r.abs)?;
 

@@ -53,6 +53,9 @@ enum Cmd {
         /// 端口被占用时最多等待的秒数（升级重启时新进程等待旧进程退出）
         #[arg(long, hide = true, default_value_t = 0)]
         wait_port: u64,
+        /// 只校验 config.toml 与证书，不启动服务（手改配置后用）
+        #[arg(long)]
+        check: bool,
     },
     /// 显示本机的名称、ID、指纹与工作区（不联网）
     Whoami {
@@ -79,8 +82,20 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// 重启对端 serve（不替换二进制；对端先校验配置，有误则拒绝）；对端可写 A,B 或 @all
+    Restart {
+        peer: String,
+        /// 对端有后台任务在运行时也强制重启（任务会被中断）
+        #[arg(long)]
+        force: bool,
+    },
+    /// 更换对端监听端口：经由新端口确认连通后才切换，连不上自动撤销；同时更新本机登记的地址
+    SetPort { peer: String, port: u16 },
     /// 打印本机证书指纹（供对端 peer add 核对）
     Fingerprint,
+    /// 后台任务执行进程（由 serve 启动，不要手动运行）
+    #[command(hide = true)]
+    JobRun { dir: PathBuf },
     /// 打印给 AI 阅读的用法说明
     Skill,
     /// 管理对端节点
@@ -129,6 +144,9 @@ enum Cmd {
         path: Option<String>,
         #[arg(long, default_value_t = 1)]
         depth: usize,
+        /// 最多列出的条目数
+        #[arg(long, default_value_t = 500)]
+        max: usize,
     },
     /// 在对端搜索文件内容（正则，遵守 .gitignore，跳过二进制与黑名单）
     Grep {
@@ -153,7 +171,7 @@ enum Cmd {
     Read {
         peer: String,
         path: String,
-        /// 行范围，如 100:200、100:、:50
+        /// 行范围，如 100:200、100:、:50。不给结束行时每次最多读 2000 行 / 64KB
         #[arg(long)]
         lines: Option<String>,
         /// 输出带行号
@@ -261,6 +279,15 @@ enum PeerCmd {
         #[arg(long)]
         fingerprint: Option<String>,
     },
+    /// 修改已登记对端的地址或 token（用登记时的指纹校验身份，连通后才保存）
+    Set {
+        name: String,
+        /// 新地址 IP:端口
+        #[arg(long, required_unless_present = "token")]
+        addr: Option<String>,
+        #[arg(long)]
+        token: Option<String>,
+    },
     /// 列出已登记的对端
     List,
     /// 删除对端
@@ -348,7 +375,17 @@ pub fn run() -> Result<i32> {
             workspaces,
             force,
         } => init(name, &listen, &workspaces, force, json),
-        Cmd::Serve { wait_port } => server::serve(&config::home_dir(), wait_port).map(|_| 0),
+        Cmd::JobRun { dir } => server::job_run(&dir),
+        Cmd::Serve { check: true, .. } => {
+            let listen = server::check(&config::home_dir())?;
+            if json {
+                println!("{}", json!({"ok": true, "listen": listen}));
+            } else {
+                println!("配置有效（监听 {listen}）");
+            }
+            Ok(0)
+        }
+        Cmd::Serve { wait_port, .. } => server::serve(&config::home_dir(), wait_port).map(|_| 0),
         Cmd::Whoami { pair } => whoami(pair, json),
         // 禁止借道时不探测对端
         Cmd::Doctor { no_peers } => doctor::run(json, !no_peers && !no_relay),
@@ -357,7 +394,16 @@ pub fn run() -> Result<i32> {
             peer,
             binary,
             force,
-        } => upgrade(&peer, binary, force, json),
+        } => {
+            client::disable_version_warning();
+            each_peer(&peer, json, "升级", |c| {
+                client::upgrade::upgrade(c, binary.as_deref(), force)
+            })
+        }
+        Cmd::Restart { peer, force } => {
+            each_peer(&peer, json, "重启", |c| client::admin::restart(c, force))
+        }
+        Cmd::SetPort { peer, port } => set_port(&peer, port, json),
         Cmd::Fingerprint => {
             let fp = tls::local_fingerprint(&config::home_dir())?;
             if json {
@@ -415,10 +461,15 @@ pub fn run() -> Result<i32> {
             }
         }
         Cmd::Job(j) => job(j, json),
-        Cmd::Ls { peer, path, depth } => {
+        Cmd::Ls {
+            peer,
+            path,
+            depth,
+            max,
+        } => {
             let v = Client::load(&peer)?.call(
                 "/v1/fs/ls",
-                &json!({"path": path.unwrap_or_default(), "depth": depth}),
+                &json!({"path": path.unwrap_or_default(), "depth": depth, "max": max}),
                 CALL_TIMEOUT,
             )?;
             if json {
@@ -433,7 +484,9 @@ pub fn run() -> Result<i32> {
                     }
                 }
                 if v["truncated"].as_bool() == Some(true) {
-                    eprintln!("[agent-cli-x: 条目过多已截断，请缩小目录或降低 --depth]");
+                    eprintln!(
+                        "[agent-cli-x: 已达 --max {max} 条上限，请缩小目录、降低 --depth，或改用 grep]"
+                    );
                 }
             }
             Ok(0)
@@ -743,8 +796,8 @@ fn init(
     println!("     {}", pair_command(&node_name, listen, &token, &fp));
     println!("  4. 配置开机自启（见 README「Start at boot」），完成后用 `agent-cli-x doctor` 自检");
     if cfg!(windows) {
-        println!("  防火墙（管理员 PowerShell 执行一次）:");
-        println!("     netsh advfirewall firewall add rule name=\"agent-cli-x\" dir=in action=allow protocol=TCP localport={port}");
+        println!("  防火墙（管理员 PowerShell 执行一次；按程序放行，以后改端口不用再改）:");
+        println!("     {}", crate::firewall::program_rule_cmd());
     } else {
         println!("  防火墙（如启用了 ufw）: sudo ufw allow {port}/tcp");
     }
@@ -924,32 +977,40 @@ fn token(cmd: TokenCmd, json: bool) -> Result<i32> {
     Ok(0)
 }
 
-fn upgrade(spec: &str, binary: Option<PathBuf>, force: bool, json: bool) -> Result<i32> {
-    client::disable_version_warning();
+/// 逐台执行 upgrade / restart：出问题时影响面最小，也便于看清是哪一台失败。
+fn each_peer(
+    spec: &str,
+    json: bool,
+    verb: &str,
+    f: impl Fn(&Client) -> Result<Value>,
+) -> Result<i32> {
     let peers = multi::resolve(spec)?;
     let mut results = Vec::new();
     let mut code = 0;
-    // 逐台升级：出问题时影响面最小，也便于看清是哪一台失败
     for p in &peers {
         if !json {
-            eprintln!("[agent-cli-x: 正在升级 {p} …]");
+            eprintln!("[agent-cli-x: 正在{verb} {p} …]");
         }
-        let r =
-            Client::load(p).and_then(|c| client::upgrade::upgrade(&c, binary.as_deref(), force));
-        match r {
+        match Client::load(p).and_then(|c| f(&c)) {
             Ok(v) => {
                 if !json {
-                    println!(
-                        "{p}: {} → {}（{}，用时 {:.1}s）",
-                        v["old_version"].as_str().unwrap_or("?"),
-                        v["new_version"].as_str().unwrap_or("?"),
-                        if v["restart"] == "exit" {
-                            "由服务管理器重启"
-                        } else {
-                            "已自动重启"
-                        },
-                        v["ms"].as_u64().unwrap_or(0) as f64 / 1000.0
-                    );
+                    let how = if v["restart"] == "exit" {
+                        "由服务管理器重启"
+                    } else {
+                        "已自动重启"
+                    };
+                    let secs = v["ms"].as_u64().unwrap_or(0) as f64 / 1000.0;
+                    let how = match v["kept_jobs"].as_u64() {
+                        Some(n) if n > 0 => format!("{how}，{n} 个后台任务继续运行"),
+                        _ => how.to_string(),
+                    };
+                    match v["new_version"].as_str() {
+                        Some(new) => println!(
+                            "{p}: {} → {new}（{how}，用时 {secs:.1}s）",
+                            v["old_version"].as_str().unwrap_or("?")
+                        ),
+                        None => println!("{p}: 已重启（{how}，用时 {secs:.1}s）"),
+                    }
                 }
                 results.push(v);
             }
@@ -958,7 +1019,7 @@ fn upgrade(spec: &str, binary: Option<PathBuf>, force: bool, json: bool) -> Resu
                     code = e.exit_code();
                 }
                 if !json {
-                    println!("{p}: 升级失败 {e}");
+                    println!("{p}: {verb}失败 {e}");
                 }
                 results.push(json!({"peer": p, "error": http::error_json(&e)}));
             }
@@ -968,6 +1029,27 @@ fn upgrade(spec: &str, binary: Option<PathBuf>, force: bool, json: bool) -> Resu
         println!("{}", json!({"exit_code": code, "results": results}));
     }
     Ok(code)
+}
+
+fn set_port(peer: &str, port: u16, json: bool) -> Result<i32> {
+    let v = client::admin::set_port(&Client::load(peer)?, port)?;
+    if json {
+        println!("{v}");
+        return Ok(0);
+    }
+    let addr = v["addr"].as_str().unwrap_or_default();
+    let names: Vec<&str> = v["updated_peers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|x| x.as_str())
+        .collect();
+    println!(
+        "{peer}: 已改为监听端口 {port}，本机登记的 {} 已更新为 {addr}",
+        names.join("、")
+    );
+    println!("其他登记了这台机器的节点需执行: agent-cli-x peer set <名称> --addr {addr}");
+    Ok(0)
 }
 
 fn peer(cmd: PeerCmd, json: bool) -> Result<i32> {
@@ -1020,6 +1102,32 @@ fn peer(cmd: PeerCmd, json: bool) -> Result<i32> {
             } else {
                 println!("已登记对端 {name} ({addr})");
                 print_info(&name, &info);
+            }
+            Ok(0)
+        }
+        PeerCmd::Set { name, addr, token } => {
+            let mut peers = config::load_peers(&home)?;
+            let Some(old) = peers.peers.get(&name) else {
+                return Err(AppError::not_found(format!("未登记对端 `{name}`")));
+            };
+            let mut p = old.clone();
+            if let Some(a) = addr {
+                p.addr = config::normalize_addr(&a);
+            }
+            if let Some(t) = token {
+                p.token = t;
+            }
+            // 指纹沿用登记时的：连得上且指纹一致才保存，防止误指到别的机器
+            let info =
+                Client::from_peer(&name, p.clone()).call("/v1/info", &json!({}), CALL_TIMEOUT)?;
+            p.absorb_info(&info);
+            let addr = p.addr.clone();
+            peers.peers.insert(name.clone(), p);
+            config::save_peers(&home, &peers)?;
+            if json {
+                println!("{}", json!({"updated": name, "addr": addr}));
+            } else {
+                println!("已更新对端 {name} ({addr})");
             }
             Ok(0)
         }
@@ -1274,7 +1382,9 @@ fn job(cmd: JobCmd, json: bool) -> Result<i32> {
                 }
                 "lost" => {
                     out.finish(&json!({"code": 1}));
-                    eprintln!("[agent-cli-x: 对端服务重启过，无法得知该任务的结果]");
+                    eprintln!(
+                        "[agent-cli-x: 任务的执行进程已不在（机器重启或进程被终止），无法得知结果]"
+                    );
                     Ok(1)
                 }
                 "killed" => {
@@ -1363,6 +1473,10 @@ fn cp(
     Ok(0)
 }
 
+/// read 不给结束行时，单次最多读取的行数 / KB 数。
+const READ_WINDOW_LINES: usize = 2000;
+const READ_WINDOW_KB: u64 = 64;
+
 fn read(peer: &str, path: &str, lines: Option<String>, number: bool, json: bool) -> Result<i32> {
     let (start, end) = match lines.as_deref() {
         None => (None, None),
@@ -1380,9 +1494,17 @@ fn read(peer: &str, path: &str, lines: Option<String>, number: bool, json: bool)
             (p(a)?, p(b)?)
         }
     };
+    // 没给结束行时只读一个窗口（行数 + 字节双上限），避免一次把大文件整个读进上下文
+    let windowed = end.is_none();
+    let (end, max_kb) = if windowed {
+        let s = start.unwrap_or(1).max(1);
+        (Some(s + READ_WINDOW_LINES - 1), Some(READ_WINDOW_KB))
+    } else {
+        (end, None)
+    };
     let v = Client::load(peer)?.call(
         "/v1/fs/read",
-        &json!({"path": path, "start": start, "end": end}),
+        &json!({"path": path, "start": start, "end": end, "max_kb": max_kb}),
         CALL_TIMEOUT,
     )?;
     if json {
@@ -1407,14 +1529,15 @@ fn read(peer: &str, path: &str, lines: Option<String>, number: bool, json: bool)
         v["truncated"].as_bool() == Some(true) || first > 1 || total.is_some_and(|t| last < t);
     if partial {
         eprintln!(
-            "\n[agent-cli-x: 显示第 {first}-{last} 行，共 {} 行{}；继续读取用 --lines {}:]",
+            "\n[agent-cli-x: 显示第 {first}-{last} 行，共 {} 行{}；继续读取用 --lines {}:{}]",
             total.map(|t| t.to_string()).unwrap_or_else(|| "?".into()),
             if v["truncated"].as_bool() == Some(true) {
                 "，已达单次读取上限"
             } else {
                 ""
             },
-            last + 1
+            last + 1,
+            last + READ_WINDOW_LINES as u64
         );
     }
     Ok(0)
@@ -1447,6 +1570,11 @@ fn print_info(name: &str, v: &Value) {
         };
         println!(
             "  exec 身份: {user}{elevated}（exec 不受下方路径权限/禁止访问约束，只受命令黑名单约束）"
+        );
+    }
+    if let Some(e) = v["config_error"].as_str() {
+        println!(
+            "  配置异常: config.toml 有误，正在用上次可用的配置运行（{e}）。修复后执行 `agent-cli-x restart {name}`"
         );
     }
     if v["caller_no_relay"] == true {

@@ -31,6 +31,7 @@ agent-cli-x put B ./dist proj:web/dist --exclude node_modules ; agent-cli-x get 
 agent-cli-x cp A dl:pkg B home:               # peer → peer, streamed, nothing kept locally
 agent-cli-x rm B proj:build/tmp -r            # to recycle bin; rollback B <op_id> undoes write/edit/put/rm
 agent-cli-x upgrade B                         # on a `版本不一致` hint
+agent-cli-x restart B ; agent-cli-x set-port B 48000   # never hand-edit a peer's config/firewall for these
 ```
 
 ## Keep output small
@@ -53,4 +54,4 @@ agent-cli-x upgrade B                         # on a `版本不一致` hint
 
 ## Exit codes
 
-other = remote command's code · 100 cannot connect · 101 bad token · 102 denied by policy · 103 not found · 104 timeout · 105 conflict (edit match / sha / jobs running on upgrade) · 106 cert fingerprint mismatch: ask a human, never re-register · 107 I/O · 108 internal · 109 config (unknown peer) · 110 bad arguments · 111 busy · 137 job killed
+other = remote command's code · 100 cannot connect · 101 bad token · 102 denied by policy · 103 not found · 104 timeout (upgrade/restart: not back yet, check `info` later) · 105 conflict (edit match / sha / jobs running on upgrade) · 106 cert fingerprint mismatch: ask a human, never re-register · 107 I/O · 108 internal · 109 config (unknown peer) · 110 bad arguments · 111 busy · 137 job killed

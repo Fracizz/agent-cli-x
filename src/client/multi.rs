@@ -1,5 +1,6 @@
 //! 一条命令操作多个对端：`A,B,C` 或 `@all`。各对端并行执行，结果按对端分组输出。
 
+use super::output::{self, emit, HeadTail};
 use super::Client;
 use crate::config;
 use crate::error::{AppError, Result};
@@ -11,8 +12,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub const ALL: &str = "@all";
-const HEAD_LINES: usize = 100;
-const TAIL_LINES: usize = 100;
 /// 每个对端最多在内存中保留的输出（超出部分只写入日志文件）。
 const MEM_CAP: usize = 8 * 1024 * 1024;
 
@@ -163,45 +162,36 @@ fn exec_one(peer: &str, body: &Value, read_timeout: Duration) -> ExecResult {
     r
 }
 
-fn emit(is_err: bool, s: &str) {
-    if is_err {
-        let mut e = std::io::stderr().lock();
-        let _ = e.write_all(s.as_bytes());
-        let _ = e.flush();
-    } else {
-        let mut o = std::io::stdout().lock();
-        let _ = o.write_all(s.as_bytes());
-        let _ = o.flush();
-    }
-}
-
 /// 打印一个对端的输出（头尾截断），返回是否保留了完整日志。
 fn print_output(r: &ExecResult, full: bool) -> bool {
-    let mut lines: Vec<(bool, &str)> = Vec::new();
-    for (is_err, text) in &r.chunks {
-        for piece in text.split_inclusive('\n') {
-            lines.push((*is_err, piece));
-        }
-    }
-    let ends_nl = lines.last().map(|(_, l)| l.ends_with('\n')).unwrap_or(true);
-    let truncated = !full && lines.len() > HEAD_LINES + TAIL_LINES;
-    if truncated {
-        for (e, l) in &lines[..HEAD_LINES] {
-            emit(*e, l);
-        }
-        eprintln!(
-            "[agent-cli-x: 中间省略 {} 行，完整输出: {}]",
-            lines.len() - HEAD_LINES - TAIL_LINES,
-            r.log
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default()
-        );
-        for (e, l) in &lines[lines.len() - TAIL_LINES..] {
-            emit(*e, l);
+    let log = r
+        .log
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let ends_nl = r
+        .chunks
+        .iter()
+        .rev()
+        .find(|(_, t)| !t.is_empty())
+        .map(|(_, t)| t.ends_with('\n'))
+        .unwrap_or(true);
+    let mut truncated = false;
+    if full {
+        for (e, t) in &r.chunks {
+            emit(*e, t);
         }
     } else {
-        for (e, l) in &lines {
+        let mut ht = HeadTail::new(output::PER_PEER);
+        for (e, t) in &r.chunks {
+            ht.feed(*e, t, &mut emit);
+        }
+        let tail = ht.finish();
+        if ht.omitted > 0 {
+            truncated = true;
+            eprintln!("{}", output::omit_note(ht.omitted, Some(&log)));
+        }
+        for (e, l) in &tail {
             emit(*e, l);
         }
     }
@@ -255,15 +245,22 @@ pub fn exec_many(
         let list: Vec<Value> = results
             .iter()
             .map(|r| {
-                let (mut out, mut err) = (String::new(), String::new());
-                for (is_err, t) in &r.chunks {
-                    if *is_err {
-                        err.push_str(t);
-                    } else {
-                        out.push_str(t);
-                    }
-                }
-                let keep_log = r.dropped;
+                let log = r.log.as_ref().map(|p| p.to_string_lossy().to_string());
+                let pick = |want_err: bool| -> Vec<&str> {
+                    r.chunks
+                        .iter()
+                        .filter(|(e, _)| *e == want_err)
+                        .map(|(_, t)| t.as_str())
+                        .collect()
+                };
+                let (out, err, omitted) = if full {
+                    (pick(false).concat(), pick(true).concat(), 0)
+                } else {
+                    let (o, no) = output::clip_text(&pick(false), output::PER_PEER, log.as_deref());
+                    let (e, ne) = output::clip_text(&pick(true), output::PER_PEER, log.as_deref());
+                    (o, e, no + ne)
+                };
+                let keep_log = r.dropped || omitted > 0;
                 if !keep_log {
                     if let Some(p) = &r.log {
                         let _ = fs::remove_file(p);
@@ -277,7 +274,8 @@ pub fn exec_many(
                     "stdout": out,
                     "stderr": err,
                     "truncated": keep_log,
-                    "log": keep_log.then(|| r.log.as_ref().map(|p| p.to_string_lossy().to_string())),
+                    "omitted_lines": omitted,
+                    "log": if keep_log { log } else { None },
                     "error": r.error.as_ref().map(http::error_json),
                 })
             })
@@ -360,8 +358,13 @@ pub fn info_many(peers: &[String], json: bool) -> i32 {
         match r {
             Ok((v, ms)) => {
                 let ver = v["version"].as_str().unwrap_or("?");
+                let warn = if v["config_error"].is_string() {
+                    format!("\t配置异常，见 `agent-cli-x info {p}`")
+                } else {
+                    String::new()
+                };
                 println!(
-                    "{p}\t在线\t{} ({})\t{}/{}\tv{ver}{}\t{ms}ms",
+                    "{p}\t在线\t{} ({})\t{}/{}\tv{ver}{}\t{ms}ms{warn}",
                     v["node_name"].as_str().unwrap_or("?"),
                     v["node_id"].as_str().unwrap_or("-"),
                     v["os"].as_str().unwrap_or("?"),

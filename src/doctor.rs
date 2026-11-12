@@ -3,10 +3,10 @@
 use crate::client::{self, multi, Client};
 use crate::config::{self, Peer};
 use crate::error::Result;
-use crate::{http, platform, server, tls};
+use crate::platform::run_cmd;
+use crate::{firewall, http, server, tls};
 use serde_json::{json, Value};
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::time::Duration;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -44,20 +44,6 @@ impl Report {
     fn add(&mut self, name: &str, level: Level, detail: impl Into<String>) {
         self.items.push((name.to_string(), level, detail.into()));
     }
-}
-
-/// 运行外部命令，返回 (是否成功, 标准输出)。命令不存在时返回 None。
-fn run_cmd(prog: &str, args: &[&str]) -> Option<(bool, String)> {
-    let mut c = Command::new(prog);
-    c.args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    platform::apply_spawn_flags(&mut c);
-    let o = c.output().ok()?;
-    // schtasks 等可能输出 UTF-16 或本地代码页；只关心 ASCII 标签和数字，去掉 NUL 即可
-    let text = String::from_utf8_lossy(&o.stdout).replace('\0', "");
-    Some((o.status.success(), text))
 }
 
 fn listen_port(listen: &str) -> String {
@@ -127,73 +113,126 @@ fn check_autostart(r: &mut Report) {
             );
         }
     } else if cfg!(target_os = "linux") {
-        let Some((_, state)) = run_cmd("systemctl", &["--user", "is-enabled", "agent-cli-x"])
-        else {
+        check_systemd(r);
+    } else {
+        r.add(NAME, Level::Skip, "当前系统不检查");
+    }
+}
+
+/// Linux：检查 systemd 系统服务或用户服务 agent-cli-x（以 root 作为系统服务运行也很常见）。
+fn check_systemd(r: &mut Report) {
+    const NAME: &str = "开机自启";
+    let enabled = |user: bool| {
+        let mut args = vec!["is-enabled", "agent-cli-x"];
+        if user {
+            args.insert(0, "--user");
+        }
+        run_cmd("systemctl", &args).map(|(_, s)| s.trim().to_string())
+    };
+    let system = enabled(false);
+    let user = if system.as_deref() == Some("enabled") {
+        None
+    } else {
+        enabled(true)
+    };
+    let user_scope = match (system.as_deref(), user.as_deref()) {
+        (None, None) => {
             r.add(
                 NAME,
                 Level::Skip,
                 "未检测到 systemd，请用系统自己的方式配置开机自启",
             );
             return;
-        };
-        if state.trim() != "enabled" {
+        }
+        (Some("enabled"), _) => {
+            r.add(NAME, Level::Ok, "systemd 系统服务 agent-cli-x 已启用");
+            false
+        }
+        (_, Some("enabled")) => {
+            let me = std::env::var("USER").unwrap_or_default();
+            let linger = run_cmd(
+                "loginctl",
+                &["show-user", &me, "--property=Linger", "--value"],
+            )
+            .map(|(_, s)| s.trim().to_string())
+            .unwrap_or_default();
+            if linger == "yes" {
+                r.add(NAME, Level::Ok, "systemd 用户服务已启用，linger 已开启");
+            } else {
+                r.add(
+                    NAME,
+                    Level::Warn,
+                    "systemd 用户服务已启用，但未开启 linger：开机不会自动启动、退出登录后会停止。执行 `sudo loginctl enable-linger $USER`",
+                );
+            }
+            true
+        }
+        _ => {
             r.add(
                 NAME,
                 Level::Warn,
-                format!(
-                    "systemd 用户服务 agent-cli-x 未启用（{}）。按 README「Start at boot」配置",
-                    if state.trim().is_empty() {
-                        "不存在"
-                    } else {
-                        state.trim()
-                    }
-                ),
+                "systemd 服务 agent-cli-x 未启用（系统服务与用户服务都没有）。按 README「Start at boot」配置",
             );
             return;
         }
-        let user = std::env::var("USER").unwrap_or_default();
-        let linger = run_cmd(
-            "loginctl",
-            &["show-user", &user, "--property=Linger", "--value"],
-        )
+    };
+    let mut args = vec!["show", "-p", "KillMode", "--value", "agent-cli-x"];
+    if user_scope {
+        args.insert(0, "--user");
+    }
+    let kill_mode = run_cmd("systemctl", &args)
         .map(|(_, s)| s.trim().to_string())
         .unwrap_or_default();
-        if linger == "yes" {
-            r.add(NAME, Level::Ok, "systemd 用户服务已启用，linger 已开启");
+    if !kill_mode.is_empty() && kill_mode != "process" && kill_mode != "none" {
+        let reload = if user_scope {
+            "systemctl --user daemon-reload"
         } else {
-            r.add(
-                NAME,
-                Level::Warn,
-                "systemd 用户服务已启用，但未开启 linger：开机不会自动启动、退出登录后会停止。执行 `sudo loginctl enable-linger $USER`",
-            );
-        }
-    } else {
-        r.add(NAME, Level::Skip, "当前系统不检查");
+            "sudo systemctl daemon-reload"
+        };
+        r.add(
+            "后台任务",
+            Level::Warn,
+            format!(
+                "KillMode={kill_mode}：重启/升级 serve 时 systemd 会连同后台任务一起终止。在 unit 的 [Service] 中加 KillMode=process，再执行 `{reload}`"
+            ),
+        );
     }
 }
 
 fn check_firewall(r: &mut Report, port: &str) {
-    if !cfg!(windows) {
-        return;
-    }
     const NAME: &str = "防火墙";
-    match run_cmd("netsh", &["advfirewall", "firewall", "show", "rule", "name=agent-cli-x"]) {
-        Some((true, out)) if out.contains(port) => {
-            r.add(NAME, Level::Ok, format!("入站规则 agent-cli-x 已放行端口 {port}"))
-        }
-        Some((true, _)) => r.add(
+    let Ok(port) = port.parse::<u16>() else {
+        return;
+    };
+    let fix = || {
+        format!(
+            "管理员 PowerShell 执行一次: {}",
+            firewall::program_rule_cmd()
+        )
+    };
+    use firewall::Status as S;
+    match firewall::check(port) {
+        S::NotChecked => {}
+        S::Program | S::Added => r.add(NAME, Level::Ok, "入站规则 agent-cli-x 按程序放行"),
+        S::Port => r.add(
             NAME,
-            Level::Warn,
-            format!("入站规则 agent-cli-x 存在，但没有包含端口 {port}"),
+            Level::Ok,
+            format!("入站规则 agent-cli-x 已放行端口 {port}"),
         ),
-        _ => r.add(
+        S::OtherPort => r.add(
             NAME,
             Level::Warn,
             format!(
-                "未找到入站规则 agent-cli-x，其他机器可能连不上。管理员 PowerShell 执行: \
-netsh advfirewall firewall add rule name=\"agent-cli-x\" dir=in action=allow protocol=TCP localport={port}"
+                "入站规则 agent-cli-x 存在，但没有放行端口 {port}。{}",
+                fix()
             ),
         ),
+        S::Missing => r.add(
+            NAME,
+            Level::Warn,
+            format!("未找到入站规则 agent-cli-x，其他机器可能连不上。{}", fix()),
+        ),
+        S::Unknown => r.add(NAME, Level::Skip, "无法运行 netsh"),
     }
 }
 
@@ -203,7 +242,18 @@ pub fn run(json: bool, check_peers: bool) -> Result<i32> {
     let mut r = Report { items: Vec::new() };
 
     match config::load_config(&home) {
-        Err(e) => r.add("配置", Level::Fail, e.message),
+        Err(e) => {
+            let lg = config::last_good_path(&home);
+            let extra = if config::config_path(&home).exists() && lg.exists() {
+                format!(
+                    "（serve 启动时会回退到上次可用的 {}，修复后需重启 serve）",
+                    lg.display()
+                )
+            } else {
+                String::new()
+            };
+            r.add("配置", Level::Fail, format!("{}{extra}", e.message))
+        }
         Ok(cfg) => {
             r.add(
                 "配置",

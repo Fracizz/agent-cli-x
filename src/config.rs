@@ -159,9 +159,31 @@ pub fn config_path(home: &Path) -> PathBuf {
     home.join("config.toml")
 }
 
+/// 上次 serve 成功启动时的配置副本：config.toml 改坏时 serve 回退到它，避免机器失联。
+pub fn last_good_path(home: &Path) -> PathBuf {
+    home.join("config.toml.last-good")
+}
+
+/// 把当前 config.toml 保存为 last-good（内容相同则不写）。失败不影响主流程。
+pub fn save_last_good(home: &Path) {
+    let Ok(text) = fs::read(config_path(home)) else {
+        return;
+    };
+    let lg = last_good_path(home);
+    if fs::read(&lg).ok().as_deref() == Some(text.as_slice()) {
+        return;
+    }
+    if crate::util::atomic_write(&lg, &text).is_ok() {
+        crate::util::restrict_permissions(&lg);
+    }
+}
+
 pub fn load_config(home: &Path) -> Result<Config> {
-    let p = config_path(home);
-    let text = fs::read_to_string(&p).map_err(|e| {
+    load_config_file(&config_path(home))
+}
+
+pub fn load_config_file(p: &Path) -> Result<Config> {
+    let text = fs::read_to_string(p).map_err(|e| {
         AppError::config(format!(
             "读取 {} 失败: {e}。请先执行 `agent-cli-x init`",
             p.display()
@@ -169,6 +191,13 @@ pub fn load_config(home: &Path) -> Result<Config> {
     })?;
     let cfg: Config = toml::from_str(&text)
         .map_err(|e| AppError::config(format!("解析 {} 失败: {e}", p.display())))?;
+    if std::net::ToSocketAddrs::to_socket_addrs(&cfg.listen.as_str()).is_err() {
+        return Err(AppError::config(format!(
+            "{} 中 listen = `{}` 不是有效的 IP:端口",
+            p.display(),
+            cfg.listen
+        )));
+    }
     if cfg.token.len() < 16 {
         return Err(AppError::config("token 过短（至少 16 个字符）"));
     }
@@ -672,22 +701,57 @@ pub fn read_config_token(home: &Path) -> Option<String> {
 
 /// 替换 config.toml 中顶层 `token = ...` 这一行，保留其余内容与注释。
 pub fn replace_config_token(home: &Path, token: &str) -> Result<()> {
+    set_top_level(home, "token", &toml_str(token))
+}
+
+/// 修改 config.toml 中的 `listen`（保留注释），写入后校验能解析，否则还原。
+pub fn replace_config_listen(home: &Path, listen: &str) -> Result<()> {
+    let p = config_path(home);
+    let before = fs::read_to_string(&p)?;
+    set_top_level(home, "listen", &toml_str(listen))?;
+    if let Err(e) = load_config(home) {
+        let _ = crate::util::atomic_write(&p, before.as_bytes());
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// 替换顶层 `key = ...` 这一行；没有时插入到第一个表之前（顶层键必须位于表之前）。
+fn set_top_level(home: &Path, key: &str, value: &str) -> Result<()> {
     let p = config_path(home);
     let text = fs::read_to_string(&p)?;
-    let re = regex::Regex::new(r"(?m)^token\s*=.*$").expect("静态正则");
-    if !re.is_match(&text) {
-        return Err(AppError::config(format!(
-            "{} 中没有找到 `token = ...` 行",
-            p.display()
-        )));
-    }
-    let new_line = format!("token = {}", toml_str(token));
-    let out = re
-        .replacen(&text, 1, regex::NoExpand(&new_line))
-        .to_string();
+    let out = set_top_level_text(&text, key, value);
     crate::util::atomic_write(&p, out.as_bytes())?;
     crate::util::restrict_permissions(&p);
     Ok(())
+}
+
+fn set_top_level_text(text: &str, key: &str, value: &str) -> String {
+    let new_line = format!("{key} = {value}");
+    let re = regex::Regex::new(&format!(r"(?m)^{}\s*=.*$", regex::escape(key))).expect("静态正则");
+    // 只在第一个表之前查找，避免误改某个表里的同名键
+    let table = regex::Regex::new(r"(?m)^\s*\[").expect("静态正则");
+    let head_end = table.find(text).map_or(text.len(), |m| m.start());
+    let (head, tail) = text.split_at(head_end);
+    if re.is_match(head) {
+        let head = re.replacen(head, 1, regex::NoExpand(&new_line));
+        return format!("{head}{tail}");
+    }
+    let sep = if head.is_empty() || head.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    format!("{head}{sep}{new_line}\n\n{tail}")
+}
+
+/// 把地址中的端口换成 `port`：`10.0.0.5:47821` → `10.0.0.5:48000`，`[::]:1` → `[::]:48000`。
+pub fn with_port(addr: &str, port: u16) -> String {
+    let host = match addr.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => h,
+        _ => addr,
+    };
+    format!("{host}:{port}")
 }
 
 /// `10.0.0.5` → `10.0.0.5:47821`
@@ -748,6 +812,33 @@ mod tests {
         assert_eq!(cfg.policy.deny_commands, preset.deny_commands);
         // [[policy.paths]] 之后的键不能误入规则表（deny_unknown_fields 会报错），这里确认其他字段仍在 [policy]
         assert_eq!(cfg.policy.max_jobs, 16);
+    }
+
+    #[test]
+    fn top_level_keys() {
+        let t = "# c\nlisten = \"0.0.0.0:1\" # x\ntoken = \"t\"\n\n[policy]\nlisten = \"keep\"\n";
+        let o = set_top_level_text(t, "listen", "\"0.0.0.0:2\"");
+        assert_eq!(o, t.replacen("\"0.0.0.0:1\" # x", "\"0.0.0.0:2\"", 1));
+        // 缺失时插到第一个表之前，表里的同名键不动
+        let t2 = "token = \"t\"\n[policy]\nlisten = \"keep\"\n";
+        let o = set_top_level_text(t2, "listen", "\"a:3\"");
+        assert_eq!(
+            o,
+            "token = \"t\"\nlisten = \"a:3\"\n\n[policy]\nlisten = \"keep\"\n"
+        );
+        let cfg = template("n", "id", "0.0.0.0:47821", "0123456789abcdef0123", &[]);
+        let o = set_top_level_text(&cfg, "listen", &toml_str("0.0.0.0:48000"));
+        assert_eq!(
+            toml::from_str::<Config>(&o).unwrap().listen,
+            "0.0.0.0:48000"
+        );
+    }
+
+    #[test]
+    fn port_swap() {
+        assert_eq!(with_port("10.0.0.5:47821", 48000), "10.0.0.5:48000");
+        assert_eq!(with_port("[::]:47821", 9), "[::]:9");
+        assert_eq!(with_port("host", 9), "host:9");
     }
 
     #[test]

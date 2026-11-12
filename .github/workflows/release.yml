@@ -106,8 +106,13 @@ jobs:
           Unpack the archive and put \`agent-cli-x\` (\`agent-cli-x.exe\` on Windows) on your \`PATH\`,
           or run \`cargo install --git https://github.com/${{ github.repository }}\`.
           EOF
+          # 标签带 `-`（如 v0.0.5-beta.1）时发布为预发布版本，不会成为 latest
+          extra=()
+          case "${{ github.ref_name }}" in
+            *-*) extra=(--prerelease) ;;
+          esac
           gh release create "${{ github.ref_name }}" dist/* \
             --repo "${{ github.repository }}" \
             --title "agent-cli-x ${{ github.ref_name }}" \
             --notes-file release-notes.md \
-            --verify-tag
+            --verify-tag "${extra[@]}"
