@@ -1,6 +1,6 @@
 [package]
 name = "agent-cli-x"
-version = "0.0.5"
+version = "0.0.6"
 edition = "2021"
 rust-version = "1.80"
 description = "Single-binary CLI that lets AI agents on different machines run commands and edit files on each other"
