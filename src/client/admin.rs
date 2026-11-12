@@ -49,7 +49,9 @@ pub fn set_port(client: &Client, port: u16) -> Result<Value> {
             &e.code,
             format!(
                 "经由新地址 {new_addr} 确认失败（{}），已撤销，{} 仍监听原端口。{hint}",
-                e.message, client.name
+                // 只取底层错误的第一句，详细的握手提示与这里的防火墙提示重复
+                e.message.split('。').next().unwrap_or_default(),
+                client.name
             ),
         ));
     }

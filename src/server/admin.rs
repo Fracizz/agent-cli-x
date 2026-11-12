@@ -12,7 +12,7 @@ use crate::error::{AppError, Result};
 use crate::{firewall, http, platform, tls};
 use serde_json::{json, Value};
 use std::io::Write;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -22,24 +22,24 @@ use std::time::Duration;
 /// 新端口等待确认的时间。
 const PENDING_SECS: u64 = 120;
 
-/// 一个监听器：设置 stop 后唤醒阻塞中的 accept，监听线程退出并释放端口。
+/// 监听线程检查停止标志的间隔（关闭监听器最多等这么久）。
+const ACCEPT_POLL_MS: i32 = 500;
+
+/// 一个监听器：设置 stop 后，监听线程在下一次醒来时退出并释放端口。
 pub struct ListenerHandle {
     pub addr: String,
-    local: SocketAddr,
     stop: Arc<AtomicBool>,
+    thread: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl ListenerHandle {
+    /// 停止监听并等监听线程退出（端口随之释放，可立即重新使用）。
     fn close(&self) {
         self.stop.store(true, Ordering::SeqCst);
-        let mut a = self.local;
-        if a.ip().is_unspecified() {
-            a.set_ip(match a.ip() {
-                IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
-                IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
-            });
+        let t = self.thread.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(t) = t {
+            let _ = t.join();
         }
-        let _ = TcpStream::connect_timeout(&a, Duration::from_secs(2));
     }
 }
 
@@ -80,25 +80,35 @@ impl Net {
     }
 }
 
-/// 在独立线程上接受连接。
+/// 在独立线程上接受连接。不用阻塞的 accept：定期醒来检查停止标志，
+/// 这样关闭监听器不依赖“连自己一次”来唤醒（本机防火墙拦截回环连接时会失败）。
 pub fn spawn_accept(st: &Arc<State>, listener: TcpListener, addr: &str) -> Result<ListenerHandle> {
-    let local = listener.local_addr()?;
     let stop = Arc::new(AtomicBool::new(false));
     let (st, flag) = (Arc::clone(st), Arc::clone(&stop));
-    thread::spawn(move || {
-        for stream in listener.incoming() {
+    let t = thread::spawn(move || {
+        while !flag.load(Ordering::SeqCst) {
+            match platform::wait_readable(&listener, ACCEPT_POLL_MS) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(_) => {
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+            }
             if flag.load(Ordering::SeqCst) {
                 break;
             }
-            let Ok(tcp) = stream else { continue };
+            let Ok((tcp, _)) = listener.accept() else {
+                continue;
+            };
             let st = Arc::clone(&st);
             thread::spawn(move || super::handle_conn(st, tcp));
         }
     });
     Ok(ListenerHandle {
         addr: addr.to_string(),
-        local,
         stop,
+        thread: Mutex::new(Some(t)),
     })
 }
 
@@ -198,7 +208,8 @@ fn open(ctx: &Ctx, port: u16) -> Result<Value> {
     })?;
     let handle = spawn_accept(st, listener, &addr)?;
     let id = st.net.next_id.fetch_add(1, Ordering::SeqCst);
-    if let Some(old) = st.net.lock().pending.replace(Pending { id, port, handle }) {
+    let old = st.net.lock().pending.replace(Pending { id, port, handle });
+    if let Some(old) = old {
         old.handle.close();
     }
     // 超时未确认：关闭新端口，旧端口不受影响

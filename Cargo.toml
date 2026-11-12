@@ -1,6 +1,6 @@
 [package]
 name = "agent-cli-x"
-version = "0.0.5-beta.1"
+version = "0.0.5-beta.2"
 edition = "2021"
 rust-version = "1.80"
 description = "Single-binary CLI that lets AI agents on different machines run commands and edit files on each other"
@@ -38,6 +38,7 @@ windows-sys = { version = "0.59", features = [
   "Win32_Storage_FileSystem",
   "Win32_System_IO",
   "Win32_System_Diagnostics_ToolHelp",
+  "Win32_Networking_WinSock",
 ] }
 
 [target.'cfg(unix)'.dependencies]

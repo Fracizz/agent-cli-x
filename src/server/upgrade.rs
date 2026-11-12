@@ -134,10 +134,15 @@ pub fn jobs_on_restart(ctx: &Ctx, force: bool, verb: &str) -> Result<(usize, usi
         return Ok((0, running));
     }
     if !force {
+        let (unit, reload) = match platform::systemd_unit() {
+            Some((u, true)) => (u, "systemctl --user daemon-reload"),
+            Some((u, false)) => (u, "sudo systemctl daemon-reload"),
+            None => ("agent-cli-x.service".to_string(), "systemctl daemon-reload"),
+        };
         return Err(AppError::conflict(format!(
             "对端有 {running} 个后台任务正在运行。该机器由服务管理器重启，且 systemd 的 KillMode 不是 process，\
-{verb}会连同任务一起终止（状态变为 lost）。在 unit 的 [Service] 中加 KillMode=process 并执行 \
-`systemctl --user daemon-reload` 后再试；或等任务结束（job list 查看）；或加 --force"
+{verb}会连同任务一起终止（状态变为 lost）。在 {unit} 的 [Service] 中加 KillMode=process 并执行 \
+`{reload}` 后再试；或等任务结束（job list 查看）；或加 --force"
         )));
     }
     Ok((running, 0))

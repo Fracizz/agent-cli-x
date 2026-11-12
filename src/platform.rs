@@ -570,6 +570,18 @@ pub fn lock_exclusive(f: &std::fs::File, wait: bool) -> std::io::Result<bool> {
 /// 当前进程所在 systemd 服务的 KillMode（不在 systemd 服务里时为 None）。
 /// 默认的 control-group 会在服务停止/重启时杀掉 cgroup 内所有进程，包括后台任务。
 pub fn systemd_kill_mode() -> Option<String> {
+    let (unit, user) = systemd_unit()?;
+    let mut args = vec!["show", "-p", "KillMode", "--value", unit.as_str()];
+    if user {
+        args.insert(0, "--user");
+    }
+    let (ok, out) = run_cmd("systemctl", &args)?;
+    let mode = out.trim().to_string();
+    (ok && !mode.is_empty()).then_some(mode)
+}
+
+/// 当前进程所在的 systemd 服务：(unit 名称, 是否用户级服务)。不在 systemd 服务里时为 None。
+pub fn systemd_unit() -> Option<(String, bool)> {
     if !cfg!(target_os = "linux") {
         return None;
     }
@@ -581,11 +593,45 @@ pub fn systemd_kill_mode() -> Option<String> {
         .next()?
         .to_string();
     let unit = path.rsplit('/').find(|s| s.ends_with(".service"))?;
-    let mut args = vec!["show", "-p", "KillMode", "--value", unit];
-    if path.contains("/user@") {
-        args.insert(0, "--user");
+    Some((unit.to_string(), path.contains("/user@")))
+}
+
+/// 等待监听 socket 上有新连接，最多 `timeout_ms` 毫秒。返回 Ok(true) 表示可以 accept。
+/// 用于让监听线程定期醒来检查停止标志，关闭监听器时不必依赖“连自己一次”去唤醒
+/// （本机防火墙拦截回环连接时那样会唤醒失败，端口一直不释放）。
+pub fn wait_readable(listener: &std::net::TcpListener, timeout_ms: i32) -> std::io::Result<bool> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{WSAPoll, POLLRDNORM, WSAPOLLFD};
+        let mut fd = WSAPOLLFD {
+            fd: listener.as_raw_socket() as usize,
+            events: POLLRDNORM,
+            revents: 0,
+        };
+        let n = unsafe { WSAPoll(&mut fd, 1, timeout_ms) };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(n > 0)
     }
-    let (ok, out) = run_cmd("systemctl", &args)?;
-    let mode = out.trim().to_string();
-    (ok && !mode.is_empty()).then_some(mode)
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let mut fd = libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let n = unsafe { libc::poll(&mut fd, 1, timeout_ms) };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            // 被信号打断不算错误
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                return Ok(false);
+            }
+            return Err(e);
+        }
+        Ok(n > 0)
+    }
 }
