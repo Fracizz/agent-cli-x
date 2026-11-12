@@ -5,15 +5,14 @@ description: Run commands, search, read/edit and transfer files on another regis
 
 # agent-cli-x
 
-Run commands and edit files on a **peer** over pinned TLS. `agent-cli-x` must be on `PATH`.
+Remote commands/files over pinned TLS. Put `agent-cli-x` on `PATH`.
 
 ```bash
-agent-cli-x peer list          # peers: node name/id, OS/arch, default shell (cached, no network)
-agent-cli-x info <peer>        # live: workspaces, path permissions, deny rules, jobs; `info @all` = who is online
-agent-cli-x doctor             # local service / firewall / peers health
+agent-cli-x peer list          # cached name/id, OS/arch, shell
+agent-cli-x info <peer>        # live permissions, workspaces, jobs; @all = online peers
 ```
 
-Paths are `workspace:relative/path` (`proj:src/main.rs`, root `proj:`); the prefix may be omitted for a single/default workspace. Absolute paths, `..`, deny-listed paths and missing CRUD rights (`info` shows `path=rcud`) are refused with exit 102. Do not work around them via `exec`.
+Paths: `workspace:relative/path` (`proj:src/main.rs`, root `proj:`); omit the prefix for a default workspace. Absolute paths, `..`, denied paths and missing CRUD rights (`info`: `path=rcud`) fail with 102. Never bypass with `exec`.
 
 ## Commands
 
@@ -31,26 +30,26 @@ agent-cli-x put B ./dist proj:web/dist --exclude node_modules ; agent-cli-x get 
 agent-cli-x cp A dl:pkg B home:               # peer → peer, streamed, nothing kept locally
 agent-cli-x rm B proj:build/tmp -r            # to recycle bin; rollback B <op_id> undoes write/edit/put/rm
 agent-cli-x upgrade B                         # on a `版本不一致` hint
-agent-cli-x restart B ; agent-cli-x set-port B 48000   # never hand-edit a peer's config/firewall for these
+agent-cli-x restart B ; agent-cli-x set-port B 48000   # use these, not manual config edits
 ```
 
 ## Keep output small
 
-- Output is already bounded: `exec`/`job logs` keep head + tail 100 lines (full log path printed to stderr, read it locally only if needed); `read` without an end line returns ≤2000 lines and prints the next `--lines` range; `ls` ≤500 entries; `grep` ≤200 matches.
+- Bounded output (also JSON): `exec`/`job logs` share head + tail 100 lines / 16KB each (multi-peer: 50 / 8KB each); any cut retains a full local log. `read` without an end: ≤2000 lines / 64KB, 2000 chars/line; follow `next_start`/the `--lines N:` hint, use the printed `get` command for clipped lines. `ls` ≤500 entries, `grep` ≤200 matches / 300 chars; pages ≤60KB of entries. Continue with `--offset` / `next_offset`; `--max` changes the count, `--full` removes byte/line clipping.
 - Locate with `grep` first, then `read --lines` around the hit. Avoid reading whole large files or `ls --depth` on big trees.
-- Use `--json` only when you need a field (e.g. `sha256`, `op_id`, job id), not by default. Use `--full` only when the trimmed middle really matters.
+- `--json` for fields (`sha256`, `op_id`, job id); `--full` for essential trimmed text. Full JSON caps at 1MB (multi-peer full: 8MB/peer); remainder stays in the log.
 
 ## Rules
 
 - Non-interactive (empty stdin, `CI=1`): pass `-y`/`--yes`/`--no-edit`, or it hangs until timeout.
-- Each `exec` is a fresh shell: use `--cwd`/`--env` or chain steps. Default shell: `pwsh` on Windows, `sh` on Linux (`--shell cmd|bash|...`).
-- Prefer `grep`/`rm`/file commands over doing the same through `exec`: they respect .gitignore, deny rules, permissions and can be undone.
+- Fresh shell per `exec`: use `--cwd`/`--env` or chain steps. Default: Windows `pwsh`, Linux `sh` (`--shell cmd|bash|...`).
+- Prefer file commands: they respect .gitignore, deny rules, permissions and support rollback.
 - `read` before `edit`; `--old` must match exactly once. For concurrent safety pass `--expect-sha` from `read --json`.
 - `rm --permanent` only when the user asks; to free space after `rm`, use `purge <peer> <op_id>`.
 - Timeout kills the process tree (exit 104); raise `--timeout` or use `--detach` for anything over a few minutes.
 - `exec` runs with the full rights of the `serve` user. Do not use it to change read-only/denied paths unless the user asked for exactly that, and say so.
 - No relaying: don't run `agent-cli-x` inside a peer's `exec` unless asked, never read a peer's `~/.agent-cli-x`. On `禁止借道` stop and tell the user.
-- Unreachable peer (100): run `doctor`. Setting up start at boot: follow README "Start at boot".
+- Unreachable peer (100): run `doctor`. Autostart and legacy trash recovery: see README.
 
 ## Exit codes
 

@@ -383,6 +383,24 @@ impl Workspaces {
             .map(|(n, r)| (n.clone(), r.clone()))
     }
 
+    /// 重新解析备份中的绝对路径，不能仅凭字符串前缀信任它仍位于工作区内。
+    /// 删除链接本身时保留末级链接，但始终重新校验其父目录的真实位置。
+    pub fn resolve_recorded(&self, abs: &Path, entry: bool) -> Result<Resolved> {
+        let (ws, root) = self
+            .owner_of(abs)
+            .ok_or_else(|| AppError::denied("the op's file is no longer in any workspace"))?;
+        let rel = abs
+            .strip_prefix(&root)
+            .map(norm)
+            .map_err(|_| AppError::denied("the op's file is no longer in any workspace"))?;
+        let spec = format!("{ws}:{rel}");
+        if entry {
+            self.resolve_entry(&spec)
+        } else {
+            self.resolve_unchecked(&spec)
+        }
+    }
+
     /// 不可读时返回原因规则（ls / grep / get 遍历时用来跳过）。
     pub fn denied_by(&self, ws: &str, root: &Path, abs: &Path) -> Option<String> {
         let v = self.verdict(ws, root, abs);

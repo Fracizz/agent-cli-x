@@ -311,34 +311,40 @@ pub fn run(dir: &Path) -> Result<i32> {
     let mut drain: Option<Instant> = None;
     let mut outcome = "exited";
     loop {
-        let text = match rx.recv_timeout(POLL) {
-            Ok((k, Some(b))) => dec[k as usize].push(&b),
-            Ok((k, None)) => {
-                open -= 1;
-                dec[k as usize].finish()
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                let mut t = dec[0].flush_partial();
-                t.push_str(&dec[1].flush_partial());
-                t
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                open = 0;
-                String::new()
+        let text = if open == 0 {
+            // 即使命令提前关闭输出，仍须响应 kill 标记与超时。
+            thread::sleep(POLL);
+            String::new()
+        } else {
+            match rx.recv_timeout(POLL) {
+                Ok((k, Some(b))) => dec[k as usize].push(&b),
+                Ok((k, None)) => {
+                    open -= 1;
+                    dec[k as usize].finish()
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let mut t = dec[0].flush_partial();
+                    t.push_str(&dec[1].flush_partial());
+                    t
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    open = 0;
+                    String::new()
+                }
             }
         };
         if !text.is_empty() {
             let _ = log.write_all(text.as_bytes());
             let _ = log.flush();
         }
-        if open == 0 {
-            break;
-        }
         if exited.is_none() {
             if let Ok(Some(s)) = child.try_wait() {
                 exited = Some(s);
                 drain = Some(Instant::now() + DRAIN_AFTER_EXIT);
             }
+        }
+        if exited.is_some() && open == 0 {
+            break;
         }
         if drain.is_some_and(|d| Instant::now() > d) {
             break;

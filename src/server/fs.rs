@@ -1,6 +1,7 @@
 //! 文件接口：ls / read / write / edit / rm。所有路径都经过 Workspaces 解析（边界 + CRUD 权限）。
 
 use super::{backup, Ctx};
+use crate::client::output::{clip_line, clip_line_bytes, MAX_LINE_CHARS};
 use crate::error::{AppError, Result};
 use crate::util;
 use serde::Deserialize;
@@ -13,6 +14,9 @@ fn parse<T: for<'de> Deserialize<'de>>(body: Value) -> Result<T> {
     serde_json::from_value(body).map_err(|e| AppError::bad_request(format!("bad params: {e}")))
 }
 
+// Leave room for response metadata inside a 64KB page.
+const PAGE_BYTES: usize = 60 * 1024;
+
 // ---------------- ls ----------------
 
 #[derive(Deserialize)]
@@ -23,6 +27,10 @@ struct LsReq {
     depth: usize,
     #[serde(default = "max_entries")]
     max: usize,
+    #[serde(default)]
+    offset: usize,
+    #[serde(default)]
+    full: bool,
 }
 fn one() -> usize {
     1
@@ -42,6 +50,10 @@ pub fn ls(ctx: &Ctx, body: Value) -> Result<Value> {
     }
     let depth = req.depth.clamp(1, 20);
     let max = req.max.clamp(1, 20_000);
+    let metadata_bytes = serde_json::to_vec(&json!({"ws": r.ws, "path": r.rel}))
+        .map_err(|e| AppError::internal(e.to_string()))?
+        .len();
+    let page_bytes = PAGE_BYTES.saturating_sub(metadata_bytes);
     let st = Arc::clone(&ctx.st);
     let ws_name = r.ws.clone();
     let root = r.root.clone();
@@ -53,19 +65,23 @@ pub fn ls(ctx: &Ctx, body: Value) -> Result<Value> {
         .git_global(false)
         .require_git(false)
         .parents(true)
+        .sort_by_file_name(|a, b| a.cmp(b))
         .filter_entry(move |e| {
             e.file_name() != ".git" && st.ws.denied_by(&ws_name, &root, e.path()).is_none()
         })
         .build();
     let mut entries = Vec::new();
     let mut truncated = false;
+    let mut bytes = 2;
+    let mut seen = 0usize;
+    let mut omitted_chars = 0usize;
     for item in walker.flatten() {
         if item.depth() == 0 {
             continue;
         }
-        if entries.len() >= max {
-            truncated = true;
-            break;
+        if seen < req.offset {
+            seen += 1;
+            continue;
         }
         let rel = item
             .path()
@@ -80,7 +96,32 @@ pub fn ls(ctx: &Ctx, body: Value) -> Result<Value> {
         } else {
             ("f", item.metadata().map(|m| m.len()).unwrap_or(0))
         };
-        entries.push(json!({"path": rel, "kind": kind, "size": size}));
+        let (path, cut) = if req.full {
+            (rel, 0)
+        } else {
+            clip_line(&rel, MAX_LINE_CHARS)
+        };
+        let mut entry = json!({"path": path, "kind": kind, "size": size});
+        if cut > 0 {
+            entry["omitted_chars"] = json!(cut);
+        }
+        let cost = serde_json::to_vec(&entry)
+            .map_err(|e| AppError::internal(e.to_string()))?
+            .len()
+            + 1;
+        let cost = cost.max(path_display_bytes(&entry["path"]) + 48);
+        if !req.full && entries.is_empty() && bytes + cost > page_bytes {
+            return Err(AppError::bad_request(
+                "entry exceeds page byte limit; add --full to retrieve its complete path",
+            ));
+        }
+        if entries.len() >= max || (!req.full && bytes + cost > page_bytes) {
+            truncated = true;
+            break;
+        }
+        bytes += cost;
+        omitted_chars += cut;
+        entries.push(entry);
     }
     entries.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
     ctx.st.audit.log(
@@ -90,7 +131,11 @@ pub fn ls(ctx: &Ctx, body: Value) -> Result<Value> {
         true,
         json!({"path": r.display(), "count": entries.len()}),
     );
-    Ok(json!({"ws": r.ws, "path": r.rel, "entries": entries, "truncated": truncated}))
+    let next = truncated.then(|| req.offset.saturating_add(entries.len()));
+    Ok(json!({"ws": r.ws, "path": r.rel, "entries": entries,
+        "truncated": truncated || omitted_chars > 0,
+        "omitted_entries_at_least": usize::from(truncated),
+        "omitted_chars": omitted_chars, "next_offset": next}))
 }
 
 // ---------------- grep ----------------
@@ -110,6 +155,10 @@ struct GrepReq {
     fixed: bool,
     #[serde(default = "grep_max")]
     max: usize,
+    #[serde(default)]
+    offset: usize,
+    #[serde(default)]
+    full: bool,
 }
 fn grep_max() -> usize {
     200
@@ -153,6 +202,7 @@ pub fn grep(ctx: &Ctx, body: Value) -> Result<Value> {
         .git_global(false)
         .require_git(false)
         .parents(true)
+        .sort_by_file_name(|a, b| a.cmp(b))
         .filter_entry(move |e| {
             e.file_name() != ".git" && st.ws.denied_by(&ws_name, &root, e.path()).is_none()
         });
@@ -171,6 +221,9 @@ pub fn grep(ctx: &Ctx, body: Value) -> Result<Value> {
     let mut matches = Vec::new();
     let mut files_scanned = 0usize;
     let mut truncated = false;
+    let mut seen = 0usize;
+    let mut bytes = 2;
+    let mut omitted_chars = 0usize;
     'walk: for item in builder.build().flatten() {
         if !item.file_type().is_some_and(|t| t.is_file()) {
             continue;
@@ -194,18 +247,43 @@ pub fn grep(ctx: &Ctx, body: Value) -> Result<Value> {
             if !re.is_match(line) {
                 continue;
             }
-            if matches.len() >= max {
-                truncated = true;
-                break 'walk;
+            if seen < req.offset {
+                seen += 1;
+                continue;
             }
             let text = String::from_utf8_lossy(line);
             let text = text.trim_end_matches('\r');
-            let text: String = if text.chars().count() > GREP_LINE_CHARS {
-                text.chars().take(GREP_LINE_CHARS).collect::<String>() + "…"
+            let (text, cut) = if req.full {
+                (text.to_string(), 0)
             } else {
-                text.to_string()
+                clip_line(text, GREP_LINE_CHARS)
             };
-            matches.push(json!({"path": rel, "line": i + 1, "text": text}));
+            let (path, path_cut) = if req.full {
+                (rel.clone(), 0)
+            } else {
+                clip_line(&rel, MAX_LINE_CHARS)
+            };
+            let mut entry = json!({"path": path, "line": i + 1, "text": text});
+            if cut + path_cut > 0 {
+                entry["omitted_chars"] = json!(cut + path_cut);
+            }
+            let cost = serde_json::to_vec(&entry)
+                .map_err(|e| AppError::internal(e.to_string()))?
+                .len()
+                + 1;
+            let cost = cost.max(
+                path_display_bytes(&entry["path"])
+                    + entry["text"].as_str().map_or(0, str::len)
+                    + r.ws.len()
+                    + 40,
+            );
+            if matches.len() >= max || (!req.full && bytes + cost > PAGE_BYTES) {
+                truncated = true;
+                break 'walk;
+            }
+            bytes += cost;
+            omitted_chars += cut + path_cut;
+            matches.push(entry);
         }
     }
     ctx.st.audit.log(
@@ -215,11 +293,15 @@ pub fn grep(ctx: &Ctx, body: Value) -> Result<Value> {
         true,
         json!({"path": r.display(), "pattern": req.pattern, "matches": matches.len()}),
     );
+    let next = truncated.then(|| req.offset.saturating_add(matches.len()));
     Ok(json!({
         "ws": r.ws,
         "matches": matches,
         "files_scanned": files_scanned,
-        "truncated": truncated,
+        "truncated": truncated || omitted_chars > 0,
+        "omitted_matches_at_least": usize::from(truncated),
+        "omitted_chars": omitted_chars,
+        "next_offset": next,
     }))
 }
 
@@ -235,10 +317,81 @@ struct ReadReq {
     /// 本次最多返回的 KB 数（不超过 max_read_kb）；旧版客户端不传
     #[serde(default)]
     max_kb: Option<u64>,
+    #[serde(default)]
+    windowed: bool,
 }
 
 /// 统计总行数 / 计算 sha256 时最多扫描的文件大小。
 const FULL_SCAN_LIMIT: u64 = 64 * 1024 * 1024;
+
+fn path_display_bytes(path: &Value) -> usize {
+    path.as_str()
+        .unwrap_or_default()
+        .escape_debug()
+        .map(char::len_utf8)
+        .sum()
+}
+
+/// Map a lossy UTF-8 prefix back to its original byte length for omission accounting.
+fn source_prefix_bytes(mut raw: &[u8], mut chars: usize) -> usize {
+    let mut consumed = 0;
+    while chars > 0 && !raw.is_empty() {
+        let (valid, invalid) = match std::str::from_utf8(raw) {
+            Ok(text) => (text, 0),
+            Err(e) => (
+                std::str::from_utf8(&raw[..e.valid_up_to()]).expect("valid prefix"),
+                e.error_len().unwrap_or(raw.len() - e.valid_up_to()),
+            ),
+        };
+        let count = valid.chars().count();
+        if chars <= count {
+            return consumed
+                + valid
+                    .char_indices()
+                    .nth(chars)
+                    .map_or(valid.len(), |(i, _)| i);
+        }
+        consumed += valid.len();
+        chars -= count;
+        if invalid == 0 {
+            break;
+        }
+        consumed += invalid;
+        chars -= 1;
+        raw = &raw[valid.len() + invalid..];
+    }
+    consumed
+}
+
+/// Consume one complete line while keeping only a bounded prefix in memory.
+fn read_line_prefix<R: BufRead>(
+    reader: &mut R,
+    prefix: &mut Vec<u8>,
+    limit: usize,
+    hasher: &mut ring::digest::Context,
+    hash: bool,
+) -> std::io::Result<(usize, bool)> {
+    prefix.clear();
+    let mut total = 0usize;
+    loop {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            return Ok((total, false));
+        }
+        let newline = chunk.iter().position(|&b| b == b'\n');
+        let n = newline.map_or(chunk.len(), |i| i + 1);
+        if hash {
+            hasher.update(&chunk[..n]);
+        }
+        let keep = n.min(limit.saturating_sub(prefix.len()));
+        prefix.extend_from_slice(&chunk[..keep]);
+        total = total.saturating_add(n);
+        reader.consume(n);
+        if newline.is_some() {
+            return Ok((total, true));
+        }
+    }
+}
 
 pub fn read(ctx: &Ctx, body: Value) -> Result<Value> {
     let req: ReadReq = parse(body)?;
@@ -249,14 +402,17 @@ pub fn read(ctx: &Ctx, body: Value) -> Result<Value> {
             r.display()
         )));
     }
-    let max_kb = match req.max_kb {
-        Some(k) => k.clamp(1, ctx.st.cfg.policy.max_read_kb),
-        None => ctx.st.cfg.policy.max_read_kb,
+    let windowed = req.windowed || req.end.is_none();
+    let policy_kb = ctx.st.cfg.policy.max_read_kb.max(1);
+    let default_kb = if windowed {
+        policy_kb.min(64)
+    } else {
+        policy_kb
     };
-    let max_bytes = (max_kb * 1024) as usize;
+    let max_kb = req.max_kb.unwrap_or(default_kb).clamp(1, default_kb);
+    let max_bytes = max_kb.saturating_mul(1024).min(usize::MAX as u64) as usize;
     let size = fs::metadata(&r.abs)?.len();
     let mut file = fs::File::open(&r.abs)?;
-
     let mut head = vec![0u8; 8192.min(size as usize)];
     file.read_exact(&mut head)?;
     if head.contains(&0) {
@@ -266,43 +422,90 @@ pub fn read(ctx: &Ctx, body: Value) -> Result<Value> {
         )));
     }
     drop(file);
-
     let start = req.start.unwrap_or(1).max(1);
-    let end = req.end.unwrap_or(usize::MAX).max(start);
+    let end = req
+        .end
+        .unwrap_or_else(|| start.saturating_add(1999))
+        .max(start);
     let full_scan = size <= FULL_SCAN_LIMIT;
     let mut reader = BufReader::new(fs::File::open(&r.abs)?);
     let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
-    let mut content: Vec<u8> = Vec::new();
+    let mut content = String::new();
     let mut line_no = 0usize;
-    let mut last_line = 0usize;
-    let mut truncated = false;
+    let mut last_line = start - 1;
+    let mut page_full = false;
+    let mut clipped_lines = 0usize;
+    let mut omitted_bytes = 0usize;
     let mut buf = Vec::new();
     loop {
-        buf.clear();
-        let n = reader.read_until(b'\n', &mut buf)?;
+        let selected = line_no + 1 >= start && line_no < end && !page_full;
+        let limit = if !selected {
+            0
+        } else if windowed {
+            (MAX_LINE_CHARS * 4 + 4).min(max_bytes.saturating_add(1))
+        } else {
+            max_bytes.saturating_add(1)
+        };
+        let (n, newline) = read_line_prefix(&mut reader, &mut buf, limit, &mut hasher, full_scan)?;
         if n == 0 {
             break;
         }
         line_no += 1;
-        if full_scan {
-            hasher.update(&buf);
-        }
-        if line_no >= start && line_no <= end && !truncated {
-            if content.len() + buf.len() > max_bytes {
-                truncated = true;
+        if selected {
+            if !windowed && n > max_bytes {
+                return Err(AppError::bad_request(format!(
+                    "line {line_no} exceeds max_read_kb ({max_kb} KB); download full text with `agent-cli-x get <peer> {} <local>`", r.display()
+                )));
+            }
+            if buf.ends_with(b"\n") {
+                buf.pop();
+            }
+            let mut text = String::from_utf8_lossy(&buf).into_owned();
+            let bom = start == 1 && line_no == 1 && text.starts_with('\u{feff}');
+            if bom {
+                text.remove(0);
+            }
+            let (mut shown, cut) = if windowed {
+                clip_line_bytes(
+                    &text,
+                    MAX_LINE_CHARS,
+                    max_bytes.saturating_sub(usize::from(newline)),
+                )
             } else {
-                content.extend_from_slice(&buf);
+                (text.clone(), 0)
+            };
+            let kept_chars = text.chars().count().saturating_sub(cut);
+            let kept_bytes = source_prefix_bytes(&buf[if bom { 3 } else { 0 }..], kept_chars);
+            let omitted = n
+                .saturating_sub(usize::from(newline) + if bom { 3 } else { 0 })
+                .saturating_sub(kept_bytes);
+            if newline {
+                shown.push('\n');
+            }
+            if !windowed && shown.len() > max_bytes {
+                return Err(AppError::bad_request(format!(
+                    "decoded line {line_no} exceeds max_read_kb ({max_kb} KB); download full text with `agent-cli-x get <peer> {} <local>`", r.display()
+                )));
+            }
+            if content.len().saturating_add(shown.len()) > max_bytes {
+                page_full = true;
+            } else {
+                content.push_str(&shown);
                 last_line = line_no;
+                omitted_bytes = omitted_bytes.saturating_add(omitted);
+                clipped_lines += usize::from(omitted > 0);
             }
         }
-        if !full_scan && (truncated || line_no >= end) {
+        if !full_scan && (page_full || line_no >= end) {
             break;
         }
     }
-    let mut text = String::from_utf8_lossy(&content).into_owned();
-    if start == 1 && text.starts_with('\u{feff}') {
-        text.remove(0);
-    }
+    let has_more = if full_scan {
+        last_line < line_no
+    } else {
+        page_full || !reader.fill_buf()?.is_empty()
+    };
+    let next_start = has_more.then(|| last_line.saturating_add(1));
     let sha = full_scan.then(|| util::hex(hasher.finish().as_ref()));
     ctx.st.audit.log(
         &ctx.ip,
@@ -312,14 +515,13 @@ pub fn read(ctx: &Ctx, body: Value) -> Result<Value> {
         json!({"path": r.display(), "bytes": content.len()}),
     );
     Ok(json!({
-        "path": r.display(),
-        "content": text,
-        "start": start,
-        "end": last_line,
+        "path": r.display(), "content": content, "start": start, "end": last_line,
         "total_lines": if full_scan { Some(line_no) } else { None },
-        "truncated": truncated,
-        "sha256": sha,
-        "size": size,
+        "truncated": has_more || clipped_lines > 0,
+        "omitted_lines": if full_scan { Some(line_no.saturating_sub(last_line)) } else { None },
+        "omitted_bytes": omitted_bytes, "clipped_lines": clipped_lines,
+        "full_text": (clipped_lines > 0).then(|| format!("agent-cli-x get <peer> {} <local>", r.display())),
+        "next_start": next_start, "sha256": sha, "size": size,
     }))
 }
 
@@ -604,22 +806,25 @@ pub fn rm(ctx: &Ctx, body: Value) -> Result<Value> {
 
     let mut op_id: Option<String> = None;
     let mut trash_error: Option<String> = None;
+    let mut trash_warning: Option<&str> = None;
     let method = if req.permanent {
         delete_items(&items)?;
         "permanent"
     } else {
         let trashed = if ctx.st.cfg.policy.rm_use_trash {
-            let since = super::recycle::now_secs();
+            let mut op = backup::Op::new(&ctx.st.home)?;
             match super::recycle::move_to_trash(&r.abs) {
-                Ok(()) => {
-                    let until = super::recycle::now_secs();
-                    let mut op = backup::Op::new(&ctx.st.home)?;
-                    op.add_trashed(&r.abs, &r.display(), since, until)?;
+                Ok(receipt) => {
+                    if !receipt.identified() {
+                        trash_warning = Some("recycle-bin entry could not be identified; restore or delete it manually in the system recycle bin");
+                    }
+                    op.add_trashed(&r.abs, &r.display(), &receipt)?;
                     op_id = Some(op.id.clone());
                     op.finish();
                     true
                 }
                 Err(e) => {
+                    op.finish();
                     trash_error = Some(e);
                     false
                 }
@@ -669,6 +874,7 @@ pub fn rm(ctx: &Ctx, body: Value) -> Result<Value> {
         "method": method,
         "op_id": op_id,
         "trash_error": trash_error,
+        "trash_warning": trash_warning,
         "files": files,
         "dirs": dirs,
         "links": links,
@@ -705,6 +911,55 @@ fn remove_link(abs: &std::path::Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lossy_prefix_accounting_uses_source_bytes() {
+        assert_eq!(source_prefix_bytes(b"a\xff\xffb", 3), 3);
+        assert_eq!(source_prefix_bytes("汉字".as_bytes(), 1), 3);
+        assert_eq!(source_prefix_bytes(b"\xf0\x9f", 1), 2);
+        assert_eq!(source_prefix_bytes(b"abc", 0), 0);
+    }
+
+    #[test]
+    fn bounded_line_prefix_consumes_and_hashes_complete_lines() {
+        let data = "汉".repeat(3000) + "\nnext\n";
+        let mut reader = BufReader::with_capacity(7, data.as_bytes());
+        let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
+        let mut prefix = Vec::new();
+        let (bytes, nl) = read_line_prefix(&mut reader, &mut prefix, 64, &mut hash, true).unwrap();
+        assert_eq!((bytes, nl), (9001, true));
+        assert_eq!(prefix.len(), 64);
+        assert_eq!(
+            read_line_prefix(&mut reader, &mut prefix, 64, &mut hash, true).unwrap(),
+            (5, true)
+        );
+        assert_eq!(prefix, b"next\n");
+        assert_eq!(
+            util::hex(hash.finish().as_ref()),
+            util::sha256_hex(data.as_bytes())
+        );
+    }
+
+    #[test]
+    fn bounded_line_prefix_handles_empty_and_unterminated_lines() {
+        let mut reader = BufReader::new(&b"\nlast"[..]);
+        let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
+        let mut prefix = Vec::new();
+        assert_eq!(
+            read_line_prefix(&mut reader, &mut prefix, 0, &mut hash, false).unwrap(),
+            (1, true)
+        );
+        assert!(prefix.is_empty());
+        assert_eq!(
+            read_line_prefix(&mut reader, &mut prefix, 2, &mut hash, false).unwrap(),
+            (4, false)
+        );
+        assert_eq!(prefix, b"la");
+        assert_eq!(
+            read_line_prefix(&mut reader, &mut prefix, 2, &mut hash, false).unwrap(),
+            (0, false)
+        );
+    }
 
     #[test]
     fn edit_unique_match() {

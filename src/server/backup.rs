@@ -100,14 +100,26 @@ impl Op {
         self.save()
     }
 
-    /// 已移入系统回收站后调用：记录原路径与移入前后的时间，回滚 / purge 时据此在回收站里找到本次的条目。
-    pub fn add_trashed(&mut self, abs: &Path, display: &str, since: i64, until: i64) -> Result<()> {
+    /// 已移入系统回收站后调用：保存本次的确切条目标识，禁止按删除时间猜测。
+    pub fn add_trashed(
+        &mut self,
+        abs: &Path,
+        display: &str,
+        receipt: &super::recycle::Receipt,
+    ) -> Result<()> {
         let idx = self.entries.len();
-        self.entries.push(json!({
+        let mut entry = json!({
             "path": abs.to_string_lossy(), "display": display, "existed": true, "idx": idx,
-            "trash": true, "since": since, "until": until
-        }));
-        self.save()
+            "trash": true, "trash_ref": receipt
+        });
+        if !receipt.identified() {
+            entry["trash_warning"] = json!("recycle-bin identity unavailable; restore or delete this item manually in the system recycle bin");
+        }
+        self.entries.push(entry);
+        self.save().map_err(|e| AppError::io(format!(
+            "{display} was already moved to the recycle bin, but saving operation {} failed: {}; restore it manually in the system recycle bin",
+            self.id, e.message
+        )))
     }
 
     /// 删除符号链接前调用：记录链接目标，回滚时尽力重建（Windows 上可能需要权限）。
@@ -124,9 +136,9 @@ impl Op {
 
     fn save(&self) -> Result<()> {
         let meta = json!({"op_id": self.id, "ts": util::now_iso(), "entries": self.entries});
-        fs::write(
-            self.dir.join("meta.json"),
-            serde_json::to_vec_pretty(&meta).unwrap_or_default(),
+        util::atomic_write(
+            &self.dir.join("meta.json"),
+            &serde_json::to_vec_pretty(&meta).unwrap_or_default(),
         )?;
         Ok(())
     }
@@ -171,6 +183,30 @@ fn load_op(home: &Path, op_id: &str) -> Result<(PathBuf, Vec<(Value, PathBuf)>)>
     Ok((dir, entries))
 }
 
+/// 按回滚时的实际动作重新解析真实路径并校验 CRUD。
+fn rollback_target(ws: &super::workspace::Workspaces, e: &Value) -> Result<PathBuf> {
+    let recorded = PathBuf::from(e["path"].as_str().unwrap_or_default());
+    let existed = e["existed"].as_bool().unwrap_or(false);
+    let entry = e["link"].is_string() || (!existed && e["dir"] != true) || e["trash"] == true;
+    let r = ws.resolve_recorded(&recorded, entry)?;
+    let present = r.abs.exists() || r.abs.is_symlink();
+    let access = match (existed, present) {
+        (false, _) => Access::Delete,
+        (true, true) if e["dir"] == true => Access::Read,
+        (true, true) => Access::Update,
+        (true, false) => Access::Create,
+    };
+    if e["trash"] == true && present {
+        return Err(AppError::conflict(format!(
+            "{} already exists; cannot restore from recycle bin; move it away first",
+            r.display()
+        )));
+    }
+    ws.check(&r, access)
+        .map_err(|err| AppError::denied(format!("{}; cannot roll back", err.message)))?;
+    Ok(r.abs)
+}
+
 pub fn rollback(ctx: &Ctx, body: Value) -> Result<Value> {
     let req: RollbackReq =
         serde_json::from_value(body).map_err(|e| AppError::bad_request(e.to_string()))?;
@@ -178,39 +214,16 @@ pub fn rollback(ctx: &Ctx, body: Value) -> Result<Value> {
     // 先整体校验，再动手，避免回滚到一半被拒。每条记录按回滚时的实际动作检查 CRUD 权限。
     let mut plan = Vec::new();
     for (e, backup_file) in entries.iter().rev() {
-        let abs = PathBuf::from(e["path"].as_str().unwrap_or_default());
-        let (ws, root) = ctx
-            .st
-            .ws
-            .owner_of(&abs)
-            .ok_or_else(|| AppError::denied("the op's file is no longer in any workspace"))?;
-        let existed = e["existed"].as_bool().unwrap_or(false);
-        let access = match (existed, abs.exists() || abs.is_symlink()) {
-            // 原本不存在：回滚 = 删除
-            (false, _) => Access::Delete,
-            // 原本存在、现在还在：恢复内容 = 修改（目录无需动作，只要可读）
-            (true, true) if e["dir"] == true => Access::Read,
-            (true, true) => Access::Update,
-            // 原本存在、现在没了（被 rm 删除）：重建 = 新建
-            (true, false) => Access::Create,
-        };
-        let display = e["display"].as_str().unwrap_or_default();
-        if e["trash"] == true && (abs.exists() || abs.is_symlink()) {
-            return Err(AppError::conflict(format!(
-                "{display} already exists; cannot restore from recycle bin; move it away first"
-            )));
-        }
-        ctx.st
-            .ws
-            .check_abs(&ws, &root, &abs, display, access)
-            .map_err(|err| AppError::denied(format!("{}; cannot roll back", err.message)))?;
+        let abs = rollback_target(&ctx.st.ws, e)?;
         plan.push((e, abs, backup_file));
     }
     let mut files = Vec::new();
-    for (e, abs, backup_file) in plan {
+    for (e, _, backup_file) in plan {
+        // 前面某个条目或其他调用可能已改变父目录，再解析一次后才执行。
+        let abs = rollback_target(&ctx.st.ws, e)?;
         let existed = e["existed"].as_bool().unwrap_or(false);
         let action = if e["trash"] == true {
-            super::recycle::restore(&abs, e["since"].as_i64().unwrap_or(0), e["until"].as_i64())?;
+            super::recycle::restore(&abs, &e["trash_ref"])?;
             "untrashed"
         } else if e["dir"] == true && !existed {
             // 只删空目录：回滚后目录里若还有别的文件（非本次操作写入），保留
@@ -245,7 +258,9 @@ pub fn rollback(ctx: &Ctx, body: Value) -> Result<Value> {
             util::atomic_write(&abs, &data)?;
             "restored"
         } else {
-            if abs.is_file() {
+            if abs.is_symlink() {
+                remove_link(&abs)?;
+            } else if abs.is_file() {
                 fs::remove_file(&abs)?;
             }
             "deleted"
@@ -274,15 +289,10 @@ pub fn purge(ctx: &Ctx, body: Value) -> Result<Value> {
             continue;
         }
         let abs = PathBuf::from(e["path"].as_str().unwrap_or_default());
-        let display = e["display"].as_str().unwrap_or_default();
-        let (ws, root) = ctx
-            .st
-            .ws
-            .owner_of(&abs)
-            .ok_or_else(|| AppError::denied("the op's file is no longer in any workspace"))?;
+        let r = ctx.st.ws.resolve_recorded(&abs, true)?;
         ctx.st
             .ws
-            .check_abs(&ws, &root, &abs, display, Access::Delete)
+            .check(&r, Access::Delete)
             .map_err(|err| AppError::denied(format!("{}; cannot purge", err.message)))?;
     }
     let mut files = Vec::new();
@@ -291,8 +301,9 @@ pub fn purge(ctx: &Ctx, body: Value) -> Result<Value> {
         let display = e["display"].clone();
         if e["trash"] == true {
             let abs = PathBuf::from(e["path"].as_str().unwrap_or_default());
-            let gone =
-                super::recycle::purge(&abs, e["since"].as_i64().unwrap_or(0), e["until"].as_i64())?;
+            let r = ctx.st.ws.resolve_recorded(&abs, true)?;
+            ctx.st.ws.check(&r, Access::Delete)?;
+            let gone = super::recycle::purge(&r.abs, &e["trash_ref"])?;
             files.push(json!({
                 "path": display,
                 "action": if gone { "purged" } else { "not_in_trash" },
@@ -324,5 +335,113 @@ fn make_symlink(target: &Path, link: &Path, dir: bool) -> std::io::Result<()> {
         std::os::windows::fs::symlink_dir(target, link)
     } else {
         std::os::windows::fs::symlink_file(target, link)
+    }
+}
+
+fn remove_link(abs: &Path) -> std::io::Result<()> {
+    match fs::remove_file(abs) {
+        Ok(()) => Ok(()),
+        Err(e) if cfg!(windows) => fs::remove_dir(abs).map_err(|_| e),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::super::workspace::Workspaces;
+    use super::*;
+    use crate::config::{Config, Policy};
+    use std::collections::BTreeMap;
+
+    struct Fixture {
+        base: PathBuf,
+        root: PathBuf,
+        ws: Workspaces,
+    }
+
+    impl Fixture {
+        fn new(deny: &[&str]) -> Self {
+            let base =
+                std::env::temp_dir().join(format!("agent-cli-x-rollback-{}", util::random_hex(6)));
+            let root = base.join("proj");
+            fs::create_dir_all(root.join("safe")).unwrap();
+            fs::create_dir_all(root.join("secrets")).unwrap();
+            fs::create_dir_all(base.join("outside")).unwrap();
+            fs::create_dir_all(base.join("home")).unwrap();
+            let cfg = Config {
+                listen: String::new(),
+                token: "x".repeat(20),
+                node_name: None,
+                node_id: None,
+                ai_cmd: String::new(),
+                default_workspace: None,
+                workspaces: BTreeMap::from([(
+                    "proj".to_string(),
+                    root.to_string_lossy().to_string(),
+                )]),
+                policy: Policy {
+                    deny_paths: deny.iter().map(|x| x.to_string()).collect(),
+                    ..Policy::default()
+                },
+            };
+            let ws = Workspaces::new(&cfg, &base.join("home")).unwrap();
+            Self { base, root, ws }
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.base);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_rechecks_existing_and_missing_ancestor_targets() {
+        let f = Fixture::new(&[]);
+        fs::write(f.base.join("outside/existing.txt"), "untouched").unwrap();
+        fs::rename(f.root.join("safe"), f.root.join("safe-before")).unwrap();
+        std::os::unix::fs::symlink(f.base.join("outside"), f.root.join("safe")).unwrap();
+        for (name, existed) in [("existing.txt", true), ("missing.txt", false)] {
+            let e = json!({"path": f.root.join("safe").join(name), "existed": existed});
+            assert_eq!(
+                rollback_target(&f.ws, &e).err().unwrap().code,
+                "policy_denied"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(f.base.join("outside/existing.txt")).unwrap(),
+            "untouched"
+        );
+        assert!(!f.base.join("outside/missing.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_rechecks_deny_rules_after_internal_redirect() {
+        let f = Fixture::new(&["secrets"]);
+        fs::rename(f.root.join("safe"), f.root.join("safe-before")).unwrap();
+        std::os::unix::fs::symlink(f.root.join("secrets"), f.root.join("safe")).unwrap();
+        let e = json!({"path": f.root.join("safe/new.txt"), "existed": false});
+        assert_eq!(
+            rollback_target(&f.ws, &e).err().unwrap().code,
+            "policy_denied"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleting_created_leaf_link_checks_the_link_not_its_target() {
+        let f = Fixture::new(&[]);
+        let outside = f.base.join("outside/existing.txt");
+        fs::write(&outside, "untouched").unwrap();
+        let link = f.root.join("safe/link.txt");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let e = json!({"path": link, "existed": false});
+        let target = rollback_target(&f.ws, &e).unwrap();
+        assert_eq!(target, link);
+        remove_link(&target).unwrap();
+        assert!(!link.is_symlink());
+        assert_eq!(fs::read_to_string(outside).unwrap(), "untouched");
     }
 }

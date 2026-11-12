@@ -1275,6 +1275,21 @@ fn output_limits_save_context() {
         1000
     );
 
+    // A cut within one line is truncation too; its complete log must survive.
+    let long_line = if cfg!(windows) {
+        "'x' * 5000"
+    } else {
+        "printf '%05000d\\n' 0"
+    };
+    let o = run(c, &["exec", "b", "--json", long_line]);
+    assert!(o.status.success(), "{}", text(&o));
+    let v = json_of(&o);
+    assert_eq!(v["truncated"], true);
+    assert!(v["omitted_bytes"].as_u64().unwrap() >= 3000);
+    let log = fs::read_to_string(v["log"].as_str().unwrap()).unwrap();
+    assert!(log.len() >= 5000);
+    assert!(v["stdout"].as_str().unwrap().contains("line truncated"));
+
     // read：不给结束行时只读一个窗口，并提示下一段的范围
     let big: String = (1..=2500).map(|i| format!("row{i}\n")).collect();
     fs::write(env.ws.join("big.txt"), big).unwrap();
@@ -1282,7 +1297,7 @@ fn output_limits_save_context() {
     assert!(o.status.success(), "{}", text(&o));
     let out = String::from_utf8_lossy(&o.stdout).to_string();
     assert_eq!(out.lines().count(), 2000);
-    assert!(text(&o).contains("--lines 2001:4000"), "{}", text(&o));
+    assert!(text(&o).contains("--lines 2001:"), "{}", text(&o));
     let o = run(c, &["read", "b", "proj:big.txt", "--lines", "2001:"]);
     let out = String::from_utf8_lossy(&o.stdout).to_string();
     assert_eq!(out.lines().count(), 500);
@@ -1298,6 +1313,40 @@ fn output_limits_save_context() {
     assert_eq!(v["truncated"], true, "{v}");
     assert!(v["content"].as_str().unwrap().len() <= 64 * 1024);
 
+    // A 600KB first line is bounded, hashed correctly and cannot block subsequent lines.
+    let enormous = "x".repeat(600 * 1024) + "\nsecond\n";
+    fs::write(env.ws.join("enormous.txt"), &enormous).unwrap();
+    let o = run(c, &["read", "b", "proj:enormous.txt", "--json"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let v = json_of(&o);
+    assert_eq!(v["end"], 2);
+    assert_eq!(v["clipped_lines"], 1);
+    assert!(v["omitted_bytes"].as_u64().unwrap() > 600_000);
+    assert!(v["content"].as_str().unwrap().ends_with("\nsecond\n"));
+    assert!(v["content"].as_str().unwrap().len() < 2100);
+    assert!(v["full_text"].as_str().unwrap().contains(" get "));
+    let o = run(c, &["read", "b", "proj:enormous.txt", "--lines", "1:1"]);
+    assert_eq!(o.status.code(), Some(110), "{}", text(&o));
+    assert!(text(&o).contains("agent-cli-x get"));
+    let o = run(c, &["read", "b", "proj:enormous.txt", "--lines", "2:2"]);
+    assert_eq!(String::from_utf8_lossy(&o.stdout), "second\n");
+
+    let unicode = "汉".repeat(3000) + "\n";
+    fs::write(env.ws.join("unicode.txt"), unicode).unwrap();
+    let v = json_of(&run(c, &["read", "b", "proj:unicode.txt", "--json"]));
+    let content = v["content"].as_str().unwrap();
+    assert!(content.contains("line truncated"));
+    assert!(!content.contains('\u{fffd}'));
+    assert_eq!(v["omitted_bytes"], 3000);
+    let o = run(c, &["read", "b", "proj:unicode.txt", "--lines", "1:1"]);
+    assert_eq!(String::from_utf8_lossy(&o.stdout).chars().count(), 3001);
+
+    // Lossy UTF-8 decoding must not turn an explicit range into a zero-progress page.
+    fs::write(env.ws.join("lossy.txt"), vec![0xff; 200 * 1024]).unwrap();
+    let o = run(c, &["read", "b", "proj:lossy.txt", "--lines", "1:1"]);
+    assert_eq!(o.status.code(), Some(110), "{}", text(&o));
+    assert!(text(&o).contains("agent-cli-x get"));
+
     // ls：--max 限制条目数
     fs::create_dir_all(env.ws.join("many")).unwrap();
     for i in 0..30 {
@@ -1307,6 +1356,84 @@ fn output_limits_save_context() {
     assert!(o.status.success(), "{}", text(&o));
     assert_eq!(String::from_utf8_lossy(&o.stdout).lines().count(), 10);
     assert!(text(&o).contains("--max 10"), "{}", text(&o));
+    // The byte limit also applies to JSON; stable offsets retrieve every entry once.
+    fs::create_dir_all(env.ws.join("long-names")).unwrap();
+    for i in 0..500 {
+        fs::write(
+            env.ws
+                .join("long-names")
+                .join(format!("{i:04}{}", "x".repeat(160))),
+            "",
+        )
+        .unwrap();
+    }
+    let mut offset = 0;
+    let mut paths = std::collections::BTreeSet::new();
+    loop {
+        let o = run(
+            c,
+            &[
+                "ls",
+                "b",
+                "proj:long-names",
+                "--offset",
+                &offset.to_string(),
+                "--json",
+            ],
+        );
+        assert!(o.status.success(), "{}", text(&o));
+        assert!(o.stdout.len() <= 64 * 1024);
+        let v = json_of(&o);
+        for e in v["entries"].as_array().unwrap() {
+            assert!(paths.insert(e["path"].as_str().unwrap().to_string()));
+        }
+        match v["next_offset"].as_u64() {
+            Some(next) => {
+                assert!(next > offset);
+                offset = next;
+            }
+            None => break,
+        }
+    }
+    assert_eq!(paths.len(), 500);
+    let o = run(c, &["ls", "b", "proj:long-names", "--full", "--json"]);
+    assert!(o.stdout.len() > 64 * 1024);
+    assert_eq!(json_of(&o)["entries"].as_array().unwrap().len(), 500);
+
+    // Match rows use the same byte/page limits and report character cuts.
+    fs::write(
+        env.ws.join("matches.txt"),
+        ("MATCH ".to_string() + &"x".repeat(400) + "\n").repeat(230),
+    )
+    .unwrap();
+    let o = run(c, &["grep", "b", "MATCH", "proj:matches.txt", "--json"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(o.stdout.len() <= 64 * 1024);
+    let v = json_of(&o);
+    assert!(v["next_offset"].as_u64().unwrap() > 0);
+    assert!(v["omitted_chars"].as_u64().unwrap() > 0);
+    let next = v["next_offset"].as_u64().unwrap().to_string();
+    let o = run(
+        c,
+        &[
+            "grep",
+            "b",
+            "MATCH",
+            "proj:matches.txt",
+            "--offset",
+            &next,
+            "--json",
+        ],
+    );
+    assert_eq!(
+        json_of(&o)["matches"][0]["line"].as_u64().unwrap(),
+        next.parse::<u64>().unwrap() + 1
+    );
+    let v = json_of(&run(
+        c,
+        &["grep", "b", "MATCH", "proj:matches.txt", "--full", "--json"],
+    ));
+    assert_eq!(v["matches"][0]["text"].as_str().unwrap().len(), 406);
 }
 
 /// 测试结束（含断言失败）时结束 restart 拉起的脱离进程。
@@ -1434,4 +1561,116 @@ fn restart_set_port_config_fallback() {
     assert!(text(&o).contains("TCP connected"), "{}", text(&o));
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[test]
+fn multi_output_preserves_the_real_tail() {
+    let env = setup();
+    let c = &env.client_home;
+    let token = cfg_token(&env.server_home.join("config.toml"));
+    let o = run(
+        c,
+        &[
+            "peer",
+            "add",
+            "c",
+            &env.listen,
+            "--token",
+            &token,
+            "--fingerprint",
+            &env.fp,
+        ],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    let large = ("x".repeat(1000) + "\n").repeat(10_000) + "FINAL_ERROR_MARKER\n";
+    fs::write(env.ws.join("large.log"), &large).unwrap();
+    let cmd = if cfg!(windows) {
+        "Get-Content -LiteralPath large.log"
+    } else {
+        "cat large.log"
+    };
+    for json in [false, true] {
+        let mut args = vec!["exec", "b,c"];
+        if json {
+            args.push("--json");
+        }
+        args.push(cmd);
+        let o = run(c, &args);
+        assert!(o.status.success(), "{}", text(&o));
+        assert!(o.stdout.len() < 40 * 1024);
+        if json {
+            for result in json_of(&o)["results"].as_array().unwrap() {
+                assert!(result["stdout"]
+                    .as_str()
+                    .unwrap()
+                    .trim_end()
+                    .ends_with("FINAL_ERROR_MARKER"));
+                assert_eq!(result["truncated"], true);
+                let log = fs::read_to_string(result["log"].as_str().unwrap()).unwrap();
+                assert!(log.trim_end().ends_with("FINAL_ERROR_MARKER"));
+                assert!(log.len() > 8 * 1024 * 1024);
+            }
+        } else {
+            assert_eq!(
+                String::from_utf8_lossy(&o.stdout)
+                    .matches("FINAL_ERROR_MARKER")
+                    .count(),
+                2
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn rollback_rechecks_replaced_parent_paths() {
+    let env = setup();
+    let c = &env.client_home;
+    fs::create_dir_all(env.ws.join("safe")).unwrap();
+    fs::write(env.ws.join("safe/a.txt"), "workspace original").unwrap();
+    let outside = env.ws.parent().unwrap().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("a.txt"), "outside original").unwrap();
+    let v = json_of(&run(
+        c,
+        &[
+            "write",
+            "b",
+            "proj:safe/a.txt",
+            "--content",
+            "changed",
+            "--json",
+        ],
+    ));
+    fs::rename(env.ws.join("safe"), env.ws.join("safe-saved")).unwrap();
+    std::os::unix::fs::symlink(&outside, env.ws.join("safe")).unwrap();
+    let o = run(c, &["rollback", "b", v["op_id"].as_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(102), "{}", text(&o));
+    assert_eq!(
+        fs::read_to_string(outside.join("a.txt")).unwrap(),
+        "outside original"
+    );
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+#[test]
+fn trash_operations_keep_distinct_identities() {
+    let env = setup();
+    let c = &env.client_home;
+    fs::write(env.ws.join("same.txt"), "version-one").unwrap();
+    let first = json_of(&run(c, &["rm", "b", "proj:same.txt", "--json"]));
+    fs::write(env.ws.join("same.txt"), "version-two").unwrap();
+    let second = json_of(&run(c, &["rm", "b", "proj:same.txt", "--json"]));
+    let a = first["op_id"].as_str().unwrap();
+    let b = second["op_id"].as_str().unwrap();
+    let o = run(c, &["purge", "b", b]);
+    assert!(o.status.success(), "{}", text(&o));
+    let o = run(c, &["rollback", "b", a]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert_eq!(
+        fs::read_to_string(env.ws.join("same.txt")).unwrap(),
+        "version-one"
+    );
+    let o = run(c, &["purge", "b", a]);
+    assert!(o.status.success(), "{}", text(&o));
 }

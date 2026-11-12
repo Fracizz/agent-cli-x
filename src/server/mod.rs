@@ -50,7 +50,7 @@ pub struct State {
     pub config_error: Option<String>,
     tls: Arc<ServerConfig>,
     net: admin::Net,
-    active: AtomicUsize,
+    active: Arc<AtomicUsize>,
 }
 
 type Conn = BufReader<StreamOwned<ServerConnection, TcpStream>>;
@@ -227,7 +227,7 @@ fn serve_inner(home: &Path, wait_port_secs: u64) -> Result<()> {
         net: admin::Net::default(),
         cfg,
         ws,
-        active: AtomicUsize::new(0),
+        active: Arc::new(AtomicUsize::new(0)),
     });
     warm.refill();
     // 监听器在独立线程上运行（换端口时会被替换），主线程只需保持进程存活
@@ -238,10 +238,36 @@ fn serve_inner(home: &Path, wait_port_secs: u64) -> Result<()> {
     }
 }
 
-struct ActiveGuard<'a>(&'a AtomicUsize);
-impl Drop for ActiveGuard<'_> {
+/// 许可在创建连接线程前获取，包含握手、鉴权及请求处理的整个生命周期。
+struct ActiveGuard(Arc<AtomicUsize>);
+impl ActiveGuard {
+    fn acquire(active: &Arc<AtomicUsize>) -> Option<Self> {
+        active
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n < MAX_CONNECTIONS).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| Self(Arc::clone(active)))
+    }
+}
+impl Drop for ActiveGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// 过载时直接关闭 TCP，不为尚未鉴权的连接再创建线程或进行 TLS 握手。
+fn spawn_connection(st: &Arc<State>, tcp: TcpStream) {
+    let Some(permit) = ActiveGuard::acquire(&st.active) else {
+        return;
+    };
+    let st = Arc::clone(st);
+    // spawn 失败会销毁闭包，释放 permit 与 socket；不会 panic 中止整个服务。
+    if let Err(e) = thread::Builder::new().spawn(move || {
+        let _permit = permit;
+        handle_conn(st, tcp);
+    }) {
+        crate::slog!("failed to start connection worker: {e}");
     }
 }
 
@@ -259,27 +285,26 @@ fn handle_conn(st: Arc<State>, tcp: TcpStream) {
     };
     let mut conn: Conn = BufReader::new(StreamOwned::new(conn, tcp));
 
-    let n = st.active.fetch_add(1, Ordering::SeqCst) + 1;
-    let _guard = ActiveGuard(&st.active);
     let max_body = (st.cfg.policy.max_write_kb as usize * 1024) * 6 + 64 * 1024;
-    // put 的请求体是大文件流，由 transfer::put 边读边写；其余接口一次读完
-    let req = http::read_request_head(&mut conn).and_then(|mut req| {
+    // 在读取或分配请求体之前鉴权；上传接口仍由处理函数流式读取。
+    let req = (|| {
+        let mut req = http::read_request_head(&mut conn)?;
+        let caller = authorize(&st, &req).ok_or_else(|| {
+            st.audit
+                .log(&ip, "", "auth_fail", false, json!({"path": req.path}));
+            thread::sleep(Duration::from_millis(300));
+            AppError::auth("invalid token")
+        })?;
         if !is_streaming_upload(&req.path) {
             req.body = http::read_body(&mut conn, req.content_length, max_body)?;
         }
-        Ok(req)
-    });
+        Ok((req, caller))
+    })();
     match req {
         Err(e) => {
             let _ = http::write_error(conn.get_mut(), &e);
         }
-        Ok(_) if n > MAX_CONNECTIONS => {
-            let _ = http::write_error(
-                conn.get_mut(),
-                &AppError::new("busy", "server connection limit reached, retry later"),
-            );
-        }
-        Ok(req) => dispatch(&st, ip, local_port, req, &mut conn),
+        Ok((req, caller)) => dispatch(&st, ip, local_port, req, caller, &mut conn),
     }
     let s = conn.get_mut();
     s.conn.send_close_notify();
@@ -300,14 +325,14 @@ fn authorize(st: &State, req: &http::Request) -> Option<auth::Caller> {
     st.auth.check(got)
 }
 
-fn dispatch(st: &Arc<State>, ip: String, local_port: u16, req: http::Request, conn: &mut Conn) {
-    let Some(caller) = authorize(st, &req) else {
-        st.audit
-            .log(&ip, "", "auth_fail", false, json!({"path": req.path}));
-        thread::sleep(Duration::from_millis(300));
-        let _ = http::write_error(conn.get_mut(), &AppError::auth("invalid token"));
-        return;
-    };
+fn dispatch(
+    st: &Arc<State>,
+    ip: String,
+    local_port: u16,
+    req: http::Request,
+    caller: auth::Caller,
+    conn: &mut Conn,
+) {
     let ctx = Ctx {
         st: Arc::clone(st),
         ip,
@@ -444,4 +469,37 @@ fn info_base(ctx: &Ctx) -> Value {
             "idle_secs": ctx.st.cfg.policy.prewarm_idle_secs,
         },
     })
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+
+    #[test]
+    fn admission_is_atomic_and_releases_capacity() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(std::sync::Barrier::new(MAX_CONNECTIONS + 17));
+        let handles: Vec<_> = (0..MAX_CONNECTIONS + 16)
+            .map(|_| {
+                let active = Arc::clone(&active);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let permit = ActiveGuard::acquire(&active);
+                    barrier.wait();
+                    permit
+                })
+            })
+            .collect();
+        barrier.wait();
+        assert_eq!(active.load(Ordering::SeqCst), MAX_CONNECTIONS);
+        assert!(ActiveGuard::acquire(&active).is_none());
+        let permits: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(
+            permits.iter().filter(|p| p.is_some()).count(),
+            MAX_CONNECTIONS
+        );
+        drop(permits);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert!(ActiveGuard::acquire(&active).is_some());
+    }
 }

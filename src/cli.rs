@@ -147,6 +147,12 @@ enum Cmd {
         /// Max entries to list
         #[arg(long, default_value_t = 500)]
         max: usize,
+        /// Skip entries from earlier pages
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        /// Disable byte and single-line limits (entry count still uses --max)
+        #[arg(long)]
+        full: bool,
     },
     /// Search file contents on a peer (regex, honors .gitignore, skips binaries and denied paths)
     Grep {
@@ -166,6 +172,12 @@ enum Cmd {
         /// Max matching lines to return
         #[arg(long, default_value_t = 200)]
         max: usize,
+        /// Skip matches from earlier pages
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        /// Disable byte and single-line limits (match count still uses --max)
+        #[arg(long)]
+        full: bool,
     },
     /// Read a text file
     Read {
@@ -466,28 +478,31 @@ pub fn run() -> Result<i32> {
             path,
             depth,
             max,
+            offset,
+            full,
         } => {
             let v = Client::load(&peer)?.call(
                 "/v1/fs/ls",
-                &json!({"path": path.unwrap_or_default(), "depth": depth, "max": max}),
+                &json!({"path": path.unwrap_or_default(), "depth": depth, "max": max, "offset": offset, "full": full}),
                 CALL_TIMEOUT,
             )?;
+            check_pagination_support(&v, offset, full, &peer)?;
             if json {
                 println!("{v}");
             } else {
                 for e in v["entries"].as_array().into_iter().flatten() {
                     let p = e["path"].as_str().unwrap_or_default();
                     match e["kind"].as_str() {
-                        Some("d") => println!("{p}/"),
-                        Some("l") => println!("{p}@"),
-                        _ => println!("{p}\t{}", human_size(e["size"].as_u64().unwrap_or(0))),
+                        Some("d") => println!("{}/", p.escape_debug()),
+                        Some("l") => println!("{}@", p.escape_debug()),
+                        _ => println!(
+                            "{}\t{}",
+                            p.escape_debug(),
+                            human_size(e["size"].as_u64().unwrap_or(0))
+                        ),
                     }
                 }
-                if v["truncated"].as_bool() == Some(true) {
-                    eprintln!(
-                        "[agent-cli-x: --max {max} limit reached; narrow the dir, lower --depth, or use grep]"
-                    );
-                }
+                print_page_hint(&v, max, "entries");
             }
             Ok(0)
         }
@@ -499,6 +514,8 @@ pub fn run() -> Result<i32> {
             ignore_case,
             fixed,
             max,
+            offset,
+            full,
         } => {
             let v = Client::load(&peer)?.call(
                 "/v1/fs/grep",
@@ -509,10 +526,13 @@ pub fn run() -> Result<i32> {
                     "ignore_case": ignore_case,
                     "fixed": fixed,
                     "max": max,
+                    "offset": offset,
+                    "full": full,
                 }),
                 CALL_TIMEOUT,
             )?;
             let matches = v["matches"].as_array().cloned().unwrap_or_default();
+            check_pagination_support(&v, offset, full, &peer)?;
             if json {
                 println!("{v}");
             } else {
@@ -520,14 +540,12 @@ pub fn run() -> Result<i32> {
                 for m in &matches {
                     println!(
                         "{ws}:{}:{}:{}",
-                        m["path"].as_str().unwrap_or_default(),
+                        m["path"].as_str().unwrap_or_default().escape_debug(),
                         m["line"],
                         m["text"].as_str().unwrap_or_default()
                     );
                 }
-                if v["truncated"].as_bool() == Some(true) {
-                    eprintln!("[agent-cli-x: --max {max} limit reached; narrow the scope or filter with --glob]");
-                }
+                print_page_hint(&v, max, "matches");
             }
             // 与 grep 一致：无匹配返回 1
             Ok(if matches.is_empty() { 1 } else { 0 })
@@ -696,6 +714,9 @@ pub fn run() -> Result<i32> {
                     eprintln!(
                         "[agent-cli-x: trash unavailable ({e}); deleted after backup instead]"
                     );
+                }
+                if let Some(warning) = v["trash_warning"].as_str() {
+                    eprintln!("[agent-cli-x: {warning}]");
                 }
             }
             Ok(0)
@@ -1147,7 +1168,7 @@ fn peer(cmd: PeerCmd, json: bool) -> Result<i32> {
                 .peers
                 .iter()
                 .filter(|(_, p)| p.os.is_none() || p.shell.is_none())
-                .filter(|(_, p)| p.info_tried.map_or(true, |t| now - t >= RETRY_SECS))
+                .filter(|(_, p)| p.info_tried.is_none_or(|t| now - t >= RETRY_SECS))
                 .map(|(n, _)| n.clone())
                 .collect();
             if !missing.is_empty() {
@@ -1487,6 +1508,39 @@ fn cp(
 const READ_WINDOW_LINES: usize = 2000;
 const READ_WINDOW_KB: u64 = 64;
 
+fn check_pagination_support(v: &Value, offset: usize, full: bool, peer: &str) -> Result<()> {
+    if (offset > 0 || full) && v.get("next_offset").is_none() {
+        return Err(AppError::bad_request(format!("peer does not support --offset/--full for this command; run `agent-cli-x upgrade {peer}` first")));
+    }
+    Ok(())
+}
+
+fn next_read_start(v: &Value) -> Option<u64> {
+    if let Some(next) = v.get("next_start") {
+        return next.as_u64();
+    }
+    let first = v["start"].as_u64().unwrap_or(1);
+    let last = v["end"].as_u64().unwrap_or(0);
+    (last >= first
+        && (v["truncated"].as_bool() == Some(true)
+            || v["total_lines"].as_u64().is_some_and(|t| last < t)))
+    .then(|| last.saturating_add(1))
+}
+
+fn print_page_hint(v: &Value, max: usize, kind: &str) {
+    if let Some(next) = v["next_offset"].as_u64() {
+        eprintln!(
+            "[agent-cli-x: at least 1 more {kind}; continue with --offset {next} --max {max}]"
+        );
+    }
+    if let Some(cut) = v["omitted_chars"].as_u64().filter(|n| *n > 0) {
+        eprintln!("[agent-cli-x: {cut} characters omitted; add --full to retrieve complete rows]");
+    }
+    if v.get("next_offset").is_none() && v["truncated"].as_bool() == Some(true) {
+        eprintln!("[agent-cli-x: --max {max} limit reached; old peer has no pagination, narrow the scope or run agent-cli-x upgrade <peer>]");
+    }
+}
+
 fn read(peer: &str, path: &str, lines: Option<String>, number: bool, json: bool) -> Result<i32> {
     let (start, end) = match lines.as_deref() {
         None => (None, None),
@@ -1508,47 +1562,54 @@ fn read(peer: &str, path: &str, lines: Option<String>, number: bool, json: bool)
     let windowed = end.is_none();
     let (end, max_kb) = if windowed {
         let s = start.unwrap_or(1).max(1);
-        (Some(s + READ_WINDOW_LINES - 1), Some(READ_WINDOW_KB))
+        (
+            Some(s.saturating_add(READ_WINDOW_LINES - 1)),
+            Some(READ_WINDOW_KB),
+        )
     } else {
         (end, None)
     };
     let v = Client::load(peer)?.call(
         "/v1/fs/read",
-        &json!({"path": path, "start": start, "end": end, "max_kb": max_kb}),
+        &json!({"path": path, "start": start, "end": end, "max_kb": max_kb, "windowed": windowed}),
         CALL_TIMEOUT,
     )?;
     if json {
         println!("{v}");
-        return Ok(0);
+        if v.get("next_start").is_some() {
+            return Ok(0);
+        }
     }
     let content = v["content"].as_str().unwrap_or_default();
     let first = v["start"].as_u64().unwrap_or(1) as usize;
-    if number {
+    if !json && number {
         for (i, line) in content.split_inclusive('\n').enumerate() {
             print!("{:>6}\t{line}", first + i);
         }
         if !content.is_empty() && !content.ends_with('\n') {
             println!();
         }
-    } else {
+    } else if !json {
         print!("{content}");
     }
     let total = v["total_lines"].as_u64();
     let last = v["end"].as_u64().unwrap_or(0);
-    let partial =
-        v["truncated"].as_bool() == Some(true) || first > 1 || total.is_some_and(|t| last < t);
-    if partial {
+    let next_start = next_read_start(&v);
+    if let Some(next) = next_start {
         eprintln!(
-            "\n[agent-cli-x: showing lines {first}-{last} of {}{}; continue with --lines {}:{}]",
+            "\n[agent-cli-x: showing lines {first}-{last} of {} ({} lines omitted); continue with --lines {next}:]",
             total.map(|t| t.to_string()).unwrap_or_else(|| "?".into()),
-            if v["truncated"].as_bool() == Some(true) {
-                ", read limit reached"
-            } else {
-                ""
-            },
-            last + 1,
-            last + READ_WINDOW_LINES as u64
+            v["omitted_lines"].as_u64().map(|n| n.to_string()).unwrap_or_else(|| "at least 1".into()),
         );
+    }
+    if let Some(bytes) = v["omitted_bytes"].as_u64().filter(|n| *n > 0) {
+        eprintln!("[agent-cli-x: {bytes} bytes omitted from long lines; full text: agent-cli-x get {peer} {path} <local>]");
+    }
+    if v.get("next_start").is_none()
+        && last < first as u64
+        && v["truncated"].as_bool() == Some(true)
+    {
+        eprintln!("[agent-cli-x: old peer cannot return this long line; full text: agent-cli-x get {peer} {path} <local>]");
     }
     Ok(0)
 }
@@ -1696,5 +1757,41 @@ fn text_arg(inline: Option<String>, file: Option<PathBuf>, name: &str) -> Result
         (Some(s), _) => Ok(s),
         (None, Some(f)) => read_local_text(&f),
         (None, None) => Err(AppError::bad_request(format!("Missing {name}"))),
+    }
+}
+
+#[cfg(test)]
+mod output_compat_tests {
+    use super::*;
+
+    #[test]
+    fn old_read_responses_progress_without_looping_on_empty_windows() {
+        assert_eq!(
+            next_read_start(&json!({"start": 1, "end": 2000, "total_lines": 2500})),
+            Some(2001)
+        );
+        assert_eq!(
+            next_read_start(&json!({"start": 1, "end": 0, "truncated": true})),
+            None
+        );
+        assert_eq!(
+            next_read_start(&json!({"start": 1, "end": 2, "truncated": true, "next_start": null})),
+            None
+        );
+        assert_eq!(next_read_start(&json!({"next_start": 42})), Some(42));
+    }
+
+    #[test]
+    fn old_peers_cannot_silently_repeat_the_first_page() {
+        let old = json!({"entries": [], "truncated": true});
+        assert!(check_pagination_support(&old, 0, false, "b").is_ok());
+        assert_eq!(
+            check_pagination_support(&old, 10, false, "b")
+                .unwrap_err()
+                .exit_code(),
+            110
+        );
+        assert!(check_pagination_support(&old, 0, true, "b").is_err());
+        assert!(check_pagination_support(&json!({"next_offset": null}), 10, false, "b").is_ok());
     }
 }

@@ -84,12 +84,34 @@ fn handshake_error(addr: &str, e: &std::io::Error) -> String {
     )
 }
 
-/// 读到 EOF；对端未发送 close_notify 导致的 UnexpectedEof 视为正常结束。
+/// JSON 响应以断连结束。提前拒绝请求时，未读的上传数据可能使 TCP 以 RST 结束；
+/// 仅当已收到完整 JSON 时保留响应，残缺响应与超时仍按连接错误返回。
 fn read_all<R: Read>(r: &mut R, out: &mut Vec<u8>) -> Result<()> {
     match r.read_to_end(out) {
         Ok(_) => Ok(()),
-        Err(e) if e.kind() == ErrorKind::UnexpectedEof => Ok(()),
+        Err(e)
+            if matches!(
+                e.kind(),
+                ErrorKind::UnexpectedEof
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+            ) && !out.is_empty()
+                && serde_json::from_slice::<Value>(out).is_ok() =>
+        {
+            Ok(())
+        }
         Err(e) => Err(map_io(e)),
+    }
+}
+
+/// 写入失败后放弃待发送的 TLS 记录，让读取响应时不再重试已失败的请求体。
+/// 双向 TLS 的读写序列相互独立；对端可能已发来能说明失败原因的 HTTP 响应。
+fn discard_pending_writes(s: &mut Stream) {
+    let mut sink = std::io::sink();
+    while s.conn.wants_write() {
+        if !matches!(s.conn.write_tls(&mut sink), Ok(n) if n > 0) {
+            break;
+        }
     }
 }
 
@@ -199,10 +221,20 @@ impl Client {
     ) -> Result<(u16, BufReader<Stream>)> {
         let (mut s, _) = connect(&self.peer.addr, Some(&self.peer.fingerprint), timeout)?;
         let bytes = serde_json::to_vec(body).unwrap_or_default();
-        http::write_request(&mut s, path, &self.peer.token, &bytes).map_err(map_io)?;
+        let sent = http::write_request(&mut s, path, &self.peer.token, &bytes).map_err(map_io);
+        if sent.is_err() {
+            discard_pending_writes(&mut s);
+        }
         let mut br = BufReader::new(s);
-        let head = http::read_response_head(&mut br)?;
+        let head = match http::read_response_head(&mut br) {
+            Ok(head) => head,
+            Err(e) => return Err(sent.err().unwrap_or(e)),
+        };
         self.note_version(&head);
+        // 拒绝响应比传输失败更准确；成功响应不能掩盖未发送完整的请求。
+        if head.status == 200 {
+            sent?;
+        }
         Ok((head.status, br))
     }
 
@@ -268,8 +300,10 @@ impl Client {
             "application/octet-stream",
         )
         .map_err(map_io)?;
-        let body_res = write_body(&mut s);
-        let _ = s.flush();
+        let body_res = write_body(&mut s).and_then(|_| s.flush().map_err(map_io));
+        if body_res.is_err() {
+            discard_pending_writes(&mut s);
+        }
         // 服务端可能中途拒绝并关闭连接：即使写入失败，也优先读取它返回的错误
         let mut br = BufReader::new(s);
         let status = match http::read_response_head(&mut br) {
@@ -291,7 +325,7 @@ impl Client {
     }
 
     /// 长度未知的帧流上传（cp 中转用，对端需支持 put_stream）。
-    /// `write_body` 出错时（例如源端中断）主动结束发送，让服务端尽快回错误（含可撤销的 op_id）。
+    /// 发送结束后关闭写方向，供服务端在提前拒绝时结束 drain；读取响应方向保持可用。
     pub fn upload_frames(
         &self,
         path: &str,
@@ -300,13 +334,21 @@ impl Client {
     ) -> Result<Value> {
         let (mut s, _) = connect(&self.peer.addr, Some(&self.peer.fingerprint), timeout)?;
         http::write_stream_request_head(&mut s, path, &self.peer.token).map_err(map_io)?;
-        let body_res = write_body(&mut s);
-        let _ = s.flush();
-        if body_res.is_err() {
+        let written = write_body(&mut s);
+        // 即使源端中断，也先尝试写完已经排队的 TLS 记录，保证后续 close_notify 的序号连续。
+        let flushed = s.flush().map_err(map_io);
+        if flushed.is_ok() {
             s.conn.send_close_notify();
-            let _ = s.flush();
-            let _ = s.sock.shutdown(std::net::Shutdown::Write);
+            if s.flush().is_err() {
+                discard_pending_writes(&mut s);
+            }
+        } else {
+            // 丢弃过 TLS 记录后不能再发 close_notify：对端无法解密有序号缺口的记录。
+            discard_pending_writes(&mut s);
         }
+        let body_res = written.and(flushed);
+        // 小流可能已全部发完才收到拒绝；服务端此时正 drain 到 EOF，必须始终结束写方向。
+        let _ = s.sock.shutdown(std::net::Shutdown::Write);
         let mut br = BufReader::new(s);
         let head = match http::read_response_head(&mut br) {
             Ok(h) => h,
@@ -370,4 +412,62 @@ pub fn discover_fingerprint(addr: &str) -> Result<String> {
     s.conn.send_close_notify();
     let _ = s.flush();
     Ok(fp)
+}
+
+#[cfg(test)]
+mod response_tests {
+    use super::*;
+    use std::io::{self, Cursor};
+
+    struct InterruptedResponse {
+        body: Cursor<Vec<u8>>,
+        error: ErrorKind,
+    }
+
+    impl Read for InterruptedResponse {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.body.read(buf)? {
+                0 => Err(io::Error::from(self.error)),
+                n => Ok(n),
+            }
+        }
+    }
+
+    fn read_response(body: &[u8], error: ErrorKind) -> Result<Vec<u8>> {
+        let mut source = InterruptedResponse {
+            body: Cursor::new(body.to_vec()),
+            error,
+        };
+        let mut data = Vec::new();
+        read_all(&mut source, &mut data)?;
+        Ok(data)
+    }
+
+    #[test]
+    fn complete_json_survives_connection_reset() {
+        let body = br#"{"error":{"code":"auth","message":"invalid token"}}"#;
+        for error in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::UnexpectedEof,
+        ] {
+            assert_eq!(read_response(body, error).unwrap(), body);
+        }
+    }
+
+    #[test]
+    fn incomplete_responses_and_timeouts_remain_transport_errors() {
+        for body in [b"".as_slice(), br#"{"error":"#] {
+            assert_eq!(
+                read_response(body, ErrorKind::ConnectionReset)
+                    .unwrap_err()
+                    .code,
+                "connect"
+            );
+        }
+        assert_eq!(
+            read_response(b"{}", ErrorKind::TimedOut).unwrap_err().code,
+            "timeout"
+        );
+    }
 }

@@ -90,6 +90,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -97,16 +98,30 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          cat > release-notes.md <<EOF
-          First public release of agent-cli-x.
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
 
-          - \`agent-cli-x-${{ github.ref_name }}-x86_64-linux-musl.tar.gz\` – Linux x86_64, statically linked (musl)
-          - \`agent-cli-x-${{ github.ref_name }}-x86_64-windows-msvc.zip\` – Windows x86_64
-
-          Unpack the archive and put \`agent-cli-x\` (\`agent-cli-x.exe\` on Windows) on your \`PATH\`,
-          or run \`cargo install --git https://github.com/${{ github.repository }}\`.
-          EOF
+          tag = os.environ["RELEASE_TAG"]
+          version = tag.removeprefix("v")
+          heading = f"## {version}\n"
+          path = Path("CHANGELOG.md")
+          changelog = path.read_text() if path.exists() else ""
+          if heading in changelog:
+              notes = changelog.split(heading, 1)[1].split("\n## ", 1)[0].strip()
+          else:
+              notes = f"Release {tag} of agent-cli-x."
+          notes += (
+              f"\n\nDownloads:\n\n"
+              f"- `agent-cli-x-{tag}-x86_64-linux-musl.tar.gz` — Linux x86_64, statically linked.\n"
+              f"- `agent-cli-x-{tag}-x86_64-windows-msvc.zip` — Windows x86_64.\n\n"
+              "Unpack the archive and put `agent-cli-x` (`agent-cli-x.exe` on Windows) on your `PATH`. "
+              "Each archive has a `.sha256` checksum file.\n"
+          )
+          Path("release-notes.md").write_text(notes)
+          PY
           # 标签带 `-`（如 v0.0.5-beta.1）时发布为预发布版本，不会成为 latest
           extra=()
           case "${{ github.ref_name }}" in

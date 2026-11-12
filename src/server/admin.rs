@@ -101,8 +101,7 @@ pub fn spawn_accept(st: &Arc<State>, listener: TcpListener, addr: &str) -> Resul
             let Ok((tcp, _)) = listener.accept() else {
                 continue;
             };
-            let st = Arc::clone(&st);
-            thread::spawn(move || super::handle_conn(st, tcp));
+            super::spawn_connection(&st, tcp);
         }
     });
     Ok(ListenerHandle {
@@ -250,7 +249,7 @@ fn open(ctx: &Ctx, port: u16) -> Result<Value> {
 fn commit(ctx: &Ctx, port: u16) -> Result<Value> {
     let st = &ctx.st;
     let mut g = st.net.lock();
-    if !g.pending.as_ref().is_some_and(|p| p.port == port) {
+    if g.pending.as_ref().is_none_or(|p| p.port != port) {
         return Err(AppError::conflict(format!(
             "no pending port {port} (may have exceeded {PENDING_SECS}s). Run set-port again"
         )));

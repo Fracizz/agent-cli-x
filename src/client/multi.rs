@@ -80,11 +80,10 @@ pub fn parallel<T: Send + 'static>(
 
 struct ExecResult {
     peer: String,
-    /// 服务端 exit 帧（code / timed_out / ms）
     exit: Option<Value>,
     chunks: Vec<(bool, String)>,
-    kept: usize,
-    dropped: bool,
+    omitted: usize,
+    omitted_bytes: usize,
     log: Option<std::path::PathBuf>,
     error: Option<AppError>,
     ms: u64,
@@ -101,16 +100,71 @@ impl ExecResult {
             None => AppError::connect("").exit_code(),
         }
     }
+
+    fn truncated(&self) -> bool {
+        self.omitted_bytes > 0 || self.omitted > 0
+    }
 }
 
-fn exec_one(peer: &str, body: &Value, read_timeout: Duration) -> ExecResult {
+struct Capture {
+    ht: HeadTail,
+    chunks: Vec<(bool, String)>,
+    full: bool,
+    kept: usize,
+    omitted: usize,
+    omitted_bytes: usize,
+}
+
+impl Capture {
+    fn new(full: bool) -> Self {
+        Self {
+            ht: HeadTail::new(output::PER_PEER),
+            chunks: Vec::new(),
+            full,
+            kept: 0,
+            omitted: 0,
+            omitted_bytes: 0,
+        }
+    }
+
+    fn feed(&mut self, err: bool, text: &str) {
+        if self.full {
+            // --full explicitly increases the budget, but one slow peer cannot consume unbounded memory.
+            let room = MEM_CAP.saturating_sub(self.kept);
+            let mut n = text.len().min(room);
+            while !text.is_char_boundary(n) {
+                n -= 1;
+            }
+            self.kept += n;
+            self.omitted_bytes += text.len() - n;
+            self.omitted += text[n..].matches('\n').count();
+            if n > 0 {
+                self.chunks.push((err, text[..n].to_string()));
+            }
+        } else {
+            self.ht
+                .feed(err, text, &mut |e, s| self.chunks.push((e, s.to_string())));
+        }
+    }
+
+    fn finish(mut self) -> (Vec<(bool, String)>, usize, usize) {
+        if !self.full {
+            self.chunks.extend(self.ht.finish());
+            self.omitted += self.ht.omitted;
+            self.omitted_bytes += self.ht.omitted_bytes;
+        }
+        (self.chunks, self.omitted, self.omitted_bytes)
+    }
+}
+
+fn exec_one(peer: &str, body: &Value, read_timeout: Duration, full: bool) -> ExecResult {
     let started = Instant::now();
     let mut r = ExecResult {
         peer: peer.to_string(),
         exit: None,
         chunks: Vec::new(),
-        kept: 0,
-        dropped: false,
+        omitted: 0,
+        omitted_bytes: 0,
         log: None,
         error: None,
         ms: 0,
@@ -123,6 +177,7 @@ fn exec_one(peer: &str, body: &Value, read_timeout: Duration) -> ExecResult {
         util::random_hex(2)
     ));
     let mut log = fs::File::create(&log_path).ok();
+    let mut capture = Capture::new(full);
     let res = Client::load(peer).and_then(|c| {
         c.stream("/v1/exec", body, read_timeout, |v| {
             let is_err = match v["t"].as_str() {
@@ -134,81 +189,42 @@ fn exec_one(peer: &str, body: &Value, read_timeout: Duration) -> ExecResult {
                 }
                 _ => return Ok(()),
             };
-            let d = v["d"].as_str().unwrap_or_default();
+            let text = v["d"].as_str().unwrap_or_default();
             if let Some(f) = log.as_mut() {
-                let _ = f.write_all(d.as_bytes());
+                let _ = f.write_all(text.as_bytes());
             }
-            if r.kept + d.len() <= MEM_CAP {
-                r.kept += d.len();
-                r.chunks.push((is_err, d.to_string()));
-            } else {
-                r.dropped = true;
-            }
+            capture.feed(is_err, text);
             Ok(())
         })
     });
+    (r.chunks, r.omitted, r.omitted_bytes) = capture.finish();
     drop(log);
     r.log = Some(log_path);
     r.ms = started.elapsed().as_millis() as u64;
     match res {
         Err(e) => r.error = Some(e),
-        Ok(()) if r.exit.is_none() => {
-            r.error = Some(AppError::connect(
-                "connection lost before the exit code arrived (command may still be running on the peer)",
-            ))
-        }
+        Ok(()) if r.exit.is_none() => r.error = Some(AppError::connect(
+            "connection lost before the exit code arrived (command may still be running on the peer)",
+        )),
         Ok(()) => {}
     }
     r
 }
 
-/// 打印一个对端的输出（头尾截断），返回是否保留了完整日志。
-fn print_output(r: &ExecResult, full: bool) -> bool {
-    let log = r
-        .log
-        .as_ref()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
-    let ends_nl = r
-        .chunks
-        .iter()
-        .rev()
-        .find(|(_, t)| !t.is_empty())
-        .map(|(_, t)| t.ends_with('\n'))
-        .unwrap_or(true);
-    let mut truncated = false;
-    if full {
-        for (e, t) in &r.chunks {
-            emit(*e, t);
-        }
-    } else {
-        let mut ht = HeadTail::new(output::PER_PEER);
-        for (e, t) in &r.chunks {
-            ht.feed(*e, t, &mut emit);
-        }
-        let tail = ht.finish();
-        if ht.omitted > 0 {
-            truncated = true;
-            eprintln!("{}", output::omit_note(ht.omitted, Some(&log)));
-        }
-        for (e, l) in &tail {
-            emit(*e, l);
-        }
+fn print_output(r: &ExecResult) {
+    for (err, text) in &r.chunks {
+        emit(*err, text);
     }
-    if !ends_nl {
+    if r.chunks.last().is_some_and(|(_, s)| !s.ends_with('\n')) {
         println!();
     }
-    if r.dropped {
+    if r.truncated() {
+        let log = r.log.as_ref().map(|p| p.to_string_lossy().to_string());
         eprintln!(
-            "[agent-cli-x: output too large, only the first {} MB kept in memory, full output: {}]",
-            MEM_CAP / 1024 / 1024,
-            r.log
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default()
+            "{}",
+            output::omit_note(r.omitted, r.omitted_bytes, log.as_deref())
         );
     }
-    truncated || r.dropped
 }
 
 /// 在多个对端并行执行同一条命令。退出码：全部为 0 时为 0，否则为第一个失败对端的退出码。
@@ -227,7 +243,7 @@ pub fn exec_many(
             .map(|p| {
                 let p = p.clone();
                 let b = body.clone();
-                thread::spawn(move || exec_one(&p, &b, read_timeout))
+                thread::spawn(move || exec_one(&p, &b, read_timeout, full))
             })
             .collect();
         handles
@@ -246,21 +262,12 @@ pub fn exec_many(
             .iter()
             .map(|r| {
                 let log = r.log.as_ref().map(|p| p.to_string_lossy().to_string());
-                let pick = |want_err: bool| -> Vec<&str> {
-                    r.chunks
-                        .iter()
-                        .filter(|(e, _)| *e == want_err)
-                        .map(|(_, t)| t.as_str())
-                        .collect()
+                let pick = |want_err: bool| -> String {
+                    r.chunks.iter().filter(|(e, _)| *e == want_err).map(|(_, t)| t.as_str()).collect()
                 };
-                let (out, err, omitted) = if full {
-                    (pick(false).concat(), pick(true).concat(), 0)
-                } else {
-                    let (o, no) = output::clip_text(&pick(false), output::PER_PEER, log.as_deref());
-                    let (e, ne) = output::clip_text(&pick(true), output::PER_PEER, log.as_deref());
-                    (o, e, no + ne)
-                };
-                let keep_log = r.dropped || omitted > 0;
+                let out = pick(false);
+                let err = pick(true);
+                let keep_log = r.truncated();
                 if !keep_log {
                     if let Some(p) = &r.log {
                         let _ = fs::remove_file(p);
@@ -274,7 +281,8 @@ pub fn exec_many(
                     "stdout": out,
                     "stderr": err,
                     "truncated": keep_log,
-                    "omitted_lines": omitted,
+                    "omitted_lines": r.omitted,
+                    "omitted_bytes": r.omitted_bytes,
                     "log": if keep_log { log } else { None },
                     "error": r.error.as_ref().map(http::error_json),
                 })
@@ -296,8 +304,8 @@ pub fn exec_many(
             r.peer,
             r.ms as f64 / 1000.0
         );
-        let keep = print_output(r, full);
-        if !keep {
+        print_output(r);
+        if !r.truncated() {
             if let Some(p) = &r.log {
                 let _ = fs::remove_file(p);
             }
@@ -380,4 +388,36 @@ pub fn info_many(peers: &[String], json: bool) -> i32 {
         }
     }
     overall
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+
+    #[test]
+    fn rolling_capture_preserves_the_true_tail_past_eight_megabytes() {
+        let mut capture = Capture::new(false);
+        let chunk = "padding padding padding padding\n".repeat(256);
+        for _ in 0..1200 {
+            capture.feed(false, &chunk);
+        }
+        capture.feed(true, "FINAL_ERROR_MARKER\n");
+        let (chunks, omitted, bytes) = capture.finish();
+        assert!(chunks
+            .iter()
+            .any(|(err, s)| *err && s.contains("FINAL_ERROR_MARKER")));
+        assert!(omitted > 0 && bytes > MEM_CAP);
+        assert!(chunks.iter().map(|(_, s)| s.len()).sum::<usize>() <= 16 * 1024);
+    }
+
+    #[test]
+    fn full_capture_has_an_explicit_shared_byte_cap() {
+        let mut capture = Capture::new(true);
+        let text = "汉".repeat(MEM_CAP / 3 + 20);
+        capture.feed(false, &text);
+        capture.feed(true, "error\n");
+        let (chunks, _, bytes) = capture.finish();
+        assert!(chunks.iter().map(|(_, s)| s.len()).sum::<usize>() <= MEM_CAP);
+        assert!(bytes >= 60);
+    }
 }

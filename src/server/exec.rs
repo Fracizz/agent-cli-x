@@ -273,23 +273,32 @@ pub fn run<W: Write>(ctx: &Ctx, body: Value, w: &mut W) {
         client_gone = true;
     }
 
-    while !client_gone && open > 0 {
-        let res = match rx.recv_timeout(POLL) {
-            Ok((k, Some(bytes))) => {
-                let text = decoders[k as usize].push(&bytes);
-                send_text(w, k, text)
+    while !client_gone {
+        // 输出管道关闭不代表子进程已退出；继续轮询超时，且不在已断开的 channel 上忙等。
+        let res = if open == 0 {
+            thread::sleep(POLL);
+            Ok(())
+        } else {
+            match rx.recv_timeout(POLL) {
+                Ok((k, Some(bytes))) => {
+                    let text = decoders[k as usize].push(&bytes);
+                    send_text(w, k, text)
+                }
+                Ok((k, None)) => {
+                    open -= 1;
+                    let text = decoders[k as usize].finish();
+                    send_text(w, k, text)
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let a = decoders[0].flush_partial();
+                    let b = decoders[1].flush_partial();
+                    send_text(w, 0, a).and_then(|_| send_text(w, 1, b))
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    open = 0;
+                    Ok(())
+                }
             }
-            Ok((k, None)) => {
-                open -= 1;
-                let text = decoders[k as usize].finish();
-                send_text(w, k, text)
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                let a = decoders[0].flush_partial();
-                let b = decoders[1].flush_partial();
-                send_text(w, 0, a).and_then(|_| send_text(w, 1, b))
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         if res.is_err() {
             client_gone = true;
@@ -300,6 +309,9 @@ pub fn run<W: Write>(ctx: &Ctx, body: Value, w: &mut W) {
                 exited = Some(status);
                 drain_deadline = Some(Instant::now() + DRAIN_AFTER_EXIT);
             }
+        }
+        if exited.is_some() && open == 0 {
+            break;
         }
         if drain_deadline.is_some_and(|d| Instant::now() > d) {
             break;

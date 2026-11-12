@@ -22,7 +22,9 @@ Prebuilt binaries for Linux (x86_64, statically linked) and Windows (x86_64) are
 cargo install --git https://github.com/Fracizz/agent-cli-x
 ```
 
-Or build with `cargo build --release` and put `target/release/agent-cli-x(.exe)` on your `PATH`:
+Building from source requires Rust 1.88 or newer.
+
+Or build with `cargo build --locked --release` and put `target/release/agent-cli-x(.exe)` on your `PATH`:
 
 - **Windows:** copy to e.g. `%USERPROFILE%\bin` and add that folder to the user `Path` (System Properties → Environment Variables).
 - **Linux:** `install -m 755 target/release/agent-cli-x ~/.local/bin/`
@@ -74,7 +76,7 @@ Then teach your agent the tool: copy [`skills/agent-cli-x/SKILL.md`](skills/agen
 | `set-port <peer> <port>` | move the peer to another listen port without restarting it; also updates this machine's `peers.toml` |
 | `exec <peer> --detach <cmd>`, `job list\|logs\|kill` | background jobs (`job logs --follow` exits with the job's code); they keep running across `restart` / `upgrade` of the peer |
 | `ls` / `grep` / `read` / `write` / `edit` | file operations inside workspaces |
-| Output limits | `exec` / `job logs` keep the first and last 100 lines (at most 16 KB each, lines cut at 2000 chars); each peer of a multi-peer `exec` keeps 50 + 50 lines (8 KB each). `--json` applies the same limits and reports `truncated`, `omitted_lines` and the local `log`; `--full` turns trimming off. `read` without an end line returns at most 2000 lines / 64 KB and prints the next `--lines` range; an explicit range is capped by `max_read_kb`. `ls` lists at most 500 entries (`--max`), `grep` 200 matches (`--max`) |
+| Output limits | Bounded head/tail logs, file windows and list/search pages; see [Output limits](#output-limits) for budgets and continuation flags |
 | `rm <peer> <path> [-r] [--permanent]` | delete a file or directory: moved to the peer's recycle bin by default (undo with `rollback`); `--permanent` deletes for good |
 | `purge <peer> <op_id>` | permanently remove what an operation left behind (its recycle-bin entries and backups) to free space; it can no longer be rolled back |
 | `put <peer> <local> <dest>` / `get <peer> <src> <local>` | transfer files or directories (`--exclude`) |
@@ -83,6 +85,23 @@ Then teach your agent the tool: copy [`skills/agent-cli-x/SKILL.md`](skills/agen
 | `skill` | print the agent guide |
 
 Paths use `workspace:relative/path`. See `agent-cli-x --help`.
+
+### Output limits
+
+The same data budgets apply to ordinary output and JSON. JSON escaping, metadata and `read -n` line numbers add presentation overhead.
+
+| Command | Default budget | Retrieve omitted data |
+|---|---|---|
+| `exec`, `job logs` | stdout/stderr share first + last 100 lines / 16KB each; 2000 characters per line | Full local `log` retained after any cut; `--full` removes normal trimming |
+| Multi-peer `exec` | Each peer shares first + last 50 lines / 8KB each | Each peer has its own full local log |
+| `read` without an end line | 2000 lines / 64KB; 2000 characters per line | `--lines N:` / JSON `next_start` continues; clipped lines give a `get` command for full text |
+| `ls` | 500 entries; up to 60KB of serialized entries, reserving space for metadata within 64KB | `--offset N` / JSON `next_offset`; `--max` changes the entry count |
+| `grep` | 200 matches / 300 characters per match; up to 60KB of serialized entries | Same pagination as `ls`; narrow with `--glob` |
+
+- JSON reports `truncated`, omitted line/byte/character counts, and a log path or continuation cursor. List/search pages stop after detecting another result, so the remaining count is a lower bound. Ordinary output gives the equivalent retrieval command on stderr. Page order is stable while the tree and file contents remain unchanged.
+- `ls` / `grep --full` removes byte and row clipping; `--max` still applies. Old peers without pagination reject a requested nonzero offset with an upgrade hint rather than silently repeating the first page.
+- An explicit `read --lines START:END` permits long lines but remains capped by `max_read_kb`; a single line exceeding that cap returns an error with a download command.
+- Explicit large-output representations remain memory-bounded: single-peer `--full --json` keeps at most 1MB total, and multi-peer `--full` keeps 8MB per peer. Any remainder is available in the full local log. Single-peer ordinary `--full` streams all output.
 
 ## Multiple machines
 
@@ -177,7 +196,7 @@ How permissions are resolved for a path:
 
 ### Performance
 
-`serve` is one process: one thread per connection (up to 64 concurrent), each `exec` a fresh child process. On Windows the dominant cost is PowerShell startup (pwsh ≈ 0.3 s, Windows PowerShell 5.1 ≈ 2 s), so `serve` keeps `prewarm_shells` idle PowerShell processes started and waiting. A request takes one, hands it cwd/env/command over stdin, and a replacement is started in the background. Every command still runs in its own new process, so nothing leaks between calls; when the pool is empty `exec` falls back to a cold start. Measured locally for `exec "echo hi"` round trips: pwsh 520 ms → 170 ms, 5.1 2.6 s → 0.2–0.9 s. If only 5.1 is installed, installing PowerShell 7 (`pwsh`) helps further. `sh`/`bash`/`cmd` start fast and are not prewarmed. After `prewarm_idle_secs` (default 600) without any `exec` the idle processes are released, so an unused machine holds no extra memory; the next `exec` cold-starts once and refills the pool.
+`serve` is one process: one thread per admitted connection (up to 64 concurrent, including pending TLS handshakes; excess TCP connections are closed before creating a thread), each `exec` a fresh child process. On Windows the dominant cost is PowerShell startup (pwsh ≈ 0.3 s, Windows PowerShell 5.1 ≈ 2 s), so `serve` keeps `prewarm_shells` idle PowerShell processes started and waiting. A request takes one, hands it cwd/env/command over stdin, and a replacement is started in the background. Every command still runs in its own new process, so nothing leaks between calls; when the pool is empty `exec` falls back to a cold start. Measured locally for `exec "echo hi"` round trips: pwsh 520 ms → 170 ms, 5.1 2.6 s → 0.2–0.9 s. If only 5.1 is installed, installing PowerShell 7 (`pwsh`) helps further. `sh`/`bash`/`cmd` start fast and are not prewarmed. After `prewarm_idle_secs` (default 600) without any `exec` the idle processes are released, so an unused machine holds no extra memory; the next `exec` cold-starts once and refills the pool.
 
 ## Security model
 
@@ -185,6 +204,7 @@ Intended for machines you own on a trusted network.
 
 - Traffic is TLS. Clients pin the server certificate fingerprint; a changed fingerprint is a hard error (exit 106).
 - Access requires a token: the `default` one from `config.toml`, or a per-caller token from `token add`. Tokens are compared in constant time, and failures are delayed and audited.
+- Rollback re-resolves recorded paths before checking permissions and again before applying each entry, rejecting directory symlinks that would leave the workspace.
 - File operations are confined to workspaces: canonicalized paths, no `..`, no absolute paths, no symlink/junction escapes, deny-list checked on every ancestor. The agent-cli-x data folder is always denied.
 - Path permissions are enforced per operation: `ls`/`read`/`grep`/`get` and the `exec` working directory need `r`; `write`/`put` need `c` for new files and `u` for existing ones; `edit` needs `u`; `rm` needs `d` on **every** entry it would remove (otherwise nothing is deleted); `rollback` checks the action it performs (restore = `u`, re-create = `c`, remove = `d`). **A shell command itself cannot be sandboxed**: `exec "cat secrets/x"` or `exec "rm x"` still works, and if `serve` runs as root/Administrator so can `exec "npm install -g …"` into a read-only `/usr`. `info` prints the exec user and whether it is elevated so callers can see this. For hard isolation, run `serve` as a dedicated low-privilege OS user and protect directories with file-system permissions.
 - `init` writes OS-specific presets, which you are free to edit:
@@ -193,9 +213,9 @@ Intended for machines you own on a trusted network.
   - macOS: `/System`, `/Library`, `/usr`, `/bin`, `/sbin`, `/private/etc`, `/private/var/db`, `/Applications` read-only.
 - `deny_commands` is a guard rail against accidents, not a security boundary. So is `token add --no-relay` (see [One-way access](#one-way-access)).
 - `grep`, `get` and `ls` skip unreadable paths; `put` refuses to write where it lacks `c`/`u`.
-- Background jobs run as the same user; their output lives in `~/.agent-cli-x/jobs/` (7 days). Jobs still running when `serve` restarts are marked `lost`.
+- Background jobs run as the same user; their output lives in `~/.agent-cli-x/jobs/` (7 days). They survive a normal `serve` restart; a job is marked `lost` when its supervisor is gone.
 - Every write/edit/put is backed up to `~/.agent-cli-x/backup/` (7 days). All requests are logged to `~/.agent-cli-x/audit/YYYY-MM-DD.jsonl` with the client IP and token name.
-- `rm` moves files to the system recycle bin (Windows Recycle Bin, freedesktop Trash on Linux, Trash on macOS), so it is fast and has no size cap; `rollback` restores them from there (Windows/Linux; on macOS restore from the Trash by hand). It refuses to restore over a path that exists again. If the recycle bin is unavailable (e.g. a Linux mount without a writable `.Trash` dir) or `rm_use_trash = false`, it falls back to backing up to `~/.agent-cli-x/backup/` and deleting, limited to `max_transfer_mb`. `rm --permanent` skips both and cannot be undone. `purge <op_id>` permanently deletes an earlier `rm`'s recycle-bin entries (needs `d` on the original paths) and removes the operation's backups, freeing the space without waiting for the 7-day cleanup.
+- `rm` moves files to the system recycle bin (Windows Recycle Bin, freedesktop Trash on Linux, Trash on macOS), so it is fast and has no size cap; `rollback` restores them from there (Windows/Linux; on macOS restore from the Trash by hand). It refuses to restore over a path that exists again. Trash-backed operations record the exact system entry ID (on Linux also its filesystem identity), so repeated deletion of the same path cannot select an earlier version. Legacy or ambiguous trash records are refused with exit 105 and require manual recovery or deletion in the system recycle bin; their backup metadata is retained. If the recycle bin is unavailable (e.g. a Linux mount without a writable `.Trash` dir) or `rm_use_trash = false`, it falls back to backing up to `~/.agent-cli-x/backup/` and deleting, limited to `max_transfer_mb`. `rm --permanent` skips both and cannot be undone. `purge <op_id>` permanently deletes an earlier `rm`'s recycle-bin entries (needs `d` on the original paths) and removes the operation's backups, freeing the space without waiting for the 7-day cleanup.
 - `serve` writes its own log (startup, token reloads, upgrades, internal errors, panics) to `~/.agent-cli-x/serve-logs/` (7 days) as well as to stderr. When it runs at boot with no console, check this log first.
 
 ## Start at boot (recommended)
