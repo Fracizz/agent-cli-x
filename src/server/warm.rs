@@ -119,7 +119,7 @@ impl WarmPool {
                 if st.idle.is_empty() || st.last_use.elapsed() < limit {
                     continue;
                 }
-                st.idle.drain(..).collect()
+                std::mem::take(&mut st.idle)
             };
             for mut c in drained {
                 let _ = c.kill();

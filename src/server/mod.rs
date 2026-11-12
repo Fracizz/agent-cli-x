@@ -242,12 +242,17 @@ fn serve_inner(home: &Path, wait_port_secs: u64) -> Result<()> {
 struct ActiveGuard(Arc<AtomicUsize>);
 impl ActiveGuard {
     fn acquire(active: &Arc<AtomicUsize>) -> Option<Self> {
-        active
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                (n < MAX_CONNECTIONS).then_some(n + 1)
-            })
-            .ok()
-            .map(|_| Self(Arc::clone(active)))
+        let mut count = active.load(Ordering::SeqCst);
+        loop {
+            if count >= MAX_CONNECTIONS {
+                return None;
+            }
+            match active.compare_exchange_weak(count, count + 1, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return Some(Self(Arc::clone(active))),
+                Err(current) => count = current,
+            }
+        }
     }
 }
 impl Drop for ActiveGuard {
