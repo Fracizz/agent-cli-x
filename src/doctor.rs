@@ -70,29 +70,29 @@ fn xml_tag<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
 }
 
 fn check_autostart(r: &mut Report) {
-    const NAME: &str = "开机自启";
+    const NAME: &str = "autostart";
     if cfg!(windows) {
         let Some((ok, xml)) = run_cmd("schtasks", &["/Query", "/TN", "agent-cli-x", "/XML"]) else {
-            r.add(NAME, Level::Skip, "无法运行 schtasks");
+            r.add(NAME, Level::Skip, "cannot run schtasks");
             return;
         };
         if !ok {
             r.add(
                 NAME,
                 Level::Warn,
-                "未找到名为 agent-cli-x 的计划任务。按 README「Start at boot」配置，否则重启后对端无法访问本机",
+                "Scheduled task agent-cli-x not found. Set it up per README \"Start at boot\", or peers cannot reach this machine after a reboot",
             );
             return;
         }
         let mut problems = Vec::new();
         if xml_tag(&xml, "ExecutionTimeLimit") != Some("PT0S") {
-            problems.push("未取消运行时长限制（默认 72 小时后被停止），需 -ExecutionTimeLimit 0");
+            problems.push("run-time limit not removed (stopped after 72h by default); need -ExecutionTimeLimit 0");
         }
         if xml_tag(&xml, "DisallowStartIfOnBatteries") != Some("false") {
-            problems.push("使用电池时不会启动，需 -AllowStartIfOnBatteries");
+            problems.push("will not start on battery; need -AllowStartIfOnBatteries");
         }
         if xml_tag(&xml, "StopIfGoingOnBatteries") != Some("false") {
-            problems.push("切换到电池时会被停止，需 -DontStopIfGoingOnBatteries");
+            problems.push("stopped when switching to battery; need -DontStopIfGoingOnBatteries");
         }
         if let (Some(cmd), Ok(me)) = (xml_tag(&xml, "Command"), std::env::current_exe()) {
             let norm = |s: &str| s.trim_matches('"').replace('\\', "/").to_lowercase();
@@ -100,28 +100,28 @@ fn check_autostart(r: &mut Report) {
             let me = norm(&me.to_string_lossy());
             if cmd != me && cmd != "agent-cli-x" && cmd != "agent-cli-x.exe" {
                 problems
-                    .push("计划任务启动的程序路径与当前 agent-cli-x 不同，升级后可能仍运行旧版本");
+                    .push("task program path differs from this agent-cli-x; an old version may keep running after upgrade");
             }
         }
         if problems.is_empty() {
-            r.add(NAME, Level::Ok, "计划任务 agent-cli-x 已配置");
+            r.add(NAME, Level::Ok, "scheduled task agent-cli-x configured");
         } else {
             r.add(
                 NAME,
                 Level::Warn,
-                format!("计划任务 agent-cli-x：{}", problems.join("；")),
+                format!("scheduled task agent-cli-x: {}", problems.join("; ")),
             );
         }
     } else if cfg!(target_os = "linux") {
         check_systemd(r);
     } else {
-        r.add(NAME, Level::Skip, "当前系统不检查");
+        r.add(NAME, Level::Skip, "not checked on this OS");
     }
 }
 
 /// Linux：检查 systemd 系统服务或用户服务 agent-cli-x（以 root 作为系统服务运行也很常见）。
 fn check_systemd(r: &mut Report) {
-    const NAME: &str = "开机自启";
+    const NAME: &str = "autostart";
     let enabled = |user: bool| {
         let mut args = vec!["is-enabled", "agent-cli-x"];
         if user {
@@ -140,12 +140,16 @@ fn check_systemd(r: &mut Report) {
             r.add(
                 NAME,
                 Level::Skip,
-                "未检测到 systemd，请用系统自己的方式配置开机自启",
+                "systemd not detected; configure autostart with your OS tools",
             );
             return;
         }
         (Some("enabled"), _) => {
-            r.add(NAME, Level::Ok, "systemd 系统服务 agent-cli-x 已启用");
+            r.add(
+                NAME,
+                Level::Ok,
+                "systemd system service agent-cli-x enabled",
+            );
             false
         }
         (_, Some("enabled")) => {
@@ -157,12 +161,12 @@ fn check_systemd(r: &mut Report) {
             .map(|(_, s)| s.trim().to_string())
             .unwrap_or_default();
             if linger == "yes" {
-                r.add(NAME, Level::Ok, "systemd 用户服务已启用，linger 已开启");
+                r.add(NAME, Level::Ok, "systemd user service enabled, linger on");
             } else {
                 r.add(
                     NAME,
                     Level::Warn,
-                    "systemd 用户服务已启用，但未开启 linger：开机不会自动启动、退出登录后会停止。执行 `sudo loginctl enable-linger $USER`",
+                    "systemd user service enabled but linger is off: it will not start at boot and stops after logout. Run `sudo loginctl enable-linger $USER`",
                 );
             }
             true
@@ -171,7 +175,7 @@ fn check_systemd(r: &mut Report) {
             r.add(
                 NAME,
                 Level::Warn,
-                "systemd 服务 agent-cli-x 未启用（系统服务与用户服务都没有）。按 README「Start at boot」配置",
+                "systemd service agent-cli-x not enabled (neither system nor user service). Set it up per README \"Start at boot\"",
             );
             return;
         }
@@ -190,49 +194,56 @@ fn check_systemd(r: &mut Report) {
             "sudo systemctl daemon-reload"
         };
         r.add(
-            "后台任务",
+            "background jobs",
             Level::Warn,
             format!(
-                "KillMode={kill_mode}：重启/升级 serve 时 systemd 会连同后台任务一起终止。在 unit 的 [Service] 中加 KillMode=process，再执行 `{reload}`"
+                "KillMode={kill_mode}: systemd kills background jobs when serve restarts/upgrades. Add KillMode=process under [Service] in the unit, then run `{reload}`"
             ),
         );
     }
 }
 
 fn check_firewall(r: &mut Report, port: &str) {
-    const NAME: &str = "防火墙";
+    const NAME: &str = "firewall";
     let Ok(port) = port.parse::<u16>() else {
         return;
     };
     let fix = || {
         format!(
-            "管理员 PowerShell 执行一次: {}",
+            "Run once in admin PowerShell: {}",
             firewall::program_rule_cmd()
         )
     };
     use firewall::Status as S;
     match firewall::check(port) {
         S::NotChecked => {}
-        S::Program | S::Added => r.add(NAME, Level::Ok, "入站规则 agent-cli-x 按程序放行"),
+        S::Program | S::Added => r.add(
+            NAME,
+            Level::Ok,
+            "inbound rule agent-cli-x allows the program",
+        ),
         S::Port => r.add(
             NAME,
             Level::Ok,
-            format!("入站规则 agent-cli-x 已放行端口 {port}"),
+            format!("inbound rule agent-cli-x allows port {port}"),
         ),
         S::OtherPort => r.add(
             NAME,
             Level::Warn,
             format!(
-                "入站规则 agent-cli-x 存在，但没有放行端口 {port}。{}",
+                "inbound rule agent-cli-x exists but does not allow port {port}. {}",
                 fix()
             ),
         ),
         S::Missing => r.add(
             NAME,
             Level::Warn,
-            format!("未找到入站规则 agent-cli-x，其他机器可能连不上。{}", fix()),
+            format!(
+                "inbound rule agent-cli-x not found; other machines may fail to connect. {}",
+                fix()
+            ),
         ),
-        S::Unknown => r.add(NAME, Level::Skip, "无法运行 netsh"),
+        S::Unknown => r.add(NAME, Level::Skip, "cannot run netsh"),
     }
 }
 
@@ -246,20 +257,20 @@ pub fn run(json: bool, check_peers: bool) -> Result<i32> {
             let lg = config::last_good_path(&home);
             let extra = if config::config_path(&home).exists() && lg.exists() {
                 format!(
-                    "（serve 启动时会回退到上次可用的 {}，修复后需重启 serve）",
+                    " (serve falls back to the last good config {} on start; restart serve after fixing)",
                     lg.display()
                 )
             } else {
                 String::new()
             };
-            r.add("配置", Level::Fail, format!("{}{extra}", e.message))
+            r.add("config", Level::Fail, format!("{}{extra}", e.message))
         }
         Ok(cfg) => {
             r.add(
-                "配置",
+                "config",
                 Level::Ok,
                 format!(
-                    "{}（{}，监听 {}）",
+                    "{} ({}, listening on {})",
                     config::config_path(&home).display(),
                     cfg.node_name(),
                     cfg.listen
@@ -267,25 +278,29 @@ pub fn run(json: bool, check_peers: bool) -> Result<i32> {
             );
             if cfg.workspaces.is_empty() {
                 r.add(
-                    "工作区",
+                    "workspace",
                     Level::Warn,
-                    "未配置任何工作区，对端无法访问文件或执行命令",
+                    "no workspaces configured; peers cannot access files or run commands",
                 );
             }
             for (n, p) in &cfg.workspaces {
                 if Path::new(p).is_dir() {
-                    r.add("工作区", Level::Ok, format!("{n} = {p}"));
+                    r.add("workspace", Level::Ok, format!("{n} = {p}"));
                 } else {
-                    r.add("工作区", Level::Fail, format!("{n} = {p} 不存在或不是目录"));
+                    r.add(
+                        "workspace",
+                        Level::Fail,
+                        format!("{n} = {p} does not exist or is not a directory"),
+                    );
                 }
             }
             let fp = match tls::local_fingerprint(&home) {
                 Ok(fp) => {
-                    r.add("证书", Level::Ok, fp.clone());
+                    r.add("cert", Level::Ok, fp.clone());
                     Some(fp)
                 }
                 Err(e) => {
-                    r.add("证书", Level::Fail, e.message);
+                    r.add("cert", Level::Fail, e.message);
                     None
                 }
             };
@@ -293,14 +308,14 @@ pub fn run(json: bool, check_peers: bool) -> Result<i32> {
                 Ok(t) => r.add(
                     "token",
                     Level::Ok,
-                    format!("默认 token + {} 个调用方 token", t.tokens.len()),
+                    format!("default token + {} caller token(s)", t.tokens.len()),
                 ),
                 Err(e) => r.add("token", Level::Fail, e.message),
             }
             if let Some(fp) = fp {
                 let addr = local_connect_addr(&cfg.listen);
                 let me = Client::from_peer(
-                    "本机",
+                    "local",
                     Peer {
                         addr: addr.clone(),
                         token: cfg.token.clone(),
@@ -313,41 +328,41 @@ pub fn run(json: bool, check_peers: bool) -> Result<i32> {
                         let ver = v["version"].as_str().unwrap_or("?");
                         if ver == http::VERSION {
                             r.add(
-                                "本机服务",
+                                "local serve",
                                 Level::Ok,
                                 format!(
-                                    "serve 运行中（{addr}，pid {}，启动于 {}）",
+                                    "serve running ({addr}, pid {}, started {})",
                                     v["pid"],
                                     v["started"].as_str().unwrap_or("?")
                                 ),
                             );
                         } else {
                             r.add(
-                                "本机服务",
+                                "local serve",
                                 Level::Warn,
                                 format!(
-                                    "运行中的 serve 是 v{ver}，与本程序 v{} 不同，需要重启 serve",
+                                    "running serve is v{ver}, this binary is v{}; restart serve",
                                     http::VERSION
                                 ),
                             );
                         }
                     }
                     Err(e) if e.code == "connect" => r.add(
-                        "本机服务",
+                        "local serve",
                         Level::Fail,
-                        format!("{addr} 上没有运行 serve。执行 `agent-cli-x serve` 或检查开机自启"),
+                        format!("no serve on {addr}. Run `agent-cli-x serve` or check autostart"),
                     ),
                     Err(e) => r.add(
-                        "本机服务",
+                        "local serve",
                         Level::Fail,
-                        format!("{addr} 有服务在监听，但校验失败（可能是其他程序占用了端口）: {e}"),
+                        format!("something listens on {addr} but verification failed (port may be used by another program): {e}"),
                     ),
                 }
             }
             check_autostart(&mut r);
             check_firewall(&mut r, &listen_port(&cfg.listen));
             let logs = server::log::dir(&home);
-            r.add("日志", Level::Ok, logs.display().to_string());
+            r.add("logs", Level::Ok, logs.display().to_string());
         }
     }
 
@@ -356,13 +371,13 @@ pub fn run(json: bool, check_peers: bool) -> Result<i32> {
             .map(|p| p.peers.keys().cloned().collect())
             .unwrap_or_default();
         if peers.is_empty() {
-            r.add("对端", Level::Skip, "尚未登记对端");
+            r.add("peers", Level::Skip, "no peers registered");
         }
         for (p, res) in multi::parallel(&peers, |p| (p.to_string(), multi::probe(p))) {
             match res {
                 Ok((v, ms)) => {
                     let ver = v["version"].as_str().unwrap_or("?");
-                    let name = format!("对端 {p}");
+                    let name = format!("peer {p}");
                     if ver == http::VERSION {
                         r.add(
                             &name,
@@ -374,13 +389,13 @@ pub fn run(json: bool, check_peers: bool) -> Result<i32> {
                             &name,
                             Level::Warn,
                             format!(
-                                "版本 v{ver} 与本机 v{} 不同。执行 `agent-cli-x upgrade {p}`",
+                                "version v{ver} differs from local v{}. Run `agent-cli-x upgrade {p}`",
                                 http::VERSION
                             ),
                         );
                     }
                 }
-                Err(e) => r.add(&format!("对端 {p}"), Level::Fail, e.to_string()),
+                Err(e) => r.add(&format!("peer {p}"), Level::Fail, e.to_string()),
             }
         }
     }
@@ -397,7 +412,7 @@ pub fn run(json: bool, check_peers: bool) -> Result<i32> {
             json!({"ok": !failed, "version": http::VERSION, "checks": list})
         );
     } else {
-        println!("agent-cli-x {} 自检", http::VERSION);
+        println!("agent-cli-x {} doctor", http::VERSION);
         for (n, l, d) in &r.items {
             println!("{} {n}: {d}", l.tag());
         }

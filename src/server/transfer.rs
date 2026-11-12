@@ -26,7 +26,7 @@ fn single_name(v: &Value) -> Result<String> {
     let name = v.as_str().unwrap_or_default();
     let parts = frame::safe_rel(name)?;
     if parts.len() != 1 {
-        return Err(AppError::bad_request(format!("名称 `{name}` 无效")));
+        return Err(AppError::bad_request(format!("invalid name `{name}`")));
     }
     Ok(parts[0].clone())
 }
@@ -38,7 +38,7 @@ pub fn exclude_set(globs: &[String]) -> Result<GlobSet> {
             .literal_separator(false)
             .case_insensitive(cfg!(windows))
             .build()
-            .map_err(|e| AppError::bad_request(format!("--exclude `{g}` 无效: {e}")))?;
+            .map_err(|e| AppError::bad_request(format!("invalid --exclude `{g}`: {e}")))?;
         b.add(glob);
     }
     b.build().map_err(|e| AppError::bad_request(e.to_string()))
@@ -96,7 +96,7 @@ pub fn put<S: Read + Write>(ctx: &Ctx, len: Option<u64>, conn: &mut BufReader<S>
         Err(mut e) => {
             if let Some(id) = &op_id {
                 e.message
-                    .push_str(&format!("（已写入的部分可用 rollback {id} 撤销）"));
+                    .push_str(&format!(" (written part can be undone with rollback {id})"));
             }
             ctx.st.audit.log(
                 &ctx.ip,
@@ -127,7 +127,7 @@ fn put_inner<R: BufRead>(
     let max = ctx.st.cfg.policy.max_transfer_mb * 1024 * 1024;
     if len > max_put_bytes(ctx) {
         return Err(AppError::bad_request(format!(
-            "传输量超过 max_transfer_mb（{} MB）",
+            "transfer exceeds max_transfer_mb ({} MB)",
             ctx.st.cfg.policy.max_transfer_mb
         )));
     }
@@ -143,10 +143,12 @@ fn put_inner<R: BufRead>(
         dest_r.rel.clone()
     };
     if base_rel.is_empty() {
-        return Err(AppError::bad_request("不能覆盖工作区根目录本身"));
+        return Err(AppError::bad_request(
+            "cannot overwrite the workspace root itself",
+        ));
     }
     if kind != "f" && kind != "d" {
-        return Err(AppError::bad_request("未知的源类型"));
+        return Err(AppError::bad_request("unknown source type"));
     }
     let ws = dest_r.ws.clone();
     *op = Some(Op::new(&ctx.st.home)?);
@@ -168,7 +170,7 @@ fn put_inner<R: BufRead>(
                 }
                 if r.abs.is_file() {
                     return Err(AppError::conflict(format!(
-                        "{} 已存在同名文件",
+                        "{} already exists",
                         r.display()
                     )));
                 }
@@ -181,13 +183,16 @@ fn put_inner<R: BufRead>(
             Some("f") => {
                 let n = h["n"]
                     .as_u64()
-                    .ok_or_else(|| AppError::bad_request("文件帧缺少大小"))?;
+                    .ok_or_else(|| AppError::bad_request("file frame missing size"))?;
                 bytes += n;
                 if bytes > max {
-                    return Err(AppError::bad_request("传输量超过 max_transfer_mb"));
+                    return Err(AppError::bad_request("transfer exceeds max_transfer_mb"));
                 }
                 if r.abs.is_dir() {
-                    return Err(AppError::conflict(format!("{} 是目录", r.display())));
+                    return Err(AppError::conflict(format!(
+                        "{} is a directory",
+                        r.display()
+                    )));
                 }
                 let access = if r.exists {
                     Access::Update
@@ -198,7 +203,7 @@ fn put_inner<R: BufRead>(
                 let parent = r
                     .abs
                     .parent()
-                    .ok_or_else(|| AppError::bad_request("无效路径"))?
+                    .ok_or_else(|| AppError::bad_request("invalid path"))?
                     .to_path_buf();
                 match op.as_mut() {
                     Some(o) => o.create_dirs(&r.root, &parent, &r.ws)?,
@@ -232,7 +237,7 @@ fn put_inner<R: BufRead>(
                 }
                 files += 1;
             }
-            _ => return Err(AppError::bad_request("未知的条目类型")),
+            _ => return Err(AppError::bad_request("unknown entry type")),
         }
     }
     Ok(json!({"dest": format!("{ws}:{base_rel}"), "files": files, "dirs": dirs, "bytes": bytes}))
@@ -269,7 +274,7 @@ pub fn get<W: Write>(ctx: &Ctx, body: Value, w: &mut W) {
             serde_json::from_value(body).map_err(|e| AppError::bad_request(e.to_string()))?;
         let r = ctx.st.ws.resolve(&req.src)?;
         if !r.exists {
-            return Err(AppError::not_found(format!("不存在: {}", r.display())));
+            return Err(AppError::not_found(format!("not found: {}", r.display())));
         }
         let ex = exclude_set(&req.exclude)?;
         let name = r
@@ -350,7 +355,7 @@ pub fn get<W: Write>(ctx: &Ctx, body: Value, w: &mut W) {
             bytes += n;
             if bytes > max {
                 return Err(AppError::bad_request(format!(
-                    "传输量超过 max_transfer_mb（{} MB），请用 --exclude 缩小范围",
+                    "transfer exceeds max_transfer_mb ({} MB); narrow with --exclude",
                     ctx.st.cfg.policy.max_transfer_mb
                 )));
             }

@@ -393,12 +393,12 @@ fn identity_grep_transfer_jobs() {
     let env = setup();
     let c = &env.client_home;
 
-    // 机器标识：init 生成 UUID，info / peer list 可见
+    // 机器标识：init 生成短 ID，info / peer list 可见
     let who = run(&env.server_home, &["whoami", "--json"]);
     assert!(who.status.success(), "{}", text(&who));
     let who: serde_json::Value = serde_json::from_slice(&who.stdout).unwrap();
     let node_id = who["node_id"].as_str().unwrap().to_string();
-    assert_eq!(node_id.len(), 36);
+    assert_eq!(node_id.len(), 6);
     let info: serde_json::Value =
         serde_json::from_slice(&run(c, &["info", "b", "--json"]).stdout).unwrap();
     assert_eq!(info["node_id"], node_id.as_str());
@@ -562,10 +562,10 @@ fn identity_grep_transfer_jobs() {
     assert!(o.status.success(), "{}", text(&o));
     let o = run(c, &["write", "b", "proj:drafts/old.md", "--content", "x"]);
     assert_eq!(o.status.code(), Some(102), "{}", text(&o));
-    assert!(text(&o).contains("不允许修改"), "{}", text(&o));
+    assert!(text(&o).contains("does not allow update"), "{}", text(&o));
     let o = run(c, &["rm", "b", "proj:drafts/old.md"]);
     assert_eq!(o.status.code(), Some(102), "{}", text(&o));
-    assert!(text(&o).contains("不允许删除"), "{}", text(&o));
+    assert!(text(&o).contains("does not allow delete"), "{}", text(&o));
     assert!(env.ws.join("drafts/old.md").is_file());
     // 只读目录与硬性禁止目录都不能删除
     assert_eq!(
@@ -638,7 +638,7 @@ fn identity_grep_transfer_jobs() {
     // 删除单个文件
     let o = run(c, &["rm", "b", "--permanent", "proj:trash/a.txt"]);
     assert!(o.status.success(), "{}", text(&o));
-    assert!(text(&o).contains("已彻底删除"), "{}", text(&o));
+    assert!(text(&o).contains("Permanently deleted"), "{}", text(&o));
     assert!(!env.ws.join("trash/a.txt").exists());
     assert_eq!(
         run(c, &["rm", "b", "proj:trash/a.txt"]).status.code(),
@@ -687,9 +687,10 @@ fn identity_grep_transfer_jobs() {
         assert_eq!(parts[3], "[]", "{out}");
         let o = run(c, &["info", "b", "--json"]);
         let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
-        // init 模板不写 prewarm_shells → 按内存自动决定，范围 1～4
+        // init 模板不写 prewarm_shells → 按内存自动决定，范围 1～2；空闲释放默认 600 秒
         let size = v["prewarm"]["size"].as_u64().unwrap_or(0);
-        assert!((1..=4).contains(&size), "{}", text(&o));
+        assert!((1..=2).contains(&size), "{}", text(&o));
+        assert_eq!(v["prewarm"]["idle_secs"], 600, "{}", text(&o));
         assert_eq!(v["prewarm"]["auto"], true, "{}", text(&o));
     }
 
@@ -813,7 +814,7 @@ fn tokens_multi_peer_doctor() {
     let o = run(c, &["info", "@all"]);
     assert!(o.status.success(), "{}", text(&o));
     assert!(
-        String::from_utf8_lossy(&o.stdout).contains("在线"),
+        String::from_utf8_lossy(&o.stdout).contains("online"),
         "{}",
         text(&o)
     );
@@ -831,13 +832,13 @@ fn tokens_multi_peer_doctor() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|x| x["check"] == "本机服务")
+        .find(|x| x["check"] == "local serve")
         .cloned()
         .unwrap_or_default();
     assert_eq!(svc["status"], "ok", "{v}");
     // 客户端视角检查对端
     let o = run(c, &["doctor", "--json"]);
-    assert!(text(&o).contains("对端 b"), "{}", text(&o));
+    assert!(text(&o).contains("peer b"), "{}", text(&o));
 
     // serve 日志落盘
     let logs: Vec<_> = fs::read_dir(s.join("serve-logs"))
@@ -846,7 +847,7 @@ fn tokens_multi_peer_doctor() {
         .collect();
     assert!(!logs.is_empty());
     let log = fs::read_to_string(logs[0].path()).unwrap();
-    assert!(log.contains("服务已启动"), "{log}");
+    assert!(log.contains("serving"), "{log}");
 
     // 更换默认 token：旧的立即作废
     assert!(run(s, &["token", "rotate", "default"]).status.success());
@@ -900,7 +901,7 @@ fn upgrade_restarts_server() {
     let o = run(c, &["job", "logs", "b", &id]);
     assert_eq!(o.status.code(), Some(0), "{}", text(&o));
     assert!(text(&o).contains("before-upgrade"), "{}", text(&o));
-    assert!(text(&o).contains("仍在运行"), "{}", text(&o));
+    assert!(text(&o).contains("still running"), "{}", text(&o));
     assert!(run(c, &["job", "kill", "b", &id]).status.success());
     let o = run(c, &["job", "logs", "b", &id]);
     assert_eq!(o.status.code(), Some(137), "{}", text(&o));
@@ -909,7 +910,11 @@ fn upgrade_restarts_server() {
     let o = run(c, &["exec", "b", "--detach", "--json", slow]);
     let id = json_of(&o)["job_id"].as_str().unwrap().to_string();
     let o = run(c, &["restart", "b"]);
-    assert!(text(&o).contains("1 个后台任务继续运行"), "{}", text(&o));
+    assert!(
+        text(&o).contains("1 background jobs still running"),
+        "{}",
+        text(&o)
+    );
     let pid2 = json_of(&run(c, &["info", "b", "--json"]))["pid"]
         .as_u64()
         .unwrap();
@@ -924,7 +929,7 @@ fn upgrade_restarts_server() {
     kill_pid(m["pid"].as_u64().unwrap());
     let o = wait_code(c, &["job", "logs", "b", &id], 1);
     assert_eq!(o.status.code(), Some(1), "{}", text(&o));
-    assert!(text(&o).contains("执行进程已不在"), "{}", text(&o));
+    assert!(text(&o).contains("job process is gone"), "{}", text(&o));
     assert_eq!(
         json_of(&run(c, &["info", "b", "--json"]))["running_jobs"],
         0
@@ -954,7 +959,7 @@ fn cp_purge_script_info() {
         feats.contains(&"put_stream") && feats.contains(&"purge"),
         "{v}"
     );
-    assert!(text(&run(c, &["info", "b"])).contains("exec 身份"));
+    assert!(text(&run(c, &["info", "b"])).contains("exec identity"));
 
     // peer list：缓存缺系统信息时自动联网补全
     let peers = c.join("peers.toml");
@@ -967,10 +972,10 @@ fn cp_purge_script_info() {
     fs::write(&peers, stripped).unwrap();
     let o = run(c, &["peer", "list"]);
     assert!(o.status.success(), "{}", text(&o));
-    assert!(text(&o).contains("已联网补全"), "{}", text(&o));
+    assert!(text(&o).contains("fetched system info for"), "{}", text(&o));
     assert!(fs::read_to_string(&peers).unwrap().contains("os ="));
     // 已补全后不再联网
-    assert!(!text(&run(c, &["peer", "list"])).contains("已联网补全"));
+    assert!(!text(&run(c, &["peer", "list"])).contains("fetched system info for"));
 
     // cp：对端之间直接中转（这里源和目标是同一台，同样走 get → put 流）
     fs::create_dir_all(env.ws.join("pkg/sub")).unwrap();
@@ -1012,7 +1017,7 @@ fn cp_purge_script_info() {
     // 单个文件改名复制
     let o = run(c, &["cp", "b", "proj:pkg/sub/b.txt", "b", "proj:out/c.txt"]);
     assert!(o.status.success(), "{}", text(&o));
-    assert!(text(&o).contains("已复制 1 个文件"), "{}", text(&o));
+    assert!(text(&o).contains("Copied 1 files"), "{}", text(&o));
     assert_eq!(fs::read_to_string(env.ws.join("out/c.txt")).unwrap(), "B");
     // 目标只读：由目标端拒绝（102）
     let o = run(c, &["cp", "b", "proj:pkg", "b", "proj:docs"]);
@@ -1060,7 +1065,7 @@ fn cp_purge_script_info() {
     let op = json_of(&o)["op_id"].as_str().unwrap().to_string();
     let o = run(c, &["purge", "b", &op]);
     assert!(o.status.success(), "{}", text(&o));
-    assert!(text(&o).contains("备份副本"), "{}", text(&o));
+    assert!(text(&o).contains("backup copies"), "{}", text(&o));
     assert_eq!(fs::read_to_string(env.ws.join("out/c.txt")).unwrap(), "C");
 
     // exec --script：多行脚本免转义，CRLF 也能在 sh 下运行
@@ -1167,7 +1172,7 @@ fn no_relay_blocks_hop() {
     // 受限：借道、凭据管理被拒（102），--env 也清不掉标记
     let o = run(c, &["exec", "g", &hop]);
     assert_eq!(o.status.code(), Some(102), "{}", text(&o));
-    assert!(text(&o).contains("禁止借道"), "{}", text(&o));
+    assert!(text(&o).contains("not allowed to relay"), "{}", text(&o));
     let o = run(c, &["exec", "g", "--env", "AGENT_CLI_X_NO_RELAY=", &hop]);
     assert_eq!(o.status.code(), Some(102), "{}", text(&o));
     for args in ["token add evil", "whoami --pair", "peer list"] {
@@ -1191,7 +1196,7 @@ fn no_relay_blocks_hop() {
     let v = json_of(&run(c, &["info", "g", "--json"]));
     assert_eq!(v["caller"], "guest", "{v}");
     assert_eq!(v["caller_no_relay"], true, "{v}");
-    assert!(text(&run(c, &["info", "g"])).contains("禁止借道"));
+    assert!(text(&run(c, &["info", "g"])).contains("Relay barred"));
 
     // 取消限制后几秒内生效
     let o = run(s, &["token", "set", "guest", "--allow-relay"]);
@@ -1250,7 +1255,7 @@ fn output_limits_save_context() {
         "{out}"
     );
     assert!(out.trim_end().ends_with("line1000"), "{out}");
-    assert!(text(&o).contains("中间省略 800 行"), "{}", text(&o));
+    assert!(text(&o).contains("800 lines omitted"), "{}", text(&o));
 
     let o = run(c, &["exec", "b", "--json", many]);
     assert!(o.status.success(), "{}", text(&o));
@@ -1258,7 +1263,7 @@ fn output_limits_save_context() {
     assert_eq!(v["truncated"], true, "{v}");
     assert_eq!(v["omitted_lines"], 800, "{v}");
     let stdout = v["stdout"].as_str().unwrap();
-    assert!(stdout.contains("中间省略 800 行"), "{stdout}");
+    assert!(stdout.contains("800 lines omitted"), "{stdout}");
     assert!(stdout.lines().count() < 210, "{stdout}");
     let log = v["log"].as_str().unwrap();
     let full = fs::read_to_string(log).unwrap();
@@ -1351,7 +1356,7 @@ fn restart_set_port_config_fallback() {
     assert_eq!(run(s, &["serve", "--check"]).status.code(), Some(109));
     let o = run(c, &["restart", "b"]);
     assert_eq!(o.status.code(), Some(109), "{}", text(&o));
-    assert!(text(&o).contains("已取消"), "{}", text(&o));
+    assert!(text(&o).contains("cancelled"), "{}", text(&o));
     assert_eq!(server_pid(c), pid1);
     fs::write(&cfg_path, &good).unwrap();
     assert!(run(s, &["serve", "--check"]).status.success());
@@ -1404,8 +1409,8 @@ fn restart_set_port_config_fallback() {
             .contains("bogus_key"),
         "{v}"
     );
-    assert!(text(&run(c, &["info", "b"])).contains("配置异常"));
-    assert!(text(&run(c, &["info", "@all"])).contains("配置异常"));
+    assert!(text(&run(c, &["info", "b"])).contains("Config error"));
+    assert!(text(&run(c, &["info", "@all"])).contains("config error"));
     assert_eq!(run(c, &["restart", "b"]).status.code(), Some(109));
     let o = run(c, &["set-port", "b", &free_port().to_string()]);
     assert_eq!(o.status.code(), Some(105), "{}", text(&o));
@@ -1426,7 +1431,7 @@ fn restart_set_port_config_fallback() {
     fs::write(c.join("peers.toml"), peers).unwrap();
     let o = run(c, &["info", "b"]);
     assert_eq!(o.status.code(), Some(100), "{}", text(&o));
-    assert!(text(&o).contains("TCP 已连上"), "{}", text(&o));
+    assert!(text(&o).contains("TCP connected"), "{}", text(&o));
     let _ = child.kill();
     let _ = child.wait();
 }

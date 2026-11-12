@@ -23,7 +23,7 @@ pub fn fingerprint(der: &[u8]) -> String {
 
 pub fn generate(home: &Path) -> Result<String> {
     let ck = rcgen::generate_simple_self_signed(vec!["agent-cli-x".to_string()])
-        .map_err(|e| AppError::internal(format!("生成证书失败: {e}")))?;
+        .map_err(|e| AppError::internal(format!("failed to generate certificate: {e}")))?;
     let cert = ck.cert.der().to_vec();
     let key = ck.key_pair.serialize_der();
     fs::create_dir_all(home)?;
@@ -35,16 +35,22 @@ pub fn generate(home: &Path) -> Result<String> {
 }
 
 pub fn local_fingerprint(home: &Path) -> Result<String> {
-    let cert = fs::read(home.join("cert.der"))
-        .map_err(|e| AppError::config(format!("读取证书失败: {e}。请先执行 `agent-cli-x init`")))?;
+    let cert = fs::read(home.join("cert.der")).map_err(|e| {
+        AppError::config(format!(
+            "failed to read certificate: {e}. Run `agent-cli-x init` first"
+        ))
+    })?;
     Ok(fingerprint(&cert))
 }
 
 pub fn server_config(home: &Path) -> Result<(Arc<ServerConfig>, String)> {
-    let cert = fs::read(home.join("cert.der"))
-        .map_err(|e| AppError::config(format!("读取证书失败: {e}。请先执行 `agent-cli-x init`")))?;
+    let cert = fs::read(home.join("cert.der")).map_err(|e| {
+        AppError::config(format!(
+            "failed to read certificate: {e}. Run `agent-cli-x init` first"
+        ))
+    })?;
     let key = fs::read(home.join("key.der"))
-        .map_err(|e| AppError::config(format!("读取私钥失败: {e}")))?;
+        .map_err(|e| AppError::config(format!("failed to read private key: {e}")))?;
     let fp = fingerprint(&cert);
     let cfg = ServerConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
@@ -54,7 +60,7 @@ pub fn server_config(home: &Path) -> Result<(Arc<ServerConfig>, String)> {
             vec![CertificateDer::from(cert)],
             PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key)),
         )
-        .map_err(|e| AppError::config(format!("证书/私钥无效: {e}")))?;
+        .map_err(|e| AppError::config(format!("invalid certificate/private key: {e}")))?;
     Ok((Arc::new(cfg), fp))
 }
 

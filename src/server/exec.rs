@@ -119,24 +119,26 @@ pub(super) fn prepare(
     max_timeout: u64,
 ) -> Result<Prepared> {
     let req: ExecReq = serde_json::from_value(body)
-        .map_err(|e| AppError::bad_request(format!("参数错误: {e}")))?;
+        .map_err(|e| AppError::bad_request(format!("bad params: {e}")))?;
     if req.cmd.trim().is_empty() {
-        return Err(AppError::bad_request("命令为空"));
+        return Err(AppError::bad_request("empty command"));
     }
     let policy = &ctx.st.cfg.policy;
     if let Some(rule) = denied_command(&req.cmd, &policy.deny_commands) {
-        return Err(AppError::denied(format!("命令命中黑名单规则 `{rule}`")));
+        return Err(AppError::denied(format!(
+            "command matches denylist rule `{rule}`"
+        )));
     }
     let spec = req.cwd.unwrap_or_default();
     if spec.is_empty() && ctx.st.ws.default_name().is_none() {
         return Err(AppError::bad_request(
-            "未指定 --cwd，且服务端没有默认工作区",
+            "no --cwd given and server has no default workspace",
         ));
     }
     let cwd = ctx.st.ws.resolve(&spec)?;
     if !cwd.abs.is_dir() {
         return Err(AppError::not_found(format!(
-            "工作目录不存在: {}",
+            "working dir not found: {}",
             cwd.display()
         )));
     }
@@ -235,7 +237,7 @@ pub fn run<W: Write>(ctx: &Ctx, body: Value, w: &mut W) {
     let (mut child, warm): (Child, bool) = match spawn(ctx, &mut p) {
         Ok(c) => c,
         Err(e) => {
-            let err = AppError::io(format!("启动 {} 失败: {e}", p.shell.name()));
+            let err = AppError::io(format!("failed to start {}: {e}", p.shell.name()));
             ctx.st.audit.log(
                 &ctx.ip,
                 &ctx.caller,

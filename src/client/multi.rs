@@ -36,7 +36,7 @@ pub fn resolve(spec: &str) -> Result<Vec<String>> {
     };
     if names.is_empty() {
         return Err(AppError::config(
-            "没有可用的对端。请先执行 `agent-cli-x peer add`",
+            "no peers available. Run `agent-cli-x peer add` first",
         ));
     }
     let unknown: Vec<&String> = names
@@ -46,7 +46,7 @@ pub fn resolve(spec: &str) -> Result<Vec<String>> {
     if !unknown.is_empty() {
         let known: Vec<_> = peers.peers.keys().cloned().collect();
         return Err(AppError::config(format!(
-            "未知对端 {}（已登记: {}）",
+            "unknown peer {} (registered: {})",
             unknown
                 .iter()
                 .map(|s| format!("`{s}`"))
@@ -72,7 +72,7 @@ pub fn parallel<T: Send + 'static>(
         .collect();
     handles
         .into_iter()
-        .map(|h| h.join().expect("工作线程异常退出"))
+        .map(|h| h.join().expect("worker thread panicked"))
         .collect()
 }
 
@@ -154,7 +154,7 @@ fn exec_one(peer: &str, body: &Value, read_timeout: Duration) -> ExecResult {
         Err(e) => r.error = Some(e),
         Ok(()) if r.exit.is_none() => {
             r.error = Some(AppError::connect(
-                "连接中断，未收到命令退出码（命令可能仍在对端运行）",
+                "connection lost before the exit code arrived (command may still be running on the peer)",
             ))
         }
         Ok(()) => {}
@@ -200,7 +200,7 @@ fn print_output(r: &ExecResult, full: bool) -> bool {
     }
     if r.dropped {
         eprintln!(
-            "[agent-cli-x: 输出过大，内存中只保留前 {} MB，完整输出: {}]",
+            "[agent-cli-x: output too large, only the first {} MB kept in memory, full output: {}]",
             MEM_CAP / 1024 / 1024,
             r.log
                 .as_ref()
@@ -232,7 +232,7 @@ pub fn exec_many(
             .collect();
         handles
             .into_iter()
-            .map(|h| h.join().expect("工作线程异常退出"))
+            .map(|h| h.join().expect("worker thread panicked"))
             .collect()
     };
     let overall = results
@@ -287,9 +287,9 @@ pub fn exec_many(
     let mut failed = Vec::new();
     for r in &results {
         let status = match &r.error {
-            Some(e) => format!("失败 {e}"),
-            None if r.code() == 104 => "超时".to_string(),
-            None => format!("退出码 {}", r.code()),
+            Some(e) => format!("failed {e}"),
+            None if r.code() == 104 => "timeout".to_string(),
+            None => format!("exit code {}", r.code()),
         };
         println!(
             "===== {} · {status} · {:.1}s =====",
@@ -307,7 +307,7 @@ pub fn exec_many(
         }
     }
     eprintln!(
-        "[agent-cli-x: 共 {} 个对端，成功 {}，失败 {}{}]",
+        "[agent-cli-x: {} peers, {} ok, {} failed{}]",
         results.len(),
         results.len() - failed.len(),
         failed.len(),
@@ -359,24 +359,24 @@ pub fn info_many(peers: &[String], json: bool) -> i32 {
             Ok((v, ms)) => {
                 let ver = v["version"].as_str().unwrap_or("?");
                 let warn = if v["config_error"].is_string() {
-                    format!("\t配置异常，见 `agent-cli-x info {p}`")
+                    format!("\tconfig error, see `agent-cli-x info {p}`")
                 } else {
                     String::new()
                 };
                 println!(
-                    "{p}\t在线\t{} ({})\t{}/{}\tv{ver}{}\t{ms}ms{warn}",
+                    "{p}\tonline\t{} ({})\t{}/{}\tv{ver}{}\t{ms}ms{warn}",
                     v["node_name"].as_str().unwrap_or("?"),
                     v["node_id"].as_str().unwrap_or("-"),
                     v["os"].as_str().unwrap_or("?"),
                     v["arch"].as_str().unwrap_or("?"),
                     if ver != http::VERSION {
-                        format!("（本机 v{}）", http::VERSION)
+                        format!(" (local v{})", http::VERSION)
                     } else {
                         String::new()
                     }
                 );
             }
-            Err(e) => println!("{p}\t不可用\t{e}"),
+            Err(e) => println!("{p}\tunavailable\t{e}"),
         }
     }
     overall

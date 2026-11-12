@@ -2,34 +2,49 @@
 //!
 //! 每条命令仍在全新进程中运行（不共享 cd / 变量 / 环境），只是省掉 PowerShell 的冷启动时间。
 //! 池为空、shell 类型不匹配或预热进程已失效时，调用方退回冷启动。
+//! 连续 `idle_secs` 秒无人取用时释放全部空闲进程，下一次取用（冷启动）时再补满。
 
 use crate::platform::{self, Shell};
 use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
+use std::time::{Duration, Instant};
 
 pub struct WarmPool {
     /// 预热的 shell 类型；None 表示不预热（非 PowerShell 或配置为 0）
     shell: Option<Shell>,
     size: usize,
+    /// 无人取用多少秒后释放空闲进程；0 表示常驻
+    idle_secs: u64,
     state: Mutex<State>,
 }
 
 /// 空闲进程与正在启动中的数量放在同一把锁里，计算缺口时不会重复补充。
-#[derive(Default)]
 struct State {
     idle: Vec<Child>,
     starting: usize,
+    /// 最近一次取用（或启动）的时间，用于空闲释放
+    last_use: Instant,
 }
 
 impl WarmPool {
-    pub fn new(shell: Shell, size: usize) -> Arc<Self> {
+    pub fn new(shell: Shell, size: usize, idle_secs: u64) -> Arc<Self> {
         let enabled = size > 0 && shell.is_powershell();
-        Arc::new(Self {
+        let pool = Arc::new(Self {
             shell: enabled.then_some(shell),
             size: if enabled { size } else { 0 },
-            state: Mutex::new(State::default()),
-        })
+            idle_secs,
+            state: Mutex::new(State {
+                idle: Vec::new(),
+                starting: 0,
+                last_use: Instant::now(),
+            }),
+        });
+        if enabled && idle_secs > 0 {
+            let p = Arc::clone(&pool);
+            thread::spawn(move || p.reap_loop());
+        }
+        pool
     }
 
     pub fn shell(&self) -> Option<Shell> {
@@ -55,6 +70,7 @@ impl WarmPool {
         }
         let got = {
             let mut st = self.lock();
+            st.last_use = Instant::now();
             let mut got = None;
             while let Some(mut c) = st.idle.pop() {
                 if matches!(c.try_wait(), Ok(None)) {
@@ -89,6 +105,26 @@ impl WarmPool {
                     st.idle.push(c);
                 }
             });
+        }
+    }
+
+    /// 定期检查：超过 idle_secs 无人取用就结束全部空闲进程（启动中的补上来后由下一轮清掉）。
+    fn reap_loop(&self) {
+        let limit = Duration::from_secs(self.idle_secs);
+        let tick = limit.min(Duration::from_secs(30));
+        loop {
+            thread::sleep(tick);
+            let drained: Vec<Child> = {
+                let mut st = self.lock();
+                if st.idle.is_empty() || st.last_use.elapsed() < limit {
+                    continue;
+                }
+                st.idle.drain(..).collect()
+            };
+            for mut c in drained {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
         }
     }
 }

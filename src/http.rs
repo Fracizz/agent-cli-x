@@ -37,15 +37,15 @@ fn read_line<R: BufRead>(r: &mut R) -> Result<String> {
         .take(MAX_LINE as u64 + 1)
         .read_until(b'\n', &mut buf)?;
     if n == 0 {
-        return Err(AppError::io("连接已关闭"));
+        return Err(AppError::io("connection closed"));
     }
     if !buf.ends_with(b"\n") {
-        return Err(AppError::bad_request("HTTP 行过长或不完整"));
+        return Err(AppError::bad_request("HTTP line too long or incomplete"));
     }
     while matches!(buf.last(), Some(b'\n' | b'\r')) {
         buf.pop();
     }
-    String::from_utf8(buf).map_err(|_| AppError::bad_request("HTTP 头不是 UTF-8"))
+    String::from_utf8(buf).map_err(|_| AppError::bad_request("HTTP header is not UTF-8"))
 }
 
 fn read_headers<R: BufRead>(r: &mut R) -> Result<Vec<(String, String)>> {
@@ -56,7 +56,7 @@ fn read_headers<R: BufRead>(r: &mut R) -> Result<Vec<(String, String)>> {
             return Ok(headers);
         }
         if headers.len() >= MAX_HEADERS {
-            return Err(AppError::bad_request("HTTP 头过多"));
+            return Err(AppError::bad_request("too many HTTP headers"));
         }
         if let Some((k, v)) = line.split_once(':') {
             headers.push((k.trim().to_string(), v.trim().to_string()));
@@ -71,7 +71,7 @@ pub fn read_request_head<R: BufRead>(r: &mut R) -> Result<Request> {
     let method = parts.next().unwrap_or_default().to_string();
     let path = parts.next().unwrap_or_default().to_string();
     if method.is_empty() || !path.starts_with('/') {
-        return Err(AppError::bad_request("无效的 HTTP 请求行"));
+        return Err(AppError::bad_request("invalid HTTP request line"));
     }
     let headers = read_headers(r)?;
     let content_length = headers
@@ -79,7 +79,7 @@ pub fn read_request_head<R: BufRead>(r: &mut R) -> Result<Request> {
         .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
         .map(|(_, v)| v.parse::<u64>())
         .transpose()
-        .map_err(|_| AppError::bad_request("Content-Length 无效"))?
+        .map_err(|_| AppError::bad_request("invalid Content-Length"))?
         .unwrap_or(0);
     Ok(Request {
         method,
@@ -93,7 +93,7 @@ pub fn read_request_head<R: BufRead>(r: &mut R) -> Result<Request> {
 pub fn read_body<R: Read>(r: &mut R, len: u64, max_body: usize) -> Result<Vec<u8>> {
     if len > max_body as u64 {
         return Err(AppError::bad_request(format!(
-            "请求体过大（{len} 字节，上限 {max_body}）"
+            "request body too large ({len} bytes, max {max_body})"
         )));
     }
     let mut body = vec![0u8; len as usize];
@@ -212,7 +212,7 @@ pub fn read_response_head<R: BufRead>(r: &mut R) -> Result<ResponseHead> {
         .split_whitespace()
         .nth(1)
         .and_then(|s| s.parse::<u16>().ok())
-        .ok_or_else(|| AppError::internal(format!("无效的响应行: {line}")))?;
+        .ok_or_else(|| AppError::internal(format!("invalid response line: {line}")))?;
     let headers = read_headers(r)?;
     Ok(ResponseHead { status, headers })
 }
@@ -223,7 +223,7 @@ pub fn remote_error(v: &Value, status: u16) -> AppError {
     let msg = v["error"]["message"]
         .as_str()
         .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("服务端返回 HTTP {status}"));
+        .unwrap_or_else(|| format!("server returned HTTP {status}"));
     AppError::new(code, msg)
 }
 

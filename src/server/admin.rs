@@ -122,7 +122,7 @@ pub fn preflight(home: &Path) -> Result<()> {
     })();
     r.map_err(|e: AppError| {
         AppError::config(format!(
-            "{}\n配置有误，重启后服务将无法启动，已取消。修复后再试（在该机器上可用 `agent-cli-x serve --check` 校验）",
+            "{}\nConfig invalid, serve would fail to start after restart; cancelled. Fix and retry (validate on that machine with `agent-cli-x serve --check`)",
             e.message.trim_end()
         ))
     })
@@ -131,7 +131,7 @@ pub fn preflight(home: &Path) -> Result<()> {
 /// `/v1/restart`：预检配置 → 返回响应 → 重启自身。
 pub fn restart<W: Write>(ctx: &Ctx, body: Value, w: &mut W) {
     let force = body["force"].as_bool().unwrap_or(false);
-    let res = upgrade::jobs_on_restart(ctx, force, "重启").and_then(|(interrupted, kept)| {
+    let res = upgrade::jobs_on_restart(ctx, force, "restart").and_then(|(interrupted, kept)| {
         preflight(&ctx.st.home)?;
         Ok(json!({
             "pid": std::process::id(),
@@ -150,7 +150,7 @@ pub fn restart<W: Write>(ctx: &Ctx, body: Value, w: &mut W) {
     );
     match res {
         Ok(v) => {
-            crate::slog!("由 {}@{} 请求重启", ctx.caller, ctx.ip);
+            crate::slog!("restart requested by {}@{}", ctx.caller, ctx.ip);
             let _ = http::write_json(w, 200, &v);
             let _ = w.flush();
             upgrade::schedule_restart();
@@ -168,18 +168,18 @@ pub fn port(ctx: &Ctx, body: Value) -> Result<Value> {
         let p = ctx.st.net.lock().pending.take();
         if let Some(p) = &p {
             p.handle.close();
-            crate::slog!("已撤销新端口 {}", p.handle.addr);
+            crate::slog!("new port {} revoked", p.handle.addr);
         }
         return Ok(json!({"aborted": p.is_some()}));
     }
     let port = body["port"]
         .as_u64()
         .filter(|p| (1..=65535).contains(p))
-        .ok_or_else(|| AppError::bad_request("port 无效（1-65535）"))? as u16;
+        .ok_or_else(|| AppError::bad_request("invalid port (1-65535)"))? as u16;
     match action {
         "open" => open(ctx, port),
         "commit" => commit(ctx, port),
-        other => Err(AppError::bad_request(format!("未知 action `{other}`"))),
+        other => Err(AppError::bad_request(format!("unknown action `{other}`"))),
     }
 }
 
@@ -187,24 +187,24 @@ fn open(ctx: &Ctx, port: u16) -> Result<Value> {
     let st = &ctx.st;
     if let Some(e) = &st.config_error {
         return Err(AppError::conflict(format!(
-            "该机器正在用上次可用的配置运行（config.toml 有误: {e}），先修复 config.toml 再改端口"
+            "Running on the last good config (config.toml invalid: {e}); fix config.toml before changing the port"
         )));
     }
     let cur = st.net.listen();
     let addr = config::with_port(&cur, port);
     if addr == cur {
-        return Err(AppError::bad_request(format!("已经在监听 {cur}")));
+        return Err(AppError::bad_request(format!("already listening on {cur}")));
     }
     let listener = TcpListener::bind(&addr).map_err(|e| match e.kind() {
         std::io::ErrorKind::AddrInUse => {
-            AppError::conflict(format!("端口 {port} 已被其他程序占用，换一个端口"))
+            AppError::conflict(format!("port {port} is in use by another program; pick another"))
         }
         // Windows 对系统保留（Hyper-V 等排除范围）或被独占的端口返回 WSAEACCES
         std::io::ErrorKind::PermissionDenied => AppError::conflict(format!(
-            "端口 {port} 被系统保留或被其他程序独占，换一个端口\
-（Windows 可用 `netsh int ipv4 show excludedportrange protocol=tcp` 查看保留范围）"
+            "port {port} is reserved by the system or held exclusively by another program; pick another \
+(on Windows see reserved ranges with `netsh int ipv4 show excludedportrange protocol=tcp`)"
         )),
-        _ => AppError::io(format!("监听 {addr} 失败: {e}")),
+        _ => AppError::io(format!("listen on {addr} failed: {e}")),
     })?;
     let handle = spawn_accept(st, listener, &addr)?;
     let id = st.net.next_id.fetch_add(1, Ordering::SeqCst);
@@ -220,7 +220,7 @@ fn open(ctx: &Ctx, port: u16) -> Result<Value> {
         if g.pending.as_ref().is_some_and(|p| p.id == id) {
             if let Some(p) = g.pending.take() {
                 p.handle.close();
-                crate::slog!("新端口 {} 超时未确认，已关闭", p.handle.addr);
+                crate::slog!("new port {} not confirmed in time, closed", p.handle.addr);
             }
         }
     });
@@ -228,10 +228,10 @@ fn open(ctx: &Ctx, port: u16) -> Result<Value> {
     let mut fw = firewall::check(port);
     if fw.blocked() && platform::is_elevated() && firewall::add_program_rule() {
         fw = firewall::Status::Added;
-        crate::slog!("已添加防火墙入站规则 agent-cli-x（按程序放行）");
+        crate::slog!("added inbound firewall rule agent-cli-x (per program)");
     }
     crate::slog!(
-        "已在 {addr} 上开始监听，等待确认（{}@{}）",
+        "listening on {addr}, awaiting confirmation ({}@{})",
         ctx.caller,
         ctx.ip
     );
@@ -252,16 +252,16 @@ fn commit(ctx: &Ctx, port: u16) -> Result<Value> {
     let mut g = st.net.lock();
     if !g.pending.as_ref().is_some_and(|p| p.port == port) {
         return Err(AppError::conflict(format!(
-            "没有待确认的端口 {port}（可能已超过 {PENDING_SECS} 秒）。请重新执行 set-port"
+            "no pending port {port} (may have exceeded {PENDING_SECS}s). Run set-port again"
         )));
     }
     if ctx.local_port != port {
         return Err(AppError::conflict(format!(
-            "确认请求必须经由新端口 {port} 发送（本次来自端口 {}）",
+            "confirm must be sent via new port {port} (this came from port {})",
             ctx.local_port
         )));
     }
-    let p = g.pending.take().expect("上面已检查");
+    let p = g.pending.take().expect("checked above");
     if let Err(e) = config::replace_config_listen(&st.home, &p.handle.addr) {
         p.handle.close();
         return Err(e);
@@ -276,7 +276,7 @@ fn commit(ctx: &Ctx, port: u16) -> Result<Value> {
         h.close();
     }
     crate::slog!(
-        "监听地址已由 {old_addr} 改为 {new_addr}（{}@{}），已写入 config.toml",
+        "listen address changed from {old_addr} to {new_addr} ({}@{}), saved to config.toml",
         ctx.caller,
         ctx.ip
     );

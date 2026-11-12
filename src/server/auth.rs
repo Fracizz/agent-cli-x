@@ -70,7 +70,7 @@ impl Auth {
                     .collect();
             }
             // 解析失败时保留旧列表，避免一次误编辑让所有调用方掉线
-            Err(e) => crate::slog!("tokens.toml 加载失败，继续使用旧的 token 列表: {e}"),
+            Err(e) => crate::slog!("tokens.toml load failed, keeping old token list: {e}"),
         }
     }
 
@@ -81,15 +81,15 @@ impl Auth {
             match config::read_config_token(&self.home) {
                 Some(t) if t != g.default => {
                     g.default = t;
-                    crate::slog!("已重新加载 config.toml 中的默认 token");
+                    crate::slog!("reloaded default token from config.toml");
                 }
                 Some(_) => {}
-                None => crate::slog!("config.toml 中的 token 无效，继续使用旧的默认 token"),
+                None => crate::slog!("token in config.toml invalid, keeping old default token"),
             }
         }
         if mtime(&config::tokens_path(&self.home)) != g.tok_mtime {
             self.reload_tokens(g);
-            crate::slog!("已重新加载 tokens.toml（{} 个调用方 token）", g.named.len());
+            crate::slog!("reloaded tokens.toml ({} caller tokens)", g.named.len());
         }
     }
 

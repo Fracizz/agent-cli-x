@@ -84,7 +84,7 @@ fn classify(out: &str, exe: Option<&str>, port: u16) -> Status {
 pub fn program_rule_cmd() -> String {
     format!(
         "netsh advfirewall firewall add rule name=\"{RULE}\" dir=in action=allow program=\"{}\" enable=yes",
-        exe_path().unwrap_or_else(|| "<agent-cli-x.exe 完整路径>".into())
+        exe_path().unwrap_or_else(|| "<full path of agent-cli-x.exe>".into())
     )
 }
 

@@ -17,8 +17,8 @@ const RESTART_WAIT: Duration = Duration::from_secs(60);
 const RESTART_WAIT_WINDOWS: Duration = Duration::from_secs(150);
 
 fn file_sha256(p: &Path) -> Result<(u64, String)> {
-    let mut f =
-        File::open(p).map_err(|e| AppError::not_found(format!("无法读取 {}: {e}", p.display())))?;
+    let mut f = File::open(p)
+        .map_err(|e| AppError::not_found(format!("cannot read {}: {e}", p.display())))?;
     let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
     let mut buf = vec![0u8; 256 * 1024];
     let mut n_total = 0u64;
@@ -45,22 +45,23 @@ pub fn upgrade(client: &Client, binary: Option<&Path>, force: bool) -> Result<Va
         None => {
             if os != std::env::consts::OS || arch != std::env::consts::ARCH {
                 return Err(AppError::bad_request(format!(
-                    "对端 {} 是 {os}/{arch}，本机是 {}/{}，不能直接用本机二进制。\
-请用 --binary 指定对端平台的 agent-cli-x（可从 releases 页面下载）",
+                    "peer {} is {os}/{arch}, local is {}/{}; cannot use the local binary. \
+Pass --binary with an agent-cli-x built for the peer platform (see the releases page)",
                     client.name,
                     std::env::consts::OS,
                     std::env::consts::ARCH
                 )));
             }
-            std::env::current_exe()
-                .map_err(|e| AppError::internal(format!("无法确定本机可执行文件: {e}")))?
+            std::env::current_exe().map_err(|e| {
+                AppError::internal(format!("cannot determine local executable: {e}"))
+            })?
         }
     };
     let jobs = info["running_jobs"].as_u64().unwrap_or(0);
     // 新版本服务端的后台任务由独立进程托管，重启不受影响；旧版本或 systemd 杀整个 cgroup 时才需要 --force
     if jobs > 0 && !force && info["jobs_survive_restart"] != true {
         return Err(AppError::conflict(format!(
-            "{} 有 {jobs} 个后台任务正在运行，升级重启会中断它们（状态变为 lost）。等任务结束后再升级（job list 查看），或加 --force 强制升级",
+            "{} has {jobs} running background job(s); upgrading restarts and interrupts them (state becomes lost). Upgrade after they finish (see job list) or add --force",
             client.name
         )));
     }
@@ -79,13 +80,13 @@ pub fn upgrade(client: &Client, binary: Option<&Path>, force: bool) -> Result<Va
     let after = wait_back(
         client,
         &info,
-        &format!("{} 已替换为 {new_version}", client.name),
+        &format!("{} replaced with {new_version}", client.name),
     )?;
     let running = after["version"].as_str().unwrap_or("?").to_string();
     if running != new_version {
         return Err(AppError::internal(format!(
-            "{} 已重启，但运行的版本是 {running}，不是刚上传的 {new_version}。\
-可能服务管理器启动的是另一个路径的 agent-cli-x（新版本已写入 {}）",
+            "{} restarted but is running {running}, not the uploaded {new_version}. \
+The service manager may start agent-cli-x from another path (new version written to {})",
             client.name,
             resp["path"].as_str().unwrap_or("?")
         )));
@@ -140,7 +141,7 @@ pub fn wait_back(client: &Client, before: &Value, done: &str) -> Result<Value> {
     Err(AppError::new(
         "timeout",
         format!(
-            "{done}，但 {} 秒内没有确认重新上线（可能仍在启动）。稍后执行 `agent-cli-x info {}` 确认；仍连不上时检查对端的开机自启/服务管理器与 ~/.agent-cli-x/serve-logs/ 下的日志",
+            "{done}, but not confirmed back online within {} s (may still be starting). Run `agent-cli-x info {}` later; if still unreachable, check the peer autostart/service manager and logs in ~/.agent-cli-x/serve-logs/",
             wait.as_secs() + 5,
             client.name
         ),

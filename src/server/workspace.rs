@@ -51,10 +51,10 @@ impl Access {
 
     pub fn label(self) -> &'static str {
         match self {
-            Access::Read => "读取",
-            Access::Create => "新建",
-            Access::Update => "修改",
-            Access::Delete => "删除",
+            Access::Read => "read",
+            Access::Create => "create",
+            Access::Update => "update",
+            Access::Delete => "delete",
         }
     }
 }
@@ -90,7 +90,7 @@ impl Perm {
 impl std::fmt::Display for Perm {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.0 == 0 {
-            return f.write_str("无");
+            return f.write_str("none");
         }
         for (b, c) in [(1, 'r'), (2, 'c'), (4, 'u'), (8, 'd')] {
             if self.0 & b != 0 {
@@ -160,20 +160,24 @@ fn parse_rel(raw: &str) -> Result<Vec<String>> {
     let s = raw.replace('\\', "/");
     if s.starts_with('/') || is_abs_pattern(&s) {
         return Err(AppError::denied(format!(
-            "不允许绝对路径 `{raw}`，请使用 工作区:相对路径"
+            "absolute path `{raw}` not allowed; use workspace:relative/path"
         )));
     }
     let mut out = Vec::new();
     for part in s.split('/') {
         match part {
             "" | "." => continue,
-            ".." => return Err(AppError::denied("不允许使用 `..` 跳出目录")),
+            ".." => return Err(AppError::denied("`..` is not allowed")),
             p => {
                 if p.contains(':') || p.contains('\0') {
-                    return Err(AppError::denied(format!("文件名 `{p}` 含非法字符")));
+                    return Err(AppError::denied(format!(
+                        "file name `{p}` has illegal characters"
+                    )));
                 }
                 if cfg!(windows) && is_reserved_windows_name(p) {
-                    return Err(AppError::denied(format!("`{p}` 是 Windows 保留名")));
+                    return Err(AppError::denied(format!(
+                        "`{p}` is a reserved Windows name"
+                    )));
                 }
                 out.push(p.to_string());
             }
@@ -186,11 +190,12 @@ impl Workspaces {
     pub fn new(cfg: &Config, home: &Path) -> Result<Self> {
         let mut roots = BTreeMap::new();
         for (name, p) in &cfg.workspaces {
-            let c = dunce::canonicalize(p)
-                .map_err(|e| AppError::config(format!("工作区 {name} 的路径 `{p}` 无效: {e}")))?;
+            let c = dunce::canonicalize(p).map_err(|e| {
+                AppError::config(format!("workspace {name} path `{p}` invalid: {e}"))
+            })?;
             if !c.is_dir() {
                 return Err(AppError::config(format!(
-                    "工作区 {name} 的路径 `{p}` 不是目录"
+                    "workspace {name} path `{p}` is not a directory"
                 )));
             }
             roots.insert(name.clone(), c);
@@ -198,7 +203,7 @@ impl Workspaces {
         let default = match &cfg.default_workspace {
             Some(d) if !roots.contains_key(d) => {
                 return Err(AppError::config(format!(
-                    "default_workspace `{d}` 不在 [workspaces] 中"
+                    "default_workspace `{d}` is not in [workspaces]"
                 )))
             }
             Some(d) => Some(d.clone()),
@@ -218,7 +223,7 @@ impl Workspaces {
         for rule in &p.paths {
             let allow = Perm::parse(&rule.allow).ok_or_else(|| {
                 AppError::config(format!(
-                    "[[policy.paths]] `{}` 的 allow = `{}` 无效：只能由 r c u d 组成（空串表示无权限）",
+                    "[[policy.paths]] `{}` has invalid allow = `{}`: only r c u d allowed (empty string = no access)",
                     rule.path, rule.allow
                 ))
             })?;
@@ -326,14 +331,14 @@ impl Workspaces {
             Some((w, _)) if w.len() > 1 => {
                 let names: Vec<_> = self.roots.keys().cloned().collect();
                 Err(AppError::not_found(format!(
-                    "未知工作区 `{w}`，可用: {}",
+                    "unknown workspace `{w}`; available: {}",
                     names.join(", ")
                 )))
             }
             _ => {
                 let d = self.default.clone().ok_or_else(|| {
                     AppError::bad_request(
-                        "未指定工作区，请使用 `工作区:相对路径` 格式（如 proj:src/main.rs）",
+                        "no workspace given; use `workspace:relative/path` (e.g. proj:src/main.rs)",
                     )
                 })?;
                 Ok((d, spec))
@@ -360,10 +365,10 @@ impl Workspaces {
         }
         let rule = v.rule.unwrap_or_default();
         Err(AppError::denied(if v.hard {
-            format!("路径 `{display}` 命中黑名单 `{rule}`，禁止访问")
+            format!("path `{display}` matches denylist `{rule}`; access denied")
         } else {
             format!(
-                "路径 `{display}` 不允许{}（规则 `{rule}` 允许: {}）",
+                "path `{display}` does not allow {} (rule `{rule}` allows: {})",
                 access.label(),
                 v.perm
             )
@@ -393,7 +398,7 @@ impl Workspaces {
         if abs.starts_with(&self.home) {
             return Verdict {
                 perm: Perm::NONE,
-                rule: Some("<agent-cli-x 数据目录>".to_string()),
+                rule: Some("<agent-cli-x data dir>".to_string()),
                 hard: true,
             };
         }
@@ -489,7 +494,7 @@ fn compile_rule(
                 allow,
             });
         }
-        return Err(AppError::config(format!("{field} 规则 `{raw}` 为空")));
+        return Err(AppError::config(format!("{field} rule `{raw}` is empty")));
     }
     let absolute = scope.is_none() && is_abs_pattern(&s);
     let matcher = GlobBuilder::new(&s)
@@ -497,7 +502,7 @@ fn compile_rule(
         .case_insensitive(cfg!(windows))
         .backslash_escape(false)
         .build()
-        .map_err(|e| AppError::config(format!("{field} 规则 `{raw}` 无效: {e}")))?
+        .map_err(|e| AppError::config(format!("{field} rule `{raw}` invalid: {e}")))?
         .compile_matcher();
     Ok(PathRule {
         raw: raw.to_string(),
@@ -524,11 +529,12 @@ fn canonical_within(root: &Path, joined: &Path) -> Result<(PathBuf, bool)> {
         }
         existing.pop();
     }
-    let canon = dunce::canonicalize(&existing)
-        .map_err(|e| AppError::not_found(format!("无法解析路径 {}: {e}", existing.display())))?;
+    let canon = dunce::canonicalize(&existing).map_err(|e| {
+        AppError::not_found(format!("cannot resolve path {}: {e}", existing.display()))
+    })?;
     if !canon.starts_with(root) {
         return Err(AppError::denied(
-            "路径经符号链接 / junction 指向工作区之外，禁止访问",
+            "path escapes the workspace via symlink / junction; access denied",
         ));
     }
     let mut abs = canon;
@@ -616,7 +622,7 @@ mod tests {
             let e = ws
                 .resolve(bad)
                 .err()
-                .unwrap_or_else(|| panic!("{bad} 应被拒绝"));
+                .unwrap_or_else(|| panic!("{bad} should be rejected"));
             assert_eq!(e.code, "policy_denied", "{bad}");
         }
         assert_eq!(ws.resolve("nope:x").err().unwrap().code, "not_found");
@@ -709,7 +715,7 @@ mod tests {
         assert_eq!(Perm::parse(""), Some(Perm::NONE));
         assert_eq!(Perm::parse("rx"), None);
         assert_eq!(Perm(9).to_string(), "rd");
-        assert_eq!(Perm::NONE.to_string(), "无");
+        assert_eq!(Perm::NONE.to_string(), "none");
     }
 
     #[test]
@@ -735,7 +741,7 @@ mod tests {
         // src 下：新建可以、覆盖不行
         assert!(ws.resolve_write("proj:src/new.rs").is_ok());
         let e = ws.resolve_write("proj:src/main.rs").err().unwrap();
-        assert!(e.message.contains("不允许修改"), "{}", e.message);
+        assert!(e.message.contains("does not allow update"), "{}", e.message);
         // 通配规则命中文件本身（最深一层），因此比目录规则更具体
         let (_b, ws4) = setup_full(&[], &[], &[("src", "rcud"), ("**/*.rs", "r")]);
         let root4 = ws4.roots["proj"].clone();

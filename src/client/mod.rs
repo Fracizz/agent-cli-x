@@ -34,19 +34,19 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub fn connect(addr: &str, pin: Option<&str>, read_timeout: Duration) -> Result<(Stream, String)> {
     let sock_addr = addr
         .to_socket_addrs()
-        .map_err(|e| AppError::connect(format!("地址 {addr} 无效: {e}")))?
+        .map_err(|e| AppError::connect(format!("invalid address {addr}: {e}")))?
         .next()
-        .ok_or_else(|| AppError::connect(format!("地址 {addr} 无法解析")))?;
+        .ok_or_else(|| AppError::connect(format!("cannot resolve address {addr}")))?;
     let tcp = TcpStream::connect_timeout(&sock_addr, CONNECT_TIMEOUT).map_err(|e| {
         AppError::connect(format!(
-            "无法连接 {addr}: {e}（检查对端 `agent-cli-x serve` 是否运行、防火墙是否放行）"
+            "cannot connect to {addr}: {e} (check that `agent-cli-x serve` is running on the peer and the firewall allows it)"
         ))
     })?;
     let _ = tcp.set_read_timeout(Some(read_timeout));
     let _ = tcp.set_write_timeout(Some(Duration::from_secs(60)));
     let _ = tcp.set_nodelay(true);
     let (cfg, verifier) = tls::client_config(pin)?;
-    let name = ServerName::try_from("agent-cli-x").expect("静态名称合法");
+    let name = ServerName::try_from("agent-cli-x").expect("static name is valid");
     let conn = ClientConnection::new(cfg, name).map_err(|e| AppError::internal(e.to_string()))?;
     let mut s = StreamOwned::new(conn, tcp);
     while s.conn.is_handshaking() {
@@ -55,8 +55,8 @@ pub fn connect(addr: &str, pin: Option<&str>, read_timeout: Duration) -> Result<
             if msg.contains(tls::MISMATCH_TAG) {
                 let seen = verifier.seen.lock().unwrap().clone().unwrap_or_default();
                 return Err(AppError::fingerprint(format!(
-                    "{addr} 的证书指纹与登记的不一致（当前 {seen}）。可能是对端重新 init 过，也可能是被冒充；\
-请在对端执行 `agent-cli-x fingerprint` 核对后，用 `agent-cli-x peer add` 重新登记"
+                    "{addr} certificate fingerprint differs from the registered one (now {seen}). The peer may have re-run init, or it may be impersonated; \
+verify with `agent-cli-x fingerprint` on the peer, then re-register with `agent-cli-x peer add`"
                 )));
             }
             return Err(AppError::connect(handshake_error(addr, &e)));
@@ -68,19 +68,19 @@ pub fn connect(addr: &str, pin: Option<&str>, read_timeout: Duration) -> Result<
 
 /// TCP 已连上但 TLS 握手失败：按错误类型说明可能原因与下一步。
 fn handshake_error(addr: &str, e: &std::io::Error) -> String {
-    let base = format!("与 {addr} 的 TLS 握手失败: {e}");
+    let base = format!("TLS handshake with {addr} failed: {e}");
     let hint = match e.kind() {
         ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted => {
-            "TCP 已连上，但对方没完成握手就断开：这个端口上可能不是 agent-cli-x serve（例如端口转发/代理还在而后端 serve 已退出）"
+            "TCP connected but the other side closed before finishing the handshake: this port may not be agent-cli-x serve (e.g. a port forward/proxy remains after the backend serve exited)"
         }
         ErrorKind::WouldBlock | ErrorKind::TimedOut => {
-            "TCP 已连上，但对方一直没有回应 TLS：端口上可能是其他程序，或对端 serve 卡住了"
+            "TCP connected but no TLS response: another program may hold the port, or the peer serve is stuck"
         }
-        ErrorKind::InvalidData => "对方返回的数据不是 TLS：这个端口很可能被其他程序占用",
+        ErrorKind::InvalidData => "the reply is not TLS: this port is probably used by another program",
         _ => return base,
     };
     format!(
-        "{base}。{hint}。在对端查看 ~/.agent-cli-x/serve-logs/ 最新日志（配置有误时 serve 会写明原因），或在对端执行 `agent-cli-x doctor`"
+        "{base}. {hint}. Check the latest log in ~/.agent-cli-x/serve-logs/ on the peer (serve states the reason for config errors), or run `agent-cli-x doctor` there"
     )
 }
 
@@ -95,10 +95,11 @@ fn read_all<R: Read>(r: &mut R, out: &mut Vec<u8>) -> Result<()> {
 
 fn map_io(e: std::io::Error) -> AppError {
     match e.kind() {
-        ErrorKind::WouldBlock | ErrorKind::TimedOut => {
-            AppError::new("timeout", format!("等待对端响应超时: {e}"))
-        }
-        _ => AppError::connect(format!("连接中断: {e}")),
+        ErrorKind::WouldBlock | ErrorKind::TimedOut => AppError::new(
+            "timeout",
+            format!("timed out waiting for peer response: {e}"),
+        ),
+        _ => AppError::connect(format!("connection lost: {e}")),
     }
 }
 
@@ -113,16 +114,16 @@ impl Client {
     pub fn load(name: &str) -> Result<Self> {
         if multi::is_multi(name) {
             return Err(AppError::bad_request(format!(
-                "`{name}`：此命令一次只能操作一个对端（多个对端仅支持 exec / info / upgrade / restart）"
+                "`{name}`: this command takes one peer at a time (multiple peers only for exec / info / upgrade / restart)"
             )));
         }
         let peers = config::load_peers(&config::home_dir())?;
         let peer = peers.peers.get(name).cloned().ok_or_else(|| {
             let known: Vec<_> = peers.peers.keys().cloned().collect();
             AppError::config(format!(
-                "未知对端 `{name}`（已登记: {}）。请先执行 `agent-cli-x peer add`",
+                "unknown peer `{name}` (registered: {}). Run `agent-cli-x peer add` first",
                 if known.is_empty() {
-                    "无".to_string()
+                    "none".to_string()
                 } else {
                     known.join(", ")
                 }
@@ -160,7 +161,7 @@ impl Client {
             .unwrap_or_else(|e| e.into_inner()) = Some(v.to_string());
         if v != http::VERSION && VERSION_WARN.swap(false, Ordering::SeqCst) {
             eprintln!(
-                "[agent-cli-x: 版本不一致：本机 {}，对端 {} 为 {v}。建议执行 `agent-cli-x upgrade {}` 统一版本]",
+                "[agent-cli-x: version mismatch: local {}, peer {} is {v}. Run `agent-cli-x upgrade {}` to align]",
                 http::VERSION,
                 self.name,
                 self.name
@@ -171,7 +172,9 @@ impl Client {
     /// 把服务端错误还原为 AppError；对端不认识接口且版本不同时，提示升级。
     fn remote_error(&self, v: &Value, status: u16) -> AppError {
         let mut e = http::remote_error(v, status);
-        if e.code == "not_found" && e.message.starts_with("未知接口") {
+        if e.code == "not_found"
+            && (e.message.starts_with("未知接口") || e.message.starts_with("unknown endpoint"))
+        {
             let rv = self
                 .remote_version
                 .lock()
@@ -180,7 +183,7 @@ impl Client {
                 .unwrap_or_else(|| "?".into());
             if rv != http::VERSION {
                 e.message.push_str(&format!(
-                    "（对端版本 {rv} 较旧，不支持此操作；本机 {}。请先升级对端）",
+                    " (peer version {rv} is older and does not support this; local {}. Upgrade the peer first)",
                     http::VERSION
                 ));
             }
@@ -208,7 +211,7 @@ impl Client {
         let mut data = Vec::new();
         read_all(&mut br, &mut data)?;
         let v: Value = serde_json::from_slice(&data)
-            .map_err(|e| AppError::internal(format!("响应不是有效 JSON: {e}")))?;
+            .map_err(|e| AppError::internal(format!("invalid JSON response: {e}")))?;
         if status != 200 {
             return Err(self.remote_error(&v, status));
         }
@@ -243,7 +246,7 @@ impl Client {
                 continue;
             }
             let v: Value = serde_json::from_slice(&line)
-                .map_err(|e| AppError::internal(format!("流数据无效: {e}")))?;
+                .map_err(|e| AppError::internal(format!("invalid stream data: {e}")))?;
             on_line(v)?;
         }
     }
@@ -279,7 +282,7 @@ impl Client {
         let mut data = Vec::new();
         read_all(&mut br, &mut data)?;
         let v: Value = serde_json::from_slice(&data)
-            .map_err(|e| AppError::internal(format!("响应不是有效 JSON: {e}")))?;
+            .map_err(|e| AppError::internal(format!("invalid JSON response: {e}")))?;
         if status != 200 {
             return Err(self.remote_error(&v, status));
         }
@@ -317,7 +320,7 @@ impl Client {
             // 服务端已回错误（例如权限不足提前拒绝）：以服务端为准
             (_, status) if status != 200 => Err(self.remote_error(&v, status)),
             (Err(e), _) => Err(e),
-            (Ok(()), _) if v.is_null() => Err(AppError::internal("响应不是有效 JSON")),
+            (Ok(()), _) if v.is_null() => Err(AppError::internal("invalid JSON response")),
             (Ok(()), _) => Ok(v),
         }
     }

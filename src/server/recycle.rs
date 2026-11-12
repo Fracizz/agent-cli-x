@@ -54,7 +54,7 @@ fn pick(times: impl Iterator<Item = i64>, since: i64, until: Option<i64>) -> Opt
 #[cfg(any(windows, all(unix, not(target_os = "macos"))))]
 fn find(abs: &Path, since: i64, until: Option<i64>) -> Result<trash::TrashItem> {
     let mut items: Vec<_> = trash::os_limited::list()
-        .map_err(|e| AppError::internal(format!("读取回收站失败: {e}")))?
+        .map_err(|e| AppError::internal(format!("failed to read recycle bin: {e}")))?
         .into_iter()
         .filter(|i| same_path(&i.original_path(), abs))
         .collect();
@@ -62,7 +62,7 @@ fn find(abs: &Path, since: i64, until: Option<i64>) -> Result<trash::TrashItem> 
         .map(|idx| items.swap_remove(idx))
         .ok_or_else(|| {
             AppError::not_found(format!(
-                "回收站中找不到 {}（可能已被清空或手动还原）",
+                "{} not found in recycle bin (may have been emptied or restored manually)",
                 abs.display()
             ))
         })
@@ -73,7 +73,7 @@ fn find(abs: &Path, since: i64, until: Option<i64>) -> Result<trash::TrashItem> 
 pub fn restore(abs: &Path, since: i64, until: Option<i64>) -> Result<()> {
     let item = find(abs, since, until)?;
     trash::os_limited::restore_all([item])
-        .map_err(|e| AppError::internal(format!("从回收站还原失败: {e}")))
+        .map_err(|e| AppError::internal(format!("failed to restore from recycle bin: {e}")))
 }
 
 /// 从回收站彻底删除 `abs`。返回 false 表示回收站里已经没有它（被清空或手动还原过）。
@@ -85,14 +85,14 @@ pub fn purge(abs: &Path, since: i64, until: Option<i64>) -> Result<bool> {
         Err(e) => return Err(e),
     };
     trash::os_limited::purge_all([item])
-        .map_err(|e| AppError::internal(format!("从回收站彻底删除失败: {e}")))?;
+        .map_err(|e| AppError::internal(format!("failed to purge from recycle bin: {e}")))?;
     Ok(true)
 }
 
 #[cfg(target_os = "macos")]
 pub fn restore(abs: &Path, _since: i64, _until: Option<i64>) -> Result<()> {
     Err(AppError::bad_request(format!(
-        "macOS 不支持自动从废纸篓还原，请在废纸篓中手动恢复 {}",
+        "macOS cannot restore from Trash automatically; restore {} manually in Trash",
         abs.display()
     )))
 }
@@ -120,7 +120,7 @@ mod tests {
 #[cfg(target_os = "macos")]
 pub fn purge(abs: &Path, _since: i64, _until: Option<i64>) -> Result<bool> {
     Err(AppError::bad_request(format!(
-        "macOS 不支持自动清除废纸篓中的单个条目，请在废纸篓中手动删除 {}",
+        "macOS cannot purge a single Trash entry automatically; delete {} manually in Trash",
         abs.display()
     )))
 }

@@ -88,7 +88,7 @@ impl Jobs {
             && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
         let d = self.dir.join(id);
         if !ok || !d.join(META).is_file() {
-            return Err(AppError::not_found(format!("找不到任务 `{id}`")));
+            return Err(AppError::not_found(format!("job `{id}` not found")));
         }
         Ok(d)
     }
@@ -121,7 +121,7 @@ pub fn start(ctx: &Ctx, body: Value) -> Result<Value> {
         return Err(AppError::new(
             "busy",
             format!(
-                "后台任务已达上限 {}，请等待结束或 job kill",
+                "background job limit {} reached; wait for one to finish or job kill",
                 policy.max_jobs
             ),
         ));
@@ -205,17 +205,17 @@ fn spawn_runner(dir: &Path) -> Result<()> {
         c
     })
     .map(|_| ())
-    .map_err(|e| AppError::io(format!("启动后台任务执行进程失败: {e}")))
+    .map_err(|e| AppError::io(format!("failed to start job runner: {e}")))
 }
 
-/// 等执行进程报告命令已启动（meta 中出现 pid），把启动失败同步返回给调用方。
+/// 等执行进程报告命令已启动（meta 中出现 pid），把start failed同步返回给调用方。
 fn wait_started(dir: &Path) -> Result<()> {
     let deadline = Instant::now() + START_WAIT;
     loop {
         if let Some(m) = read_meta(&dir.join(META)) {
             if m["status"] == "failed" {
                 return Err(AppError::io(
-                    m["error"].as_str().unwrap_or("启动失败").to_string(),
+                    m["error"].as_str().unwrap_or("start failed").to_string(),
                 ));
             }
             if !m["pid"].is_null() {
@@ -224,7 +224,7 @@ fn wait_started(dir: &Path) -> Result<()> {
         }
         if Instant::now() > deadline {
             return Err(AppError::io(format!(
-                "后台任务执行进程 {} 秒内没有启动命令",
+                "job runner did not start the command within {} s",
                 START_WAIT.as_secs()
             )));
         }
@@ -271,7 +271,7 @@ pub fn run(dir: &Path) -> Result<i32> {
     let spec: Spec = fs::read(dir.join(SPEC))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
-        .ok_or_else(|| fail("spec.json 无效".into()))?;
+        .ok_or_else(|| fail("invalid spec.json".into()))?;
     let shell = Shell::parse(Some(&spec.shell)).map_err(|e| fail(e.message))?;
     let mut command = platform::build_command(shell, &spec.cmd).map_err(|e| fail(e.message))?;
     command
@@ -285,7 +285,7 @@ pub fn run(dir: &Path) -> Result<i32> {
     }
     let mut child = command
         .spawn()
-        .map_err(|e| fail(format!("启动 {} 失败: {e}", shell.name())))?;
+        .map_err(|e| fail(format!("failed to start {}: {e}", shell.name())))?;
     let killer = KillHandle::attach(&child);
     let mut m = read_meta(&meta_path).unwrap_or_else(|| json!({}));
     m["pid"] = json!(child.id());
@@ -429,7 +429,7 @@ pub fn kill(ctx: &Ctx, body: Value) -> Result<Value> {
     let now = status(&dir);
     if now != "running" {
         return Err(AppError::conflict(format!(
-            "任务 {} 已不在运行（状态: {now}）",
+            "job {} is no longer running (status: {now})",
             req.id
         )));
     }

@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::sync::Arc;
 
 fn parse<T: for<'de> Deserialize<'de>>(body: Value) -> Result<T> {
-    serde_json::from_value(body).map_err(|e| AppError::bad_request(format!("参数错误: {e}")))
+    serde_json::from_value(body).map_err(|e| AppError::bad_request(format!("bad params: {e}")))
 }
 
 // ---------------- ls ----------------
@@ -35,7 +35,10 @@ pub fn ls(ctx: &Ctx, body: Value) -> Result<Value> {
     let req: LsReq = parse(body)?;
     let r = ctx.st.ws.resolve(&req.path)?;
     if !r.abs.is_dir() {
-        return Err(AppError::bad_request(format!("{} 不是目录", r.display())));
+        return Err(AppError::bad_request(format!(
+            "{} is not a directory",
+            r.display()
+        )));
     }
     let depth = req.depth.clamp(1, 20);
     let max = req.max.clamp(1, 20_000);
@@ -118,7 +121,7 @@ const GREP_LINE_CHARS: usize = 300;
 pub fn grep(ctx: &Ctx, body: Value) -> Result<Value> {
     let req: GrepReq = parse(body)?;
     if req.pattern.is_empty() {
-        return Err(AppError::bad_request("pattern 不能为空"));
+        return Err(AppError::bad_request("pattern must not be empty"));
     }
     let pat = if req.fixed {
         regex::escape(&req.pattern)
@@ -129,10 +132,13 @@ pub fn grep(ctx: &Ctx, body: Value) -> Result<Value> {
         .case_insensitive(req.ignore_case)
         .size_limit(8 * 1024 * 1024)
         .build()
-        .map_err(|e| AppError::bad_request(format!("正则无效: {e}")))?;
+        .map_err(|e| AppError::bad_request(format!("invalid regex: {e}")))?;
     let r = ctx.st.ws.resolve(&req.path)?;
     if !r.exists {
-        return Err(AppError::not_found(format!("路径不存在: {}", r.display())));
+        return Err(AppError::not_found(format!(
+            "path not found: {}",
+            r.display()
+        )));
     }
     let max = req.max.clamp(1, 5000);
 
@@ -154,11 +160,11 @@ pub fn grep(ctx: &Ctx, body: Value) -> Result<Value> {
         let mut ob = ignore::overrides::OverrideBuilder::new(&r.abs);
         for g in &req.glob {
             ob.add(g)
-                .map_err(|e| AppError::bad_request(format!("glob `{g}` 无效: {e}")))?;
+                .map_err(|e| AppError::bad_request(format!("invalid glob `{g}`: {e}")))?;
         }
         builder.overrides(
             ob.build()
-                .map_err(|e| AppError::bad_request(format!("glob 无效: {e}")))?,
+                .map_err(|e| AppError::bad_request(format!("invalid glob: {e}")))?,
         );
     }
 
@@ -238,7 +244,10 @@ pub fn read(ctx: &Ctx, body: Value) -> Result<Value> {
     let req: ReadReq = parse(body)?;
     let r = ctx.st.ws.resolve(&req.path)?;
     if !r.exists || !r.abs.is_file() {
-        return Err(AppError::not_found(format!("文件不存在: {}", r.display())));
+        return Err(AppError::not_found(format!(
+            "file not found: {}",
+            r.display()
+        )));
     }
     let max_kb = match req.max_kb {
         Some(k) => k.clamp(1, ctx.st.cfg.policy.max_read_kb),
@@ -252,7 +261,7 @@ pub fn read(ctx: &Ctx, body: Value) -> Result<Value> {
     file.read_exact(&mut head)?;
     if head.contains(&0) {
         return Err(AppError::bad_request(format!(
-            "{} 看起来是二进制文件，read 只支持文本",
+            "{} looks binary; read supports text only",
             r.display()
         )));
     }
@@ -333,8 +342,8 @@ fn check_expect_sha(abs: &std::path::Path, expect: &Option<String>) -> Result<()
             .unwrap_or_default();
         if !cur.eq_ignore_ascii_case(want.trim_start_matches("sha256:")) {
             return Err(AppError::conflict(format!(
-                "文件已被修改（当前 sha256={}），请重新读取后再改",
-                if cur.is_empty() { "<不存在>" } else { &cur }
+                "file modified (current sha256={}); re-read before editing",
+                if cur.is_empty() { "<missing>" } else { &cur }
             )));
         }
     }
@@ -346,21 +355,24 @@ pub fn write(ctx: &Ctx, body: Value) -> Result<Value> {
     let max = ctx.st.cfg.policy.max_write_kb * 1024;
     if req.content.len() as u64 > max {
         return Err(AppError::bad_request(format!(
-            "内容超过 max_write_kb（{max} 字节）"
+            "content exceeds max_write_kb ({max} bytes)"
         )));
     }
     let r = ctx.st.ws.resolve_write(&req.path)?;
     if r.rel.is_empty() || r.abs.is_dir() {
-        return Err(AppError::bad_request(format!("{} 是目录", r.display())));
+        return Err(AppError::bad_request(format!(
+            "{} is a directory",
+            r.display()
+        )));
     }
     let parent = r
         .abs
         .parent()
-        .ok_or_else(|| AppError::bad_request("无效路径"))?;
+        .ok_or_else(|| AppError::bad_request("invalid path"))?;
     let need_mkdir = !parent.is_dir();
     if need_mkdir && !req.mkdir {
         return Err(AppError::not_found(format!(
-            "父目录不存在: {}（加 --mkdir 自动创建）",
+            "parent dir not found: {} (add --mkdir to create)",
             r.display()
         )));
     }
@@ -408,7 +420,7 @@ pub struct EditOutcome {
 /// 纯函数：按文件换行风格归一 old/new 后精确替换。
 pub fn apply_edit(original: &str, old: &str, new: &str, replace_all: bool) -> Result<EditOutcome> {
     if old.is_empty() {
-        return Err(AppError::bad_request("old 不能为空"));
+        return Err(AppError::bad_request("old must not be empty"));
     }
     let crlf = original.contains("\r\n");
     let fix = |s: &str| {
@@ -423,12 +435,12 @@ pub fn apply_edit(original: &str, old: &str, new: &str, replace_all: bool) -> Re
     let count = original.matches(&old).count();
     if count == 0 {
         return Err(AppError::conflict(
-            "未找到 old 文本（需逐字匹配，含缩进与空白），请先 read 确认当前内容",
+            "old text not found (must match exactly incl. indentation/whitespace); read first to confirm current content",
         ));
     }
     if count > 1 && !replace_all {
         return Err(AppError::conflict(format!(
-            "old 文本匹配到 {count} 处，请扩大上下文使其唯一，或使用 --all 全部替换"
+            "old text matches {count} places; add context to make it unique, or use --all"
         )));
     }
     let idx = original.find(&old).unwrap_or(0);
@@ -449,7 +461,10 @@ pub fn edit(ctx: &Ctx, body: Value) -> Result<Value> {
     let req: EditReq = parse(body)?;
     let r = ctx.st.ws.resolve_write(&req.path)?;
     if !r.exists || !r.abs.is_file() {
-        return Err(AppError::not_found(format!("文件不存在: {}", r.display())));
+        return Err(AppError::not_found(format!(
+            "file not found: {}",
+            r.display()
+        )));
     }
     let bytes = fs::read(&r.abs)?;
     let (bom, body_bytes) = match bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
@@ -458,7 +473,7 @@ pub fn edit(ctx: &Ctx, body: Value) -> Result<Value> {
     };
     let original = std::str::from_utf8(body_bytes).map_err(|_| {
         AppError::bad_request(format!(
-            "{} 不是 UTF-8 文本，edit 不支持（可用 write 整体覆盖）",
+            "{} is not UTF-8 text; edit unsupported (use write to overwrite)",
             r.display()
         ))
     })?;
@@ -466,7 +481,7 @@ pub fn edit(ctx: &Ctx, body: Value) -> Result<Value> {
         let cur = util::sha256_hex(&bytes);
         if !cur.eq_ignore_ascii_case(want.trim_start_matches("sha256:")) {
             return Err(AppError::conflict(format!(
-                "文件已被修改（当前 sha256={cur}），请重新读取后再改"
+                "file modified (current sha256={cur}); re-read before editing"
             )));
         }
     }
@@ -530,16 +545,19 @@ pub fn rm(ctx: &Ctx, body: Value) -> Result<Value> {
     let ws = &ctx.st.ws;
     let r = ws.resolve_entry(&req.path)?;
     if r.rel.is_empty() {
-        return Err(AppError::bad_request("不能删除工作区根目录"));
+        return Err(AppError::bad_request("cannot delete workspace root"));
     }
     if !r.exists {
-        return Err(AppError::not_found(format!("路径不存在: {}", r.display())));
+        return Err(AppError::not_found(format!(
+            "path not found: {}",
+            r.display()
+        )));
     }
     let meta = fs::symlink_metadata(&r.abs)?;
     let top_is_dir = meta.is_dir();
     if top_is_dir && !req.recursive {
         return Err(AppError::bad_request(format!(
-            "{} 是目录，删除目录请加 --recursive（-r）",
+            "{} is a directory; add --recursive (-r) to delete directories",
             r.display()
         )));
     }
@@ -575,7 +593,7 @@ pub fn rm(ctx: &Ctx, body: Value) -> Result<Value> {
         items.push((abs, display, kind));
         if items.len() > RM_MAX_ENTRIES {
             return Err(AppError::bad_request(format!(
-                "要删除的条目超过 {RM_MAX_ENTRIES} 个，请缩小范围"
+                "more than {RM_MAX_ENTRIES} entries to delete; narrow the scope"
             )));
         }
     }
@@ -616,11 +634,11 @@ pub fn rm(ctx: &Ctx, body: Value) -> Result<Value> {
             let max_bytes = ctx.st.cfg.policy.max_transfer_mb * 1024 * 1024;
             if total > max_bytes {
                 return Err(AppError::bad_request(format!(
-                    "回收站不可用{}，且要删除的文件总量超过 max_transfer_mb（{} MB）无法备份；\
-                     请缩小范围、调大该配置，或确认后使用 --permanent 彻底删除",
+                    "recycle bin unavailable{}, and files to delete exceed max_transfer_mb ({} MB), cannot back up; \
+                     narrow the scope, raise the setting, or confirm and use --permanent",
                     trash_error
                         .as_deref()
-                        .map(|e| format!("（{e}）"))
+                        .map(|e| format!(" ({e})"))
                         .unwrap_or_default(),
                     ctx.st.cfg.policy.max_transfer_mb
                 )));

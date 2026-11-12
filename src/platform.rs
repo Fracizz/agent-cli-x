@@ -28,13 +28,13 @@ impl Shell {
             "bash" => Shell::Bash,
             other => {
                 return Err(AppError::bad_request(format!(
-                    "未知 shell `{other}`，可选: pwsh / powershell / cmd / sh / bash"
+                    "unknown shell `{other}`; options: pwsh / powershell / cmd / sh / bash"
                 )))
             }
         };
         if !cfg!(windows) && matches!(shell, Shell::PowerShell | Shell::Cmd) {
             return Err(AppError::bad_request(format!(
-                "{} 仅在 Windows 上可用",
+                "{} is only available on Windows",
                 shell.name()
             )));
         }
@@ -134,7 +134,7 @@ pub fn build_command(shell: Shell, cmd: &str) -> Result<Command> {
             // 环境变量值上限 32767 个 UTF-16 字符。
             if script.encode_utf16().count() > 30_000 {
                 return Err(AppError::bad_request(
-                    "命令过长（超过约 30000 字符），请先用 write 写入脚本文件再执行",
+                    "command too long (over ~30000 chars); write it to a script file with `write` first, then run it",
                 ));
             }
             let mut c = ps_command(shell);

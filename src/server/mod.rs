@@ -76,7 +76,7 @@ pub fn serve(home: &Path, wait_port_secs: u64) -> Result<()> {
     log::init(home);
     let r = serve_inner(home, wait_port_secs);
     if let Err(e) = &r {
-        crate::slog!("serve 退出: {e}");
+        crate::slog!("serve exited: {e}");
     }
     r
 }
@@ -91,10 +91,10 @@ fn bind(listen: &str, wait_secs: u64) -> Result<TcpListener> {
             }
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                 return Err(AppError::io(format!(
-                    "监听 {listen} 失败: 端口已被占用。可能已有一个 agent-cli-x serve 在运行（例如开机自启的那个），可用 `agent-cli-x doctor` 检查；或在 config.toml 中修改 listen"
+                    "listen on {listen} failed: port in use. An agent-cli-x serve may already be running (e.g. the autostart one); check with `agent-cli-x doctor`, or change listen in config.toml"
                 )))
             }
-            Err(e) => return Err(AppError::io(format!("监听 {listen} 失败: {e}"))),
+            Err(e) => return Err(AppError::io(format!("listen on {listen} failed: {e}"))),
         }
     }
 }
@@ -131,7 +131,7 @@ fn load_or_fallback(home: &Path) -> Result<(Config, Workspaces, Option<String>)>
                 return Err(e);
             };
             crate::slog!(
-                "警告: {}；已回退到上次可用的配置 {} 运行。修复后重启 serve（其他机器可执行 `agent-cli-x restart <本机>`）",
+                "warning: {}; fell back to last good config {}. Fix and restart serve (from another machine: `agent-cli-x restart <this-peer>`)",
                 e.message,
                 lg.display()
             );
@@ -153,50 +153,62 @@ fn serve_inner(home: &Path, wait_port_secs: u64) -> Result<()> {
     let auth = auth::Auth::new(home, &cfg.token);
 
     crate::slog!(
-        "agent-cli-x {} 服务已启动（pid {}）",
+        "agent-cli-x {} serving (pid {})",
         http::VERSION,
         std::process::id()
     );
     crate::slog!(
-        "  机器:   {} ({})",
+        "  machine: {} ({})",
         cfg.node_name(),
         cfg.node_id.as_deref().unwrap_or("-")
     );
-    crate::slog!("  监听:   {}", cfg.listen);
-    crate::slog!("  指纹:   {fp}");
+    crate::slog!("  listen: {}", cfg.listen);
+    crate::slog!("  fingerprint: {fp}");
     let shell = platform::default_shell();
     let mem_gb = platform::total_memory_gb();
     let configured = cfg.policy.prewarm_shells;
-    let warm = warm::WarmPool::new(shell, config::resolve_prewarm(configured, mem_gb));
+    let warm = warm::WarmPool::new(
+        shell,
+        config::resolve_prewarm(configured, mem_gb),
+        cfg.policy.prewarm_idle_secs,
+    );
     crate::slog!("  shell:  {}", shell.name());
     if warm.size() > 0 {
-        let mem = mem_gb.map_or("内存未知".to_string(), |g| format!("内存 {g} GB"));
+        let mem = mem_gb.map_or("memory unknown".to_string(), |g| format!("memory {g} GB"));
         let how = match configured {
-            None => format!("自动，{mem}"),
-            Some(n) if n > warm.size() => format!("配置 {n}，超过{mem}，已限制"),
+            None => format!("auto, {mem}"),
+            Some(n) if n > warm.size() => format!("configured {n}, exceeds {mem}, capped"),
             Some(_) => "policy.prewarm_shells".to_string(),
         };
-        crate::slog!("  预热:   {} 个空闲 {}（{how}）", warm.size(), shell.name());
+        let idle = match cfg.policy.prewarm_idle_secs {
+            0 => "kept".to_string(),
+            n => format!("released after {n}s idle"),
+        };
+        crate::slog!(
+            "  warm: {} idle {} ({how}; {idle})",
+            warm.size(),
+            shell.name()
+        );
     }
     if shell == platform::Shell::PowerShell {
-        crate::slog!("  提示:   未找到 pwsh，正在使用 Windows PowerShell 5.1（冷启动约 2 秒）；安装 PowerShell 7 可明显加快 exec");
+        crate::slog!("  note: pwsh not found, using Windows PowerShell 5.1 (cold start ~2 s); installing PowerShell 7 speeds up exec noticeably");
     }
     if ws.is_empty() {
         crate::slog!(
-            "  警告:   未配置任何工作区，对端无法访问文件或执行命令（编辑 {}）",
+            "  warning: no workspace configured, peers cannot access files or run commands (edit {})",
             config::config_path(home).display()
         );
     }
     for (n, p) in ws.list() {
-        crate::slog!("  工作区: {n} = {}", p.display());
+        crate::slog!("  workspace: {n} = {}", p.display());
     }
     crate::slog!(
-        "  token:  默认 token + {} 个调用方 token",
+        "  token: default token + {} caller tokens",
         auth.named_count()
     );
-    crate::slog!("  日志:   {}", log::dir(home).display());
+    crate::slog!("  log: {}", log::dir(home).display());
     crate::slog!(
-        "  黑名单: {} 条禁止路径，{} 条路径权限规则，{} 条命令规则",
+        "  denylist: {} denied paths, {} path policy rules, {} command rules",
         ws.deny_rules().len(),
         ws.perm_rules().len(),
         cfg.policy.deny_commands.len()
@@ -264,7 +276,7 @@ fn handle_conn(st: Arc<State>, tcp: TcpStream) {
         Ok(_) if n > MAX_CONNECTIONS => {
             let _ = http::write_error(
                 conn.get_mut(),
-                &AppError::new("busy", "服务端并发连接已满，请稍后重试"),
+                &AppError::new("busy", "server connection limit reached, retry later"),
             );
         }
         Ok(req) => dispatch(&st, ip, local_port, req, &mut conn),
@@ -293,7 +305,7 @@ fn dispatch(st: &Arc<State>, ip: String, local_port: u16, req: http::Request, co
         st.audit
             .log(&ip, "", "auth_fail", false, json!({"path": req.path}));
         thread::sleep(Duration::from_millis(300));
-        let _ = http::write_error(conn.get_mut(), &AppError::auth("token 无效"));
+        let _ = http::write_error(conn.get_mut(), &AppError::auth("invalid token"));
         return;
     };
     let ctx = Ctx {
@@ -322,7 +334,7 @@ fn dispatch(st: &Arc<State>, ip: String, local_port: u16, req: http::Request, co
         match serde_json::from_slice(&req.body) {
             Ok(v) => v,
             Err(e) => {
-                let _ = http::write_error(w, &AppError::bad_request(format!("JSON 无效: {e}")));
+                let _ = http::write_error(w, &AppError::bad_request(format!("invalid JSON: {e}")));
                 return;
             }
         }
@@ -357,11 +369,11 @@ fn dispatch(st: &Arc<State>, ip: String, local_port: u16, req: http::Request, co
         "/v1/port" => admin::port(&ctx, body),
         "/v1/rollback" => backup::rollback(&ctx, body),
         "/v1/purge" => backup::purge(&ctx, body),
-        other => Err(AppError::not_found(format!("未知接口 {other}"))),
+        other => Err(AppError::not_found(format!("unknown endpoint {other}"))),
     };
     if let Err(e) = &result {
         if e.code == "internal" {
-            crate::slog!("{} 内部错误: {}", req.path, e.message);
+            crate::slog!("{} internal error: {}", req.path, e.message);
         }
         if e.code == "policy_denied" {
             ctx.st.audit.log(
@@ -429,6 +441,7 @@ fn info_base(ctx: &Ctx) -> Value {
             "size": ctx.st.warm.size(),
             "auto": ctx.st.cfg.policy.prewarm_shells.is_none(),
             "idle": ctx.st.warm.idle_count(),
+            "idle_secs": ctx.st.cfg.policy.prewarm_idle_secs,
         },
     })
 }

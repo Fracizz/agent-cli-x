@@ -42,11 +42,13 @@ struct Item {
 
 pub fn put(client: &Client, local: &Path, dest: &str, exclude: &[String]) -> Result<Value> {
     let canon = dunce::canonicalize(local)
-        .map_err(|e| AppError::not_found(format!("本地路径 {} 无效: {e}", local.display())))?;
+        .map_err(|e| AppError::not_found(format!("invalid local path {}: {e}", local.display())))?;
     let name = canon
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
-        .ok_or_else(|| AppError::bad_request("无法确定源名称（不能上传磁盘根目录）"))?;
+        .ok_or_else(|| {
+            AppError::bad_request("cannot determine source name (cannot upload a drive root)")
+        })?;
     let ex = exclude_set(exclude)?;
     let mut items = Vec::new();
     let mut skipped_links = 0usize;
@@ -116,7 +118,11 @@ pub fn put(client: &Client, local: &Path, dest: &str, exclude: &[String]) -> Res
             if let Some((p, n)) = &it.file {
                 let mut f = File::open(p)?;
                 frame::copy_exact(&mut f, s, *n).map_err(|e| {
-                    AppError::io(format!("{} 在上传过程中被修改: {}", p.display(), e.message))
+                    AppError::io(format!(
+                        "{} was modified during upload: {}",
+                        p.display(),
+                        e.message
+                    ))
                 })?;
             }
         }
@@ -140,7 +146,7 @@ pub fn get(client: &Client, src: &str, local: &Path, exclude: &[String]) -> Resu
     let kind = meta["kind"].as_str().unwrap_or_default().to_string();
     let parts = frame::safe_rel(meta["name"].as_str().unwrap_or_default())?;
     if parts.len() != 1 {
-        return Err(AppError::bad_request("对端返回的名称无效"));
+        return Err(AppError::bad_request("invalid name returned by peer"));
     }
     let base = if local.is_dir() {
         local.join(&parts[0])
@@ -149,13 +155,13 @@ pub fn get(client: &Client, src: &str, local: &Path, exclude: &[String]) -> Resu
     };
     if kind == "f" && base.is_dir() {
         return Err(AppError::conflict(format!(
-            "本地 {} 是目录",
+            "local {} is a directory",
             base.display()
         )));
     }
     if kind == "d" && base.is_file() {
         return Err(AppError::conflict(format!(
-            "本地 {} 是文件",
+            "local {} is a file",
             base.display()
         )));
     }
@@ -164,7 +170,8 @@ pub fn get(client: &Client, src: &str, local: &Path, exclude: &[String]) -> Resu
         let h = frame::read_header(&mut br)?;
         if h.get("error").is_some() {
             let mut e = http::remote_error(&h, 500);
-            e.message.push_str("（已下载的部分文件保留在本地）");
+            e.message
+                .push_str(" (partially downloaded files kept locally)");
             return Err(e);
         }
         if h["end"] == true {
@@ -177,7 +184,7 @@ pub fn get(client: &Client, src: &str, local: &Path, exclude: &[String]) -> Resu
             Some("f") => {
                 let n = h["n"]
                     .as_u64()
-                    .ok_or_else(|| AppError::bad_request("文件帧缺少大小"))?;
+                    .ok_or_else(|| AppError::bad_request("file frame missing size"))?;
                 let parent = target
                     .parent()
                     .map(|p| p.to_path_buf())
@@ -210,7 +217,7 @@ pub fn get(client: &Client, src: &str, local: &Path, exclude: &[String]) -> Resu
                 files += 1;
                 bytes += n;
             }
-            _ => return Err(AppError::bad_request("未知的条目类型")),
+            _ => return Err(AppError::bad_request("unknown entry type")),
         }
     }
     Ok(json!({"dest": base.to_string_lossy(), "files": files, "bytes": bytes}))
@@ -238,10 +245,10 @@ pub fn relay(
     let kind = meta["kind"].as_str().unwrap_or_default().to_string();
     let name = meta["name"].as_str().unwrap_or_default().to_string();
     if frame::safe_rel(&name)?.len() != 1 {
-        return Err(AppError::bad_request("源端返回的名称无效"));
+        return Err(AppError::bad_request("invalid name returned by source"));
     }
     let (mut files, mut bytes) = (0u64, 0u64);
-    // 源端出错时记下原因：目标端随后也会因流被截断而报错，两者合并告诉用户
+    // source error时记下原因：目标端随后也会因流被截断而报错，两者合并告诉用户
     let mut src_err: Option<AppError> = None;
     let res = dst.upload_frames("/v1/fs/put", TIMEOUT, |s| {
         frame::write_header(s, &json!({"dest": dest, "kind": kind, "name": name}))?;
@@ -249,18 +256,18 @@ pub fn relay(
             let h = match frame::read_header(&mut br) {
                 Ok(h) => h,
                 Err(e) => {
-                    src_err = Some(AppError::io(format!("源端 {}: {}", src.name, e.message)));
-                    return Err(AppError::io("源端中断"));
+                    src_err = Some(AppError::io(format!("source {}: {}", src.name, e.message)));
+                    return Err(AppError::io("source interrupted"));
                 }
             };
             if h.get("error").is_some() {
                 let mut e = http::remote_error(&h, 500);
-                e.message = format!("源端 {}: {}", src.name, e.message);
+                e.message = format!("source {}: {}", src.name, e.message);
                 src_err = Some(e);
-                return Err(AppError::io("源端出错"));
+                return Err(AppError::io("source error"));
             }
             if super::peer_replied(s) {
-                return Err(AppError::io("目标端提前结束了接收"));
+                return Err(AppError::io("destination ended receiving early"));
             }
             if h["end"] == true {
                 frame::write_header(s, &json!({"end": true}))?;
@@ -272,7 +279,7 @@ pub fn relay(
                 Some("f") => {
                     let n = h["n"]
                         .as_u64()
-                        .ok_or_else(|| AppError::bad_request("文件帧缺少大小"))?;
+                        .ok_or_else(|| AppError::bad_request("file frame missing size"))?;
                     frame::write_header(
                         s,
                         &json!({"p": h["p"], "k": "f", "n": n, "x": h["x"] == true}),
@@ -285,15 +292,15 @@ pub fn relay(
                         let got = match br.read(&mut buf[..want]) {
                             Ok(0) | Err(_) => {
                                 src_err = Some(AppError::io(format!(
-                                    "源端 {} 传输中断：文件还差 {left} 字节",
+                                    "source {} transfer interrupted: {left} bytes of the file missing",
                                     src.name
                                 )));
-                                return Err(AppError::io("源端中断"));
+                                return Err(AppError::io("source interrupted"));
                             }
                             Ok(k) => k,
                         };
                         if super::peer_replied(s) {
-                            return Err(AppError::io("目标端提前结束了接收"));
+                            return Err(AppError::io("destination ended receiving early"));
                         }
                         s.write_all(&buf[..got])?;
                         left -= got as u64;
@@ -302,7 +309,7 @@ pub fn relay(
                     bytes += n;
                     progress(files, bytes);
                 }
-                _ => return Err(AppError::bad_request("未知的条目类型")),
+                _ => return Err(AppError::bad_request("unknown entry type")),
             }
         }
     });
@@ -310,7 +317,7 @@ pub fn relay(
         (Ok(v), _) => Ok(v),
         (Err(dst_e), Some(mut e)) => {
             e.message
-                .push_str(&format!("；目标端 {}: {}", dst.name, dst_e.message));
+                .push_str(&format!("; destination {}: {}", dst.name, dst_e.message));
             Err(e)
         }
         (Err(e), None) => Err(e),

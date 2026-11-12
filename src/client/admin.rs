@@ -14,7 +14,7 @@ pub fn restart(client: &Client, force: bool) -> Result<Value> {
     let started = Instant::now();
     let before = client.call("/v1/info", &json!({}), CALL)?;
     let resp = client.call("/v1/restart", &json!({"force": force}), CALL)?;
-    wait_back(client, &before, &format!("{} 已发出重启", client.name))?;
+    wait_back(client, &before, &format!("{} restart issued", client.name))?;
     Ok(json!({
         "peer": client.name,
         "restart": resp["restart"],
@@ -39,18 +39,18 @@ pub fn set_port(client: &Client, port: u16) -> Result<Value> {
         let _ = client.call("/v1/port", &json!({"action": "abort"}), CALL);
         let hint = match open["firewall_cmd"].as_str() {
             Some(cmd) => format!(
-                "对端 Windows 防火墙没有放行。在对端管理员 PowerShell 执行一次（按程序放行，以后改端口不用再改）: {cmd}"
+                "Peer Windows firewall blocks it. Run once in an admin PowerShell on the peer (allows the program, no change needed for later port changes): {cmd}"
             ),
             None => format!(
-                "检查对端防火墙（Linux 如 `sudo ufw allow {port}/tcp`）和云安全组是否放行 TCP {port}"
+                "Check that the peer firewall (Linux e.g. `sudo ufw allow {port}/tcp`) and cloud security group allow TCP {port}"
             ),
         };
         return Err(AppError::new(
             &e.code,
             format!(
-                "经由新地址 {new_addr} 确认失败（{}），已撤销，{} 仍监听原端口。{hint}",
+                "Confirmation via new address {new_addr} failed ({}); rolled back, {} still listens on the old port. {hint}",
                 // 只取底层错误的第一句，详细的握手提示与这里的防火墙提示重复
-                e.message.split('。').next().unwrap_or_default(),
+                e.message.split(". ").next().unwrap_or_default(),
                 client.name
             ),
         ));

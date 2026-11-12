@@ -36,7 +36,7 @@ pub fn handle<S: Read + Write>(ctx: &Ctx, len: u64, conn: &mut BufReader<S>) {
                 .audit
                 .log(&ctx.ip, &ctx.caller, "upgrade", true, v.clone());
             crate::slog!(
-                "已由 {}@{} 升级到 {}，即将重启（方式: {}）",
+                "upgraded by {}@{} to {}, restarting (mode: {})",
                 ctx.caller,
                 ctx.ip,
                 v["new_version"].as_str().unwrap_or("?"),
@@ -54,7 +54,7 @@ pub fn handle<S: Read + Write>(ctx: &Ctx, len: u64, conn: &mut BufReader<S>) {
                 false,
                 json!({"error": e.to_string()}),
             );
-            crate::slog!("升级失败（来自 {}@{}）: {e}", ctx.caller, ctx.ip);
+            crate::slog!("upgrade failed (from {}@{}): {e}", ctx.caller, ctx.ip);
             let _ = http::write_error(w, &e);
         }
     }
@@ -62,19 +62,19 @@ pub fn handle<S: Read + Write>(ctx: &Ctx, len: u64, conn: &mut BufReader<S>) {
 
 fn handle_inner<R: std::io::BufRead>(ctx: &Ctx, len: u64, body: &mut R) -> Result<Value> {
     if len > MAX_BINARY {
-        return Err(AppError::bad_request("二进制文件过大（上限 512 MB）"));
+        return Err(AppError::bad_request("binary too large (limit 512 MB)"));
     }
     let meta = frame::read_header(body)?;
     let size = meta["size"]
         .as_u64()
-        .ok_or_else(|| AppError::bad_request("缺少 size"))?;
+        .ok_or_else(|| AppError::bad_request("missing size"))?;
     let want_sha = meta["sha256"]
         .as_str()
         .unwrap_or_default()
         .to_ascii_lowercase();
     let force = meta["force"].as_bool().unwrap_or(false);
 
-    let (interrupted, kept) = jobs_on_restart(ctx, force, "升级")?;
+    let (interrupted, kept) = jobs_on_restart(ctx, force, "upgrade")?;
 
     // 先确认当前配置能让新进程正常启动，否则替换后会失联
     super::admin::preflight(&ctx.st.home)?;
@@ -82,7 +82,7 @@ fn handle_inner<R: std::io::BufRead>(ctx: &Ctx, len: u64, body: &mut R) -> Resul
     let exe = current_exe()?;
     let dir = exe
         .parent()
-        .ok_or_else(|| AppError::internal("无法确定可执行文件所在目录"))?;
+        .ok_or_else(|| AppError::internal("cannot determine executable directory"))?;
     let tmp = dir.join(format!(
         "{TMP_PREFIX}{}{}",
         util::random_hex(4),
@@ -140,9 +140,9 @@ pub fn jobs_on_restart(ctx: &Ctx, force: bool, verb: &str) -> Result<(usize, usi
             None => ("agent-cli-x.service".to_string(), "systemctl daemon-reload"),
         };
         return Err(AppError::conflict(format!(
-            "对端有 {running} 个后台任务正在运行。该机器由服务管理器重启，且 systemd 的 KillMode 不是 process，\
-{verb}会连同任务一起终止（状态变为 lost）。在 {unit} 的 [Service] 中加 KillMode=process 并执行 \
-`{reload}` 后再试；或等任务结束（job list 查看）；或加 --force"
+            "peer has {running} running background jobs. This machine is restarted by the service manager and systemd KillMode is not process, \
+{verb} would kill the jobs too (status becomes lost). Add KillMode=process under [Service] in {unit} and run \
+`{reload}`, then retry; or wait for jobs to finish (see job list); or add --force"
         )));
     }
     Ok((running, 0))
@@ -151,7 +151,7 @@ pub fn jobs_on_restart(ctx: &Ctx, force: bool, verb: &str) -> Result<(usize, usi
 /// 当前可执行文件路径（Linux 上被替换过的文件路径会带 ` (deleted)` 后缀，需去掉）。
 pub fn current_exe() -> Result<PathBuf> {
     let p = std::env::current_exe()
-        .map_err(|e| AppError::internal(format!("无法确定可执行文件路径: {e}")))?;
+        .map_err(|e| AppError::internal(format!("cannot determine executable path: {e}")))?;
     let s = p.to_string_lossy();
     Ok(match s.strip_suffix(" (deleted)") {
         Some(t) => PathBuf::from(t),
@@ -162,7 +162,7 @@ pub fn current_exe() -> Result<PathBuf> {
 fn receive<R: Read>(body: &mut R, tmp: &Path, size: u64, want_sha: &str) -> Result<()> {
     let mut f = File::create(tmp).map_err(|e| {
         AppError::io(format!(
-            "无法在 {} 写入新版本: {e}（检查目录权限）",
+            "cannot write new version in {}: {e} (check directory permissions)",
             tmp.parent().unwrap_or(tmp).display()
         ))
     })?;
@@ -174,7 +174,7 @@ fn receive<R: Read>(body: &mut R, tmp: &Path, size: u64, want_sha: &str) -> Resu
         let n = body.read(&mut buf[..want])?;
         if n == 0 {
             return Err(AppError::io(format!(
-                "传输中断：期望 {size} 字节，实际 {} 字节",
+                "transfer interrupted: expected {size} bytes, got {}",
                 size - left
             )));
         }
@@ -187,7 +187,7 @@ fn receive<R: Read>(body: &mut R, tmp: &Path, size: u64, want_sha: &str) -> Resu
     let got = util::hex(ctx.finish().as_ref());
     if !want_sha.is_empty() && got != want_sha {
         return Err(AppError::io(format!(
-            "sha256 不一致（期望 {want_sha}，实际 {got}），传输可能损坏"
+            "sha256 mismatch (expected {want_sha}, got {got}); transfer may be corrupt"
         )));
     }
     #[cfg(unix)]
@@ -219,7 +219,7 @@ fn probe_version(bin: &Path) -> Result<String> {
     };
     let mut child = spawned.map_err(|e| {
         AppError::bad_request(format!(
-            "新二进制无法在对端运行: {e}（确认与对端的系统/架构一致，`agent-cli-x info` 可查看）"
+            "new binary cannot run on peer: {e} (ensure it matches peer OS/arch; see `agent-cli-x info`)"
         ))
     })?;
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -230,7 +230,7 @@ fn probe_version(bin: &Path) -> Result<String> {
         if Instant::now() > deadline {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(AppError::bad_request("新二进制运行 --version 超时"));
+            return Err(AppError::bad_request("new binary --version timed out"));
         }
         thread::sleep(Duration::from_millis(50));
     };
@@ -245,7 +245,7 @@ fn probe_version(bin: &Path) -> Result<String> {
     match ver {
         Some(v) if status.success() && !v.is_empty() => Ok(v),
         _ => Err(AppError::bad_request(format!(
-            "上传的文件不是有效的 agent-cli-x 二进制（--version 输出: {}）",
+            "uploaded file is not a valid agent-cli-x binary (--version output: {})",
             out.trim()
         ))),
     }
@@ -260,17 +260,22 @@ fn replace(exe: &Path, new: &Path) -> Result<()> {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "agent-cli-x".into());
         let old = exe.with_file_name(format!("{stem}.old-{}.exe", util::random_hex(4)));
-        fs::rename(exe, &old)
-            .map_err(|e| AppError::io(format!("无法挪开旧版本 {}: {e}", exe.display())))?;
+        fs::rename(exe, &old).map_err(|e| {
+            AppError::io(format!(
+                "cannot move old version {} aside: {e}",
+                exe.display()
+            ))
+        })?;
         if let Err(e) = fs::rename(new, exe) {
             let _ = fs::rename(&old, exe);
-            return Err(AppError::io(format!("无法放入新版本: {e}")));
+            return Err(AppError::io(format!("cannot install new version: {e}")));
         }
         Ok(())
     }
     #[cfg(not(windows))]
     {
-        fs::rename(new, exe).map_err(|e| AppError::io(format!("无法替换 {}: {e}", exe.display())))
+        fs::rename(new, exe)
+            .map_err(|e| AppError::io(format!("cannot replace {}: {e}", exe.display())))
     }
 }
 
@@ -295,15 +300,15 @@ fn restart() -> ! {
     if restart_mode() == "spawn" {
         match spawn_detached() {
             Ok(pid) => {
-                crate::slog!("已启动新进程 pid {pid}，本进程退出");
+                crate::slog!("started new process pid {pid}, exiting");
                 std::process::exit(0);
             }
             Err(e) => crate::slog!(
-                "启动新进程失败: {e}；本进程以 {RESTART_EXIT_CODE} 退出，等待服务管理器重启"
+                "failed to start new process: {e}; exiting with {RESTART_EXIT_CODE}, awaiting service manager restart"
             ),
         }
     }
-    crate::slog!("以退出码 {RESTART_EXIT_CODE} 退出，由服务管理器重启");
+    crate::slog!("exiting with code {RESTART_EXIT_CODE}, service manager will restart");
     std::process::exit(RESTART_EXIT_CODE);
 }
 
@@ -317,7 +322,7 @@ fn spawn_detached() -> Result<u32> {
             .stderr(Stdio::null());
         c
     })
-    .map_err(|e| AppError::io(format!("启动新进程失败: {e}")))?;
+    .map_err(|e| AppError::io(format!("failed to start new process: {e}")))?;
     Ok(child.id())
 }
 

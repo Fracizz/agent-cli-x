@@ -18,13 +18,13 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 #[command(
     name = "agent-cli-x",
     version,
-    about = "跨机器 AI 指令工具：让不同服务器上的 AI 互相执行命令与读写文件",
-    after_help = "路径格式：工作区:相对路径，例如 proj:src/main.rs（只有一个工作区时可省略前缀）。\n\
-退出码：远端命令退出码原样透传；agent-cli-x 自身错误为 100 连接 / 101 鉴权 / 102 策略拒绝 / \
-103 不存在 / 104 超时 / 105 冲突 / 106 指纹 / 110 参数 / 111 繁忙。\n给 AI 的完整说明：agent-cli-x skill"
+    about = "Cross-machine tool for AI agents: run commands and read/write files on other servers",
+    after_help = "Path format: workspace:relative/path, e.g. proj:src/main.rs (prefix optional with one workspace).\n\
+Exit codes: remote command's code is passed through; agent-cli-x errors: 100 connect / 101 auth / 102 policy denied / \
+103 not found / 104 timeout / 105 conflict / 106 fingerprint / 110 args / 111 busy.\nFull guide for AI: agent-cli-x skill"
 )]
 pub struct Cli {
-    /// 以 JSON 输出结果（便于程序解析）
+    /// Output as JSON
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
@@ -33,101 +33,101 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// 初始化本机：生成机器 ID、token、自签证书与带注释的 config.toml
+    /// Initialize this machine: machine ID, token, self-signed cert, commented config.toml
     Init {
-        /// 本机名称（默认主机名），对端 info / peer list 中显示
+        /// Node name (default: hostname), shown in peers' info / peer list
         #[arg(long)]
         name: Option<String>,
-        /// 监听地址
+        /// Listen address
         #[arg(long, default_value = "0.0.0.0:47821")]
         listen: String,
-        /// 工作区，可重复：--workspace proj=D:/code/proj
+        /// Workspace, repeatable: --workspace proj=D:/code/proj
         #[arg(long = "workspace", value_name = "NAME=PATH")]
         workspaces: Vec<String>,
-        /// 覆盖已有配置（会更换 token、证书与机器 ID，已登记本机的对端需重新 peer add）
+        /// Overwrite existing config (replaces token, cert and machine ID; peers must re-run peer add)
         #[arg(long)]
         force: bool,
     },
-    /// 前台运行服务端（日志同时写入 ~/.agent-cli-x/serve-logs/）
+    /// Run server in foreground (logs also go to ~/.agent-cli-x/serve-logs/)
     Serve {
-        /// 端口被占用时最多等待的秒数（升级重启时新进程等待旧进程退出）
+        /// Max seconds to wait if the port is in use (new process waits for old one on upgrade)
         #[arg(long, hide = true, default_value_t = 0)]
         wait_port: u64,
-        /// 只校验 config.toml 与证书，不启动服务（手改配置后用）
+        /// Only validate config.toml and cert, don't start (use after manual edits)
         #[arg(long)]
         check: bool,
     },
-    /// 显示本机的名称、ID、指纹与工作区（不联网）
+    /// Show this node's name, ID, fingerprint and workspaces (offline)
     Whoami {
-        /// 同时打印供其他机器登记本机的 `peer add` 命令（含默认 token）
+        /// Also print the `peer add` command for other machines (includes default token)
         #[arg(long)]
         pair: bool,
     },
-    /// 自检：配置、本机服务、开机自启、防火墙、各对端连通性与版本
+    /// Self-check: config, local service, autostart, firewall, peer connectivity and versions
     Doctor {
-        /// 不检查对端
+        /// Skip peer checks
         #[arg(long)]
         no_peers: bool,
     },
-    /// 管理访问本机的 token（按调用方分别签发，可单独吊销）
+    /// Manage tokens for access to this machine (issued per caller, individually revocable)
     #[command(subcommand)]
     Token(TokenCmd),
-    /// 远程升级对端：上传新二进制并重启对端服务（对端可写 A,B 或 @all）
+    /// Upgrade peers remotely: upload new binary and restart (peer may be A,B or @all)
     Upgrade {
         peer: String,
-        /// 要部署的二进制，默认用本机正在运行的这个（对端系统/架构需相同）
+        /// Binary to deploy, default: the running one (peer OS/arch must match)
         #[arg(long)]
         binary: Option<PathBuf>,
-        /// 对端有后台任务在运行时也强制升级（任务会被中断）
+        /// Upgrade even if peer has running background jobs (jobs are interrupted)
         #[arg(long)]
         force: bool,
     },
-    /// 重启对端 serve（不替换二进制；对端先校验配置，有误则拒绝）；对端可写 A,B 或 @all
+    /// Restart peer serve (binary unchanged; peer validates config first, refuses if invalid); peer may be A,B or @all
     Restart {
         peer: String,
-        /// 对端有后台任务在运行时也强制重启（任务会被中断）
+        /// Restart even if peer has running background jobs (jobs are interrupted)
         #[arg(long)]
         force: bool,
     },
-    /// 更换对端监听端口：经由新端口确认连通后才切换，连不上自动撤销；同时更新本机登记的地址
+    /// Change peer listen port: switches only after the new port is confirmed reachable, else reverted; also updates the local peer address
     SetPort { peer: String, port: u16 },
-    /// 打印本机证书指纹（供对端 peer add 核对）
+    /// Print this machine's cert fingerprint (for verification in peer add)
     Fingerprint,
-    /// 后台任务执行进程（由 serve 启动，不要手动运行）
+    /// Background job runner (started by serve, do not run manually)
     #[command(hide = true)]
     JobRun { dir: PathBuf },
-    /// 打印给 AI 阅读的用法说明
+    /// Print usage guide for AI
     Skill,
-    /// 管理对端节点
+    /// Manage peers
     #[command(subcommand)]
     Peer(PeerCmd),
-    /// 查看对端信息（机器名/ID、系统、shell、工作区、黑名单）；A,B 或 @all 时显示概览
+    /// Show peer info (name/ID, OS, shell, workspaces, deny list); A,B or @all shows an overview
     Info { peer: String },
-    /// 在对端执行命令（选项写在命令之前）；对端写 A,B 或 @all 时并行执行并分组输出
+    /// Run a command on a peer (options before the command); A,B or @all runs in parallel with grouped output
     Exec {
         peer: String,
-        /// 工作目录（工作区:相对路径），默认是对端的默认工作区根目录
+        /// Working dir (workspace:relative/path), default: peer's default workspace root
         #[arg(long)]
         cwd: Option<String>,
-        /// pwsh / powershell / cmd / sh / bash，默认 Windows 用 pwsh，Linux 用 sh
+        /// pwsh / powershell / cmd / sh / bash; default pwsh on Windows, sh on Linux
         #[arg(long)]
         shell: Option<String>,
-        /// 超时秒数（前台受 max_timeout_secs、后台受 job_timeout_secs 限制）
+        /// Timeout in seconds (capped by max_timeout_secs foreground, job_timeout_secs background)
         #[arg(long)]
         timeout: Option<u64>,
-        /// 额外环境变量，可重复：--env KEY=VALUE
+        /// Extra env var, repeatable: --env KEY=VALUE
         #[arg(long = "env", value_name = "KEY=VALUE")]
         envs: Vec<String>,
-        /// 作为后台任务运行，立即返回任务 ID（用 job logs / job kill 管理）
+        /// Run as background job, return job ID immediately (manage with job logs / job kill)
         #[arg(long)]
         detach: bool,
-        /// 不截断输出
+        /// Don't truncate output
         #[arg(long)]
         full: bool,
-        /// 执行本地脚本文件的内容（`-` 表示标准输入），免去多层引号转义；不能与命令同时给出
+        /// Run contents of a local script file (`-` = stdin), avoids quote escaping; not allowed with a command
         #[arg(long, value_name = "FILE", conflicts_with = "command")]
         script: Option<PathBuf>,
-        /// 要执行的命令（多个参数会以空格拼接）
+        /// Command to run (multiple args are joined by spaces)
         #[arg(
             required_unless_present = "script",
             trailing_var_arg = true,
@@ -135,211 +135,211 @@ enum Cmd {
         )]
         command: Vec<String>,
     },
-    /// 管理后台任务
+    /// Manage background jobs
     #[command(subcommand)]
     Job(JobCmd),
-    /// 列目录（遵守 .gitignore，隐藏黑名单路径）
+    /// List a directory (honors .gitignore, hides denied paths)
     Ls {
         peer: String,
         path: Option<String>,
         #[arg(long, default_value_t = 1)]
         depth: usize,
-        /// 最多列出的条目数
+        /// Max entries to list
         #[arg(long, default_value_t = 500)]
         max: usize,
     },
-    /// 在对端搜索文件内容（正则，遵守 .gitignore，跳过二进制与黑名单）
+    /// Search file contents on a peer (regex, honors .gitignore, skips binaries and denied paths)
     Grep {
         peer: String,
         pattern: String,
-        /// 搜索范围（工作区:相对路径），默认默认工作区根目录
+        /// Search scope (workspace:relative/path), default: default workspace root
         path: Option<String>,
-        /// 只搜匹配的文件，可重复：--glob "*.rs"
+        /// Only search matching files, repeatable: --glob "*.rs"
         #[arg(long)]
         glob: Vec<String>,
-        /// 忽略大小写
+        /// Case-insensitive
         #[arg(short = 'i', long)]
         ignore_case: bool,
-        /// 按字面量匹配（不当作正则）
+        /// Match literally (not regex)
         #[arg(short = 'F', long)]
         fixed: bool,
-        /// 最多返回的匹配行数
+        /// Max matching lines to return
         #[arg(long, default_value_t = 200)]
         max: usize,
     },
-    /// 读取文本文件
+    /// Read a text file
     Read {
         peer: String,
         path: String,
-        /// 行范围，如 100:200、100:、:50。不给结束行时每次最多读 2000 行 / 64KB
+        /// Line range, e.g. 100:200, 100:, :50. Without an end line, reads at most 2000 lines / 64KB
         #[arg(long)]
         lines: Option<String>,
-        /// 输出带行号
+        /// Prefix line numbers
         #[arg(short = 'n', long)]
         number: bool,
     },
-    /// 写入整个文件（内容来自 --content / --from / 标准输入）
+    /// Write a whole file (content from --content / --from / stdin)
     Write {
         peer: String,
         path: String,
         #[arg(long, conflicts_with = "from")]
         content: Option<String>,
-        /// 从本地文件读取内容
+        /// Read content from a local file
         #[arg(long)]
         from: Option<PathBuf>,
-        /// 父目录不存在时自动创建
+        /// Create parent dirs if missing
         #[arg(long)]
         mkdir: bool,
-        /// 仅当远端文件当前 sha256 等于此值时才写入（乐观锁）
+        /// Write only if the remote file's current sha256 equals this (optimistic lock)
         #[arg(long)]
         expect_sha: Option<String>,
     },
-    /// 精确替换文件中的文本（old 必须唯一匹配）
+    /// Exact text replace in a file (old must match uniquely)
     Edit {
         peer: String,
         path: String,
         #[arg(long, conflicts_with = "old_file")]
         old: Option<String>,
-        /// 从本地文件读取 old 文本（避免命令行转义问题）
+        /// Read old text from a local file (avoids shell escaping)
         #[arg(long)]
         old_file: Option<PathBuf>,
         #[arg(long, conflicts_with = "new_file")]
         new: Option<String>,
-        /// 从本地文件读取 new 文本
+        /// Read new text from a local file
         #[arg(long)]
         new_file: Option<PathBuf>,
-        /// 替换全部匹配
+        /// Replace all matches
         #[arg(long)]
         all: bool,
         #[arg(long)]
         expect_sha: Option<String>,
     },
-    /// 上传本地文件或目录到对端（目标是已存在目录时放到其下，同 cp -r）
+    /// Upload a local file or dir to a peer (into the target if it is an existing dir, like cp -r)
     Put {
         peer: String,
         local: PathBuf,
-        /// 远端目标（工作区:相对路径）
+        /// Remote target (workspace:relative/path)
         dest: String,
-        /// 排除的文件/目录，可重复：--exclude node_modules --exclude "*.log"
+        /// Files/dirs to exclude, repeatable: --exclude node_modules --exclude "*.log"
         #[arg(long)]
         exclude: Vec<String>,
     },
-    /// 从对端下载文件或目录（本地目标是已存在目录时放到其下）
+    /// Download a file or dir from a peer (into the local target if it is an existing dir)
     Get {
         peer: String,
-        /// 远端源（工作区:相对路径）
+        /// Remote source (workspace:relative/path)
         src: String,
         local: PathBuf,
         #[arg(long)]
         exclude: Vec<String>,
     },
-    /// 在两个对端之间直接复制文件或目录（经本机流式转发，不落本机磁盘）
+    /// Copy a file or dir directly between two peers (streamed via this machine, not saved to local disk)
     #[command(
-        after_help = "示例：agent-cli-x cp win127 dl:pkg ub40 home:\n语义同 put：目标是已存在目录时放到其下。目标端需 0.0.4 及以上，旧版本自动退回本机临时目录中转（用完即删）。"
+        after_help = "Example: agent-cli-x cp win127 dl:pkg ub40 home:\nSame as put: into the target if it is an existing dir. Target needs 0.0.4+; older versions fall back to a local temp dir relay (deleted afterwards)."
     )]
     Cp {
-        /// 源对端
+        /// Source peer
         src_peer: String,
-        /// 源路径（工作区:相对路径）
+        /// Source path (workspace:relative/path)
         src: String,
-        /// 目标对端
+        /// Target peer
         dst_peer: String,
-        /// 目标路径（工作区:相对路径）
+        /// Target path (workspace:relative/path)
         dest: String,
         #[arg(long)]
         exclude: Vec<String>,
     },
-    /// 删除文件或目录：默认移入对端回收站，可用 rollback 还原（需要对端路径权限含 d）
+    /// Delete a file or dir: moved to the peer's trash by default, restorable via rollback (needs path permission d)
     Rm {
         peer: String,
         path: String,
-        /// 删除目录及其下全部内容
+        /// Delete a dir and all its contents
         #[arg(short = 'r', long)]
         recursive: bool,
-        /// 彻底删除：不进回收站、不备份，无法恢复
+        /// Delete permanently: no trash, no backup, unrecoverable
         #[arg(long)]
         permanent: bool,
     },
-    /// 撤销一次 write / edit / put / rm
+    /// Undo one write / edit / put / rm
     Rollback { peer: String, op_id: String },
-    /// 彻底清除一次操作留下的回收站条目和备份（释放空间，之后无法 rollback）
+    /// Permanently remove the trash entry and backups of an operation (frees space; no rollback afterwards)
     Purge { peer: String, op_id: String },
 }
 
 #[derive(Subcommand)]
 enum PeerCmd {
-    /// 登记对端。首次不带 --fingerprint 只显示指纹供核对
+    /// Register a peer. Without --fingerprint it only shows the fingerprint for verification
     Add {
         name: String,
-        /// IP:端口（端口默认 47821）
+        /// IP:port (default port 47821)
         addr: String,
         #[arg(long)]
         token: String,
-        /// 对端指纹（在对端执行 `agent-cli-x fingerprint` 获取）
+        /// Peer fingerprint (get via `agent-cli-x fingerprint` on the peer)
         #[arg(long)]
         fingerprint: Option<String>,
     },
-    /// 修改已登记对端的地址或 token（用登记时的指纹校验身份，连通后才保存）
+    /// Change a registered peer's address or token (verified by the stored fingerprint; saved only once reachable)
     Set {
         name: String,
-        /// 新地址 IP:端口
+        /// New address IP:port
         #[arg(long, required_unless_present = "token")]
         addr: Option<String>,
         #[arg(long)]
         token: Option<String>,
     },
-    /// 列出已登记的对端
+    /// List registered peers
     List,
-    /// 删除对端
+    /// Remove a peer
     Remove { name: String },
 }
 
 #[derive(Subcommand)]
 enum TokenCmd {
-    /// 为一个调用方签发 token，并打印对方需要执行的 `peer add` 命令
+    /// Issue a token for a caller and print the `peer add` command it needs
     Add {
         name: String,
-        /// 禁止借道：该调用方在本机 exec 里不能再用 agent-cli-x 访问其他节点或管理凭据
+        /// No relay: this caller's exec on this machine can't use agent-cli-x to reach other nodes or manage credentials
         #[arg(long)]
         no_relay: bool,
     },
-    /// 修改已签发 token 的限制（不更换 token）
+    /// Change restrictions of an issued token (token unchanged)
     Set {
         name: String,
-        /// 禁止借道
+        /// No relay
         #[arg(long, required_unless_present = "allow_relay")]
         no_relay: bool,
-        /// 取消禁止借道
+        /// Allow relay again
         #[arg(long, conflicts_with = "no_relay")]
         allow_relay: bool,
     },
-    /// 列出已签发的 token（名称、创建时间与限制）
+    /// List issued tokens (name, creation time, restrictions)
     List,
-    /// 吊销一个调用方的 token（serve 运行中几秒内生效）
+    /// Revoke a caller's token (takes effect within seconds on a running serve)
     Remove { name: String },
-    /// 更换 token（名称为 default 时更换 config.toml 中的默认 token）
+    /// Rotate a token (name `default` rotates the default token in config.toml)
     Rotate { name: String },
 }
 
 #[derive(Subcommand)]
 enum JobCmd {
-    /// 列出最近的后台任务
+    /// List recent background jobs
     List {
         peer: String,
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
-    /// 查看任务输出；--follow 持续输出直到任务结束，并以任务退出码退出
+    /// Show job output; --follow streams until the job ends and exits with its exit code
     Logs {
         peer: String,
         id: String,
         #[arg(short = 'f', long)]
         follow: bool,
-        /// 不截断输出
+        /// Don't truncate output
         #[arg(long)]
         full: bool,
     },
-    /// 终止任务（连同整棵进程树）
+    /// Kill a job (whole process tree)
     Kill { peer: String, id: String },
 }
 
@@ -356,9 +356,9 @@ fn check_no_relay(cmd: &Cmd) -> Result<bool> {
             Ok(true)
         }
         _ => Err(AppError::denied(format!(
-            "当前命令运行在调用方 `{who}` 发起的 exec 中，本机禁止借道：不能再用 agent-cli-x \
-             访问其他节点或管理本机凭据。请在你自己的机器上直接操作；需要访问其他节点请告知用户，\
-             不要尝试绕过（读取凭据文件、清除 {} 环境变量或直连）",
+            "This command runs inside an exec started by caller `{who}`, which is not allowed to relay: it can't use agent-cli-x \
+             to reach other nodes or manage local credentials. Work on your own machine; if other nodes are needed, tell the user, \
+             and do not try to bypass (reading credential files, clearing {} env vars, direct connections)",
             config::NO_RELAY_ENV
         ))),
     }
@@ -381,7 +381,7 @@ pub fn run() -> Result<i32> {
             if json {
                 println!("{}", json!({"ok": true, "listen": listen}));
             } else {
-                println!("配置有效（监听 {listen}）");
+                println!("Config valid (listen {listen})");
             }
             Ok(0)
         }
@@ -396,12 +396,12 @@ pub fn run() -> Result<i32> {
             force,
         } => {
             client::disable_version_warning();
-            each_peer(&peer, json, "升级", |c| {
+            each_peer(&peer, json, "upgrade", |c| {
                 client::upgrade::upgrade(c, binary.as_deref(), force)
             })
         }
         Cmd::Restart { peer, force } => {
-            each_peer(&peer, json, "重启", |c| client::admin::restart(c, force))
+            each_peer(&peer, json, "restart", |c| client::admin::restart(c, force))
         }
         Cmd::SetPort { peer, port } => set_port(&peer, port, json),
         Cmd::Fingerprint => {
@@ -449,7 +449,7 @@ pub fn run() -> Result<i32> {
             let body = exec_body(cwd, shell, timeout, envs, cmd)?;
             if multi::is_multi(&peer) {
                 if detach {
-                    return Err(AppError::bad_request("--detach 一次只能用于一个对端"));
+                    return Err(AppError::bad_request("--detach works with one peer only"));
                 }
                 let peers = multi::resolve(&peer)?;
                 return Ok(multi::exec_many(&peers, &body, timeout, full, json));
@@ -485,7 +485,7 @@ pub fn run() -> Result<i32> {
                 }
                 if v["truncated"].as_bool() == Some(true) {
                     eprintln!(
-                        "[agent-cli-x: 已达 --max {max} 条上限，请缩小目录、降低 --depth，或改用 grep]"
+                        "[agent-cli-x: --max {max} limit reached; narrow the dir, lower --depth, or use grep]"
                     );
                 }
             }
@@ -526,7 +526,7 @@ pub fn run() -> Result<i32> {
                     );
                 }
                 if v["truncated"].as_bool() == Some(true) {
-                    eprintln!("[agent-cli-x: 已达 --max {max} 条上限，请缩小范围或用 --glob 过滤]");
+                    eprintln!("[agent-cli-x: --max {max} limit reached; narrow the scope or filter with --glob]");
                 }
             }
             // 与 grep 一致：无匹配返回 1
@@ -556,7 +556,7 @@ pub fn run() -> Result<i32> {
                 &json!({"path": path, "content": content, "mkdir": mkdir, "expect_sha": expect_sha}),
                 CALL_TIMEOUT,
             )?;
-            print_write_result(&v, json, "写入");
+            print_write_result(&v, json, "wrote");
             Ok(0)
         }
         Cmd::Edit {
@@ -576,7 +576,7 @@ pub fn run() -> Result<i32> {
                 &json!({"path": path, "old": old, "new": new, "replace_all": all, "expect_sha": expect_sha}),
                 CALL_TIMEOUT,
             )?;
-            print_write_result(&v, json, "修改");
+            print_write_result(&v, json, "edited");
             Ok(0)
         }
         Cmd::Put {
@@ -590,16 +590,16 @@ pub fn run() -> Result<i32> {
                 println!("{v}");
             } else {
                 println!(
-                    "已上传 {} 个文件（{}）到 {}",
+                    "Uploaded {} files ({}) to {}",
                     v["files"],
                     human_size(v["bytes"].as_u64().unwrap_or(0)),
                     v["dest"].as_str().unwrap_or_default()
                 );
                 if let Some(op) = v["op_id"].as_str() {
-                    println!("  op_id={op}（撤销: agent-cli-x rollback {peer} {op}）");
+                    println!("  op_id={op} (undo: agent-cli-x rollback {peer} {op})");
                 }
                 if v["skipped_symlinks"].as_u64().unwrap_or(0) > 0 {
-                    eprintln!("[agent-cli-x: 跳过了 {} 个符号链接]", v["skipped_symlinks"]);
+                    eprintln!("[agent-cli-x: skipped {} symlinks]", v["skipped_symlinks"]);
                 }
             }
             Ok(0)
@@ -615,7 +615,7 @@ pub fn run() -> Result<i32> {
                 println!("{v}");
             } else {
                 println!(
-                    "已下载 {} 个文件（{}）到 {}",
+                    "Downloaded {} files ({}) to {}",
                     v["files"],
                     human_size(v["bytes"].as_u64().unwrap_or(0)),
                     v["dest"].as_str().unwrap_or_default()
@@ -638,19 +638,19 @@ pub fn run() -> Result<i32> {
             } else {
                 for f in v["files"].as_array().into_iter().flatten() {
                     let action = match f["action"].as_str() {
-                        Some("purged") => "已从回收站彻底删除",
-                        _ => "回收站中已不存在（可能已清空或还原）",
+                        Some("purged") => "Permanently deleted from trash",
+                        _ => "No longer in trash (may have been emptied or restored)",
                     };
                     println!("{action}: {}", f["path"].as_str().unwrap_or_default());
                 }
                 let n = v["backups"].as_u64().unwrap_or(0);
                 if n > 0 {
                     println!(
-                        "已删除 {n} 个备份副本（{}）",
+                        "Deleted {n} backup copies ({})",
                         human_size(v["backup_bytes"].as_u64().unwrap_or(0))
                     );
                 }
-                println!("操作 {op_id} 已清除，无法再 rollback");
+                println!("Operation {op_id} purged; rollback no longer possible");
             }
             Ok(0)
         }
@@ -669,31 +669,33 @@ pub fn run() -> Result<i32> {
                 println!("{v}");
             } else {
                 let mut parts = vec![format!(
-                    "{} 个文件（{}）",
+                    "{} files ({})",
                     v["files"],
                     human_size(v["bytes"].as_u64().unwrap_or(0))
                 )];
                 if v["dirs"].as_u64().unwrap_or(0) > 0 {
-                    parts.push(format!("{} 个目录", v["dirs"]));
+                    parts.push(format!("{} dirs", v["dirs"]));
                 }
                 if v["links"].as_u64().unwrap_or(0) > 0 {
-                    parts.push(format!("{} 个符号链接", v["links"]));
+                    parts.push(format!("{} symlinks", v["links"]));
                 }
                 let how = match v["method"].as_str() {
-                    Some("trash") => "已移入回收站",
-                    Some("permanent") => "已彻底删除",
-                    _ => "已删除（已备份）",
+                    Some("trash") => "Moved to trash",
+                    Some("permanent") => "Permanently deleted",
+                    _ => "Deleted (backed up)",
                 };
                 println!(
-                    "{how} {}：{}",
+                    "{how} {}: {}",
                     v["path"].as_str().unwrap_or_default(),
-                    parts.join("、")
+                    parts.join(", ")
                 );
                 if let Some(op) = v["op_id"].as_str() {
-                    println!("  op_id={op}（撤销: agent-cli-x rollback {peer} {op}；释放空间: agent-cli-x purge {peer} {op}）");
+                    println!("  op_id={op} (undo: agent-cli-x rollback {peer} {op}; free space: agent-cli-x purge {peer} {op})");
                 }
                 if let Some(e) = v["trash_error"].as_str() {
-                    eprintln!("[agent-cli-x: 回收站不可用（{e}），已改为备份后删除]");
+                    eprintln!(
+                        "[agent-cli-x: trash unavailable ({e}); deleted after backup instead]"
+                    );
                 }
             }
             Ok(0)
@@ -709,15 +711,17 @@ pub fn run() -> Result<i32> {
             } else {
                 for f in v["files"].as_array().into_iter().flatten() {
                     let action = match f["action"].as_str() {
-                        Some("deleted") => "已删除新建的文件",
-                        Some("rmdir") => "已删除新建的目录",
-                        Some("kept_dir") => "保留已有目录",
-                        Some("recreated_dir") => "已重建被删除的目录",
-                        Some("untrashed") => "已从回收站还原",
-                        Some("relinked") => "已重建符号链接",
-                        Some("kept_link") => "保留已有符号链接",
-                        Some("link_failed") => "符号链接重建失败（可能缺少权限）",
-                        _ => "已恢复为修改前内容",
+                        Some("deleted") => "Removed created file",
+                        Some("rmdir") => "Removed created dir",
+                        Some("kept_dir") => "Kept existing dir",
+                        Some("recreated_dir") => "Recreated deleted dir",
+                        Some("untrashed") => "Restored from trash",
+                        Some("relinked") => "Recreated symlink",
+                        Some("kept_link") => "Kept existing symlink",
+                        Some("link_failed") => {
+                            "Symlink recreation failed (possibly missing permission)"
+                        }
+                        _ => "Restored to pre-change content",
                     };
                     println!("{action}: {}", f["path"].as_str().unwrap_or_default());
                 }
@@ -738,25 +742,25 @@ fn init(
     let cfg_path = config::config_path(&home);
     if cfg_path.exists() && !force {
         return Err(AppError::config(format!(
-            "{} 已存在。如需重新生成（会更换 token、证书和机器 ID）请加 --force",
+            "{} already exists. To regenerate (replaces token, cert and machine ID) add --force",
             cfg_path.display()
         )));
     }
     let node_name = name.unwrap_or_else(config::default_node_name);
-    config::validate_name(&node_name, "机器")?;
+    config::validate_name(&node_name, "machine")?;
     let mut ws = Vec::new();
     for item in workspaces {
         let (name, path) = item.split_once('=').ok_or_else(|| {
-            AppError::bad_request(format!("--workspace `{item}` 格式应为 NAME=PATH"))
+            AppError::bad_request(format!("--workspace `{item}` must be NAME=PATH"))
         })?;
-        config::validate_name(name, "工作区")?;
+        config::validate_name(name, "workspace")?;
         let canon = dunce::canonicalize(path)
-            .map_err(|e| AppError::bad_request(format!("工作区路径 `{path}` 无效: {e}")))?;
+            .map_err(|e| AppError::bad_request(format!("Invalid workspace path `{path}`: {e}")))?;
         ws.push((name.to_string(), canon.to_string_lossy().replace('\\', "/")));
     }
     std::fs::create_dir_all(&home)?;
     let token = util::random_hex(24);
-    let node_id = util::uuid_v4();
+    let node_id = util::short_id();
     let fp = tls::generate(&home)?;
     util::atomic_write(
         &cfg_path,
@@ -782,24 +786,24 @@ fn init(
         );
         return Ok(0);
     }
-    println!("已初始化 {}", home.display());
-    println!("  机器:   {node_name} ({node_id})");
-    println!("  配置:   {}", cfg_path.display());
-    println!("  监听:   {listen}");
+    println!("Initialized {}", home.display());
+    println!("  Node:   {node_name} ({node_id})");
+    println!("  Config: {}", cfg_path.display());
+    println!("  Listen: {listen}");
     println!("  token:  {token}");
-    println!("  指纹:   {fp}");
+    println!("  Fingerprint: {fp}");
     println!();
-    println!("下一步:");
-    println!("  1. 编辑配置，在 [workspaces] 中登记允许访问的目录、按需调整 deny_paths / [[policy.paths]] / deny_commands 预设");
-    println!("  2. 运行 `agent-cli-x serve`");
-    println!("  3. 在要访问本机的机器上执行（为每个调用方单独签发 token 可用 `agent-cli-x token add <名称>`）:");
+    println!("Next steps:");
+    println!("  1. Edit the config: register accessible dirs under [workspaces]; adjust deny_paths / [[policy.paths]] / deny_commands as needed");
+    println!("  2. Run `agent-cli-x serve`");
+    println!("  3. On the machine that will access this one (per-caller token: `agent-cli-x token add <name>`):");
     println!("     {}", pair_command(&node_name, listen, &token, &fp));
-    println!("  4. 配置开机自启（见 README「Start at boot」），完成后用 `agent-cli-x doctor` 自检");
+    println!("  4. Set up autostart (see README 'Start at boot'), then run `agent-cli-x doctor`");
     if cfg!(windows) {
-        println!("  防火墙（管理员 PowerShell 执行一次；按程序放行，以后改端口不用再改）:");
+        println!("  Firewall (run once in admin PowerShell; allows the program, so port changes need no update):");
         println!("     {}", crate::firewall::program_rule_cmd());
     } else {
-        println!("  防火墙（如启用了 ufw）: sudo ufw allow {port}/tcp");
+        println!("  Firewall (if ufw is enabled): sudo ufw allow {port}/tcp");
     }
     Ok(0)
 }
@@ -809,7 +813,7 @@ fn pair_command(node_name: &str, listen: &str, token: &str, fp: &str) -> String 
     let port = listen.rsplit(':').next().unwrap_or_default();
     let host = listen[..listen.len() - port.len()].trim_end_matches(':');
     let ip = match host {
-        "" | "0.0.0.0" | "[::]" => util::local_ip().unwrap_or_else(|| "<本机IP>".into()),
+        "" | "0.0.0.0" | "[::]" => util::local_ip().unwrap_or_else(|| "<local-IP>".into()),
         h => h.to_string(),
     };
     format!("agent-cli-x peer add {node_name} {ip}:{port} --token {token} --fingerprint {fp}")
@@ -841,13 +845,13 @@ fn whoami(pair: bool, json: bool) -> Result<i32> {
             std::env::consts::OS,
             std::env::consts::ARCH
         );
-        println!("  监听: {}", cfg.listen);
-        println!("  指纹: {fp}");
+        println!("  Listen: {}", cfg.listen);
+        println!("  Fingerprint: {fp}");
         for (n, p) in &cfg.workspaces {
-            println!("  工作区 {n} = {p}");
+            println!("  Workspace {n} = {p}");
         }
         if pair {
-            println!("  在要访问本机的机器上执行:");
+            println!("  On the machine that will access this one:");
             println!(
                 "    {}",
                 pair_command(&cfg.node_name(), &cfg.listen, &cfg.token, &fp)
@@ -870,8 +874,8 @@ fn token(cmd: TokenCmd, json: bool) -> Result<i32> {
                 json!({"name": name, "token": tok, "pair_command": cmd})
             );
         } else {
-            println!("已{verb} token `{name}`: {tok}");
-            println!("在调用方执行（token 只显示这一次）:");
+            println!("{verb} token `{name}`: {tok}");
+            println!("Run on the caller (token shown only once):");
             println!("  {cmd}");
         }
     };
@@ -880,7 +884,7 @@ fn token(cmd: TokenCmd, json: bool) -> Result<i32> {
             config::validate_name(&name, "token")?;
             if name == DEFAULT_TOKEN_NAME || tokens.tokens.contains_key(&name) {
                 return Err(AppError::conflict(format!(
-                    "token `{name}` 已存在，更换请用 `agent-cli-x token rotate {name}`"
+                    "token `{name}` already exists; to replace use `agent-cli-x token rotate {name}`"
                 )));
             }
             let tok = util::random_hex(24);
@@ -893,9 +897,9 @@ fn token(cmd: TokenCmd, json: bool) -> Result<i32> {
                 },
             );
             config::save_tokens(&home, &tokens)?;
-            issued(&name, &tok, "签发");
+            issued(&name, &tok, "Issued");
             if no_relay && !json {
-                println!("该调用方已禁止借道：它在本机 exec 里不能再调用 agent-cli-x 访问其他节点");
+                println!("This caller is barred from relaying: its exec on this machine can't use agent-cli-x to reach other nodes");
             }
         }
         TokenCmd::Set {
@@ -905,20 +909,20 @@ fn token(cmd: TokenCmd, json: bool) -> Result<i32> {
         } => {
             if name == DEFAULT_TOKEN_NAME {
                 return Err(AppError::bad_request(
-                    "默认 token 不支持限制，请为该调用方单独 `token add <名称> --no-relay`",
+                    "The default token can't be restricted; use a separate `token add <name> --no-relay` for this caller",
                 ));
             }
             let Some(e) = tokens.tokens.get_mut(&name) else {
-                return Err(AppError::not_found(format!("没有名为 `{name}` 的 token")));
+                return Err(AppError::not_found(format!("No token named `{name}`")));
             };
             e.no_relay = no_relay;
             config::save_tokens(&home, &tokens)?;
             if json {
                 println!("{}", json!({"name": name, "no_relay": no_relay}));
             } else if no_relay {
-                println!("token `{name}` 已禁止借道（运行中的 serve 几秒内生效）");
+                println!("token `{name}` relay disabled (takes effect within seconds on a running serve)");
             } else {
-                println!("token `{name}` 已取消禁止借道（运行中的 serve 几秒内生效）");
+                println!("token `{name}` relay re-enabled (takes effect within seconds on a running serve)");
             }
         }
         TokenCmd::Rotate { name } => {
@@ -927,31 +931,31 @@ fn token(cmd: TokenCmd, json: bool) -> Result<i32> {
                 config::replace_config_token(&home, &tok)?;
             } else {
                 let Some(e) = tokens.tokens.get_mut(&name) else {
-                    return Err(AppError::not_found(format!("没有名为 `{name}` 的 token")));
+                    return Err(AppError::not_found(format!("No token named `{name}`")));
                 };
                 e.sha256 = util::sha256_hex(tok.as_bytes());
                 e.created = util::now_iso();
                 config::save_tokens(&home, &tokens)?;
             }
-            issued(&name, &tok, "更换");
+            issued(&name, &tok, "Rotated");
             if !json {
-                println!("旧 token 已作废（运行中的 serve 几秒内生效），用旧 token 登记的调用方需重新 peer add");
+                println!("Old token invalidated (effective within seconds on a running serve); callers registered with it must re-run peer add");
             }
         }
         TokenCmd::Remove { name } => {
             if name == DEFAULT_TOKEN_NAME {
                 return Err(AppError::bad_request(
-                    "默认 token 不能删除，可用 `agent-cli-x token rotate default` 更换",
+                    "The default token can't be deleted; rotate it with `agent-cli-x token rotate default`",
                 ));
             }
             if tokens.tokens.remove(&name).is_none() {
-                return Err(AppError::not_found(format!("没有名为 `{name}` 的 token")));
+                return Err(AppError::not_found(format!("No token named `{name}`")));
             }
             config::save_tokens(&home, &tokens)?;
             if json {
                 println!("{}", json!({"removed": name}));
             } else {
-                println!("已吊销 token `{name}`（运行中的 serve 几秒内生效）");
+                println!("Revoked token `{name}` (effective within seconds on a running serve)");
             }
         }
         TokenCmd::List => {
@@ -968,7 +972,7 @@ fn token(cmd: TokenCmd, json: bool) -> Result<i32> {
             } else {
                 println!("{DEFAULT_TOKEN_NAME}\t(config.toml)");
                 for (n, e) in &tokens.tokens {
-                    let flag = if e.no_relay { "\t禁止借道" } else { "" };
+                    let flag = if e.no_relay { "\tno-relay" } else { "" };
                     println!("{n}\t{}{flag}", e.created);
                 }
             }
@@ -989,27 +993,27 @@ fn each_peer(
     let mut code = 0;
     for p in &peers {
         if !json {
-            eprintln!("[agent-cli-x: 正在{verb} {p} …]");
+            eprintln!("[agent-cli-x: {verb} {p} ...]");
         }
         match Client::load(p).and_then(|c| f(&c)) {
             Ok(v) => {
                 if !json {
                     let how = if v["restart"] == "exit" {
-                        "由服务管理器重启"
+                        "restarted by service manager"
                     } else {
-                        "已自动重启"
+                        "restarted automatically"
                     };
                     let secs = v["ms"].as_u64().unwrap_or(0) as f64 / 1000.0;
                     let how = match v["kept_jobs"].as_u64() {
-                        Some(n) if n > 0 => format!("{how}，{n} 个后台任务继续运行"),
+                        Some(n) if n > 0 => format!("{how}, {n} background jobs still running"),
                         _ => how.to_string(),
                     };
                     match v["new_version"].as_str() {
                         Some(new) => println!(
-                            "{p}: {} → {new}（{how}，用时 {secs:.1}s）",
+                            "{p}: {} → {new}({how}, took {secs:.1}s)",
                             v["old_version"].as_str().unwrap_or("?")
                         ),
-                        None => println!("{p}: 已重启（{how}，用时 {secs:.1}s）"),
+                        None => println!("{p}: restarted({how}, took {secs:.1}s)"),
                     }
                 }
                 results.push(v);
@@ -1019,7 +1023,7 @@ fn each_peer(
                     code = e.exit_code();
                 }
                 if !json {
-                    println!("{p}: {verb}失败 {e}");
+                    println!("{p}: {verb} failed {e}");
                 }
                 results.push(json!({"peer": p, "error": http::error_json(&e)}));
             }
@@ -1045,10 +1049,10 @@ fn set_port(peer: &str, port: u16, json: bool) -> Result<i32> {
         .filter_map(|x| x.as_str())
         .collect();
     println!(
-        "{peer}: 已改为监听端口 {port}，本机登记的 {} 已更新为 {addr}",
-        names.join("、")
+        "{peer}: now listening on port {port}; local entry for {} updated to {addr}",
+        names.join(", ")
     );
-    println!("其他登记了这台机器的节点需执行: agent-cli-x peer set <名称> --addr {addr}");
+    println!("Other nodes that registered this machine must run: agent-cli-x peer set <name> --addr {addr}");
     Ok(0)
 }
 
@@ -1061,17 +1065,17 @@ fn peer(cmd: PeerCmd, json: bool) -> Result<i32> {
             token,
             fingerprint,
         } => {
-            config::validate_name(&name, "对端")?;
+            config::validate_name(&name, "peer")?;
             let addr = config::normalize_addr(&addr);
             let seen = client::discover_fingerprint(&addr)?;
             let Some(want) = fingerprint else {
                 return Err(AppError::fingerprint(format!(
-                    "{addr} 的证书指纹为 {seen}\n请在对端执行 `agent-cli-x fingerprint` 核对一致后，追加参数重新登记:\n  --fingerprint {seen}"
+                    "{addr} cert fingerprint is {seen}\nVerify it matches `agent-cli-x fingerprint` on the peer, then register again with:\n  --fingerprint {seen}"
                 )));
             };
             if !want.trim().eq_ignore_ascii_case(&seen) {
                 return Err(AppError::fingerprint(format!(
-                    "指纹不一致：期望 {want}，实际 {seen}。请勿登记，确认对端身份后再试"
+                    "Fingerprint mismatch: expected {want}, got {seen}. Do not register; verify the peer's identity and retry"
                 )));
             }
             let mut p = Peer {
@@ -1091,7 +1095,7 @@ fn peer(cmd: PeerCmd, json: bool) -> Result<i32> {
                     .find(|(n, q)| *n != &name && q.node_id.as_ref() == Some(id))
                 {
                     eprintln!(
-                        "[agent-cli-x: 注意，这台机器已以 `{other}` 的名称登记过（相同 node_id）]"
+                        "[agent-cli-x: note: this machine is already registered as `{other}` (same node_id)]"
                     );
                 }
             }
@@ -1100,7 +1104,7 @@ fn peer(cmd: PeerCmd, json: bool) -> Result<i32> {
             if json {
                 println!("{}", json!({"added": name, "info": info}));
             } else {
-                println!("已登记对端 {name} ({addr})");
+                println!("Registered peer {name} ({addr})");
                 print_info(&name, &info);
             }
             Ok(0)
@@ -1108,7 +1112,7 @@ fn peer(cmd: PeerCmd, json: bool) -> Result<i32> {
         PeerCmd::Set { name, addr, token } => {
             let mut peers = config::load_peers(&home)?;
             let Some(old) = peers.peers.get(&name) else {
-                return Err(AppError::not_found(format!("未登记对端 `{name}`")));
+                return Err(AppError::not_found(format!("Peer `{name}` not registered")));
             };
             let mut p = old.clone();
             if let Some(a) = addr {
@@ -1127,7 +1131,7 @@ fn peer(cmd: PeerCmd, json: bool) -> Result<i32> {
             if json {
                 println!("{}", json!({"updated": name, "addr": addr}));
             } else {
-                println!("已更新对端 {name} ({addr})");
+                println!("Updated peer {name} ({addr})");
             }
             Ok(0)
         }
@@ -1169,7 +1173,10 @@ fn peer(cmd: PeerCmd, json: bool) -> Result<i32> {
                 }
                 if !fresh.is_empty() && !json {
                     let names: Vec<&str> = fresh.iter().map(|(n, _)| *n).collect();
-                    eprintln!("[agent-cli-x: 已联网补全 {} 的系统信息]", names.join(", "));
+                    eprintln!(
+                        "[agent-cli-x: fetched system info for {}]",
+                        names.join(", ")
+                    );
                 }
             }
             if json {
@@ -1192,7 +1199,7 @@ fn peer(cmd: PeerCmd, json: bool) -> Result<i32> {
                 println!("{}", Value::Array(list));
             } else if peers.peers.is_empty() {
                 println!(
-                    "尚未登记对端。使用 `agent-cli-x peer add <名称> <IP:端口> --token <token>`"
+                    "No peers registered. Use `agent-cli-x peer add <name> <IP:port> --token <token>`"
                 );
             } else {
                 for (n, p) in &peers.peers {
@@ -1216,10 +1223,10 @@ fn peer(cmd: PeerCmd, json: bool) -> Result<i32> {
         PeerCmd::Remove { name } => {
             let mut peers = config::load_peers(&home)?;
             if peers.peers.remove(&name).is_none() {
-                return Err(AppError::not_found(format!("未登记对端 `{name}`")));
+                return Err(AppError::not_found(format!("Peer `{name}` not registered")));
             }
             config::save_peers(&home, &peers)?;
-            println!("已删除对端 {name}");
+            println!("Removed peer {name}");
             Ok(0)
         }
     }
@@ -1236,7 +1243,7 @@ fn exec_body(
     for kv in envs {
         let (k, v) = kv
             .split_once('=')
-            .ok_or_else(|| AppError::bad_request(format!("--env `{kv}` 格式应为 KEY=VALUE")))?;
+            .ok_or_else(|| AppError::bad_request(format!("--env `{kv}` must be KEY=VALUE")))?;
         env.insert(k.to_string(), v.to_string());
     }
     Ok(json!({"cmd": command, "cwd": cwd, "shell": shell, "timeout_secs": timeout, "env": env}))
@@ -1251,11 +1258,11 @@ fn script_text(f: &std::path::Path, shell: Option<&str>) -> Result<String> {
     };
     let text = raw.trim_start_matches('\u{feff}').replace("\r\n", "\n");
     if text.trim().is_empty() {
-        return Err(AppError::bad_request("脚本内容为空"));
+        return Err(AppError::bad_request("Script is empty"));
     }
     if shell.is_some_and(|s| s.eq_ignore_ascii_case("cmd")) && text.trim_end().contains('\n') {
         return Err(AppError::bad_request(
-            "cmd 不支持多行 --script，请改用 pwsh / powershell，或先用 write 写成 .bat 再执行",
+            "cmd doesn't support multi-line --script; use pwsh / powershell, or write a .bat first and run it",
         ));
     }
     Ok(text)
@@ -1277,7 +1284,7 @@ fn exec(peer: &str, body: &Value, timeout: Option<u64>, full: bool, json: bool) 
         Ok(())
     })?;
     let exit = exit
-        .ok_or_else(|| AppError::connect("连接中断，未收到命令退出码（命令可能仍在对端运行）"))?;
+        .ok_or_else(|| AppError::connect("Connection lost before the exit code arrived (command may still be running on the peer)"))?;
     Ok(out.finish(&exit))
 }
 
@@ -1288,11 +1295,11 @@ fn start_job(peer: &str, body: &Value, json: bool) -> Result<i32> {
     } else {
         let id = v["job_id"].as_str().unwrap_or_default();
         println!(
-            "已在后台启动任务 {id}（工作目录 {}）",
+            "Started job {id} in background (cwd {})",
             v["cwd"].as_str().unwrap_or_default()
         );
-        println!("  查看输出: agent-cli-x job logs {peer} {id} --follow");
-        println!("  终止任务: agent-cli-x job kill {peer} {id}");
+        println!("  Logs: agent-cli-x job logs {peer} {id} --follow");
+        println!("  Kill: agent-cli-x job kill {peer} {id}");
     }
     Ok(0)
 }
@@ -1311,7 +1318,7 @@ fn job(cmd: JobCmd, json: bool) -> Result<i32> {
             }
             let jobs = v["jobs"].as_array().cloned().unwrap_or_default();
             if jobs.is_empty() {
-                println!("没有后台任务");
+                println!("No background jobs");
             }
             for j in jobs {
                 let cmd: String = j["cmd"]
@@ -1341,9 +1348,11 @@ fn job(cmd: JobCmd, json: bool) -> Result<i32> {
             } else {
                 match v["status"].as_str() {
                     Some("killing") => {
-                        println!("已发送终止请求: {id}（尚未确认结束，稍后用 job list 查看）")
+                        println!(
+                            "Kill requested: {id} (not yet confirmed; check later with job list)"
+                        )
                     }
-                    _ => println!("已终止任务: {id}"),
+                    _ => println!("Killed job: {id}"),
                 }
             }
             Ok(0)
@@ -1372,24 +1381,25 @@ fn job(cmd: JobCmd, json: bool) -> Result<i32> {
                     Ok(())
                 },
             )?;
-            let end = end.ok_or_else(|| AppError::connect("连接中断，未收到任务状态"))?;
+            let end =
+                end.ok_or_else(|| AppError::connect("Connection lost before job status arrived"))?;
             let status = end["status"].as_str().unwrap_or_default().to_string();
             match status.as_str() {
                 "running" => {
                     out.finish(&json!({"code": 0}));
-                    eprintln!("[agent-cli-x: 任务仍在运行；用 --follow 等待结束]");
+                    eprintln!("[agent-cli-x: job still running; use --follow to wait]");
                     Ok(0)
                 }
                 "lost" => {
                     out.finish(&json!({"code": 1}));
                     eprintln!(
-                        "[agent-cli-x: 任务的执行进程已不在（机器重启或进程被终止），无法得知结果]"
+                        "[agent-cli-x: job process is gone (machine restarted or process killed); result unknown]"
                     );
                     Ok(1)
                 }
                 "killed" => {
                     out.finish(&json!({"code": 137}));
-                    eprintln!("[agent-cli-x: 任务已被终止]");
+                    eprintln!("[agent-cli-x: job was killed]");
                     Ok(137)
                 }
                 _ => Ok(out.finish(&end)),
@@ -1421,7 +1431,7 @@ fn cp(
             if show && last.elapsed() >= Duration::from_millis(500) {
                 last = std::time::Instant::now();
                 eprint!(
-                    "\r[agent-cli-x: 已转发 {files} 个文件（{}）]   ",
+                    "\r[agent-cli-x: forwarded {files} files ({})]   ",
                     human_size(bytes)
                 );
             }
@@ -1446,7 +1456,7 @@ fn cp(
         v["via"] = json!("local_temp");
         if !json {
             eprintln!(
-                "[agent-cli-x: {dst_peer} 版本 {} 不支持直传，已经本机临时目录中转（已删除）；升级对端后可直传]",
+                "[agent-cli-x: {dst_peer} version {} lacks direct transfer; relayed via local temp dir (deleted); upgrade the peer for direct transfer]",
                 dinfo["version"].as_str().unwrap_or("?")
             );
         }
@@ -1459,7 +1469,7 @@ fn cp(
     } else {
         let bytes = v["bytes"].as_u64().unwrap_or(0);
         println!(
-            "已复制 {} 个文件（{}，{:.1}s，{}/s）: {src_peer} {src} → {dst_peer} {}",
+            "Copied {} files ({}, {:.1}s, {}/s): {src_peer} {src} → {dst_peer} {}",
             v["files"],
             human_size(bytes),
             ms as f64 / 1000.0,
@@ -1467,7 +1477,7 @@ fn cp(
             v["dest"].as_str().unwrap_or_default()
         );
         if let Some(op) = v["op_id"].as_str() {
-            println!("  op_id={op}（撤销: agent-cli-x rollback {dst_peer} {op}）");
+            println!("  op_id={op} (undo: agent-cli-x rollback {dst_peer} {op})");
         }
     }
     Ok(0)
@@ -1487,7 +1497,7 @@ fn read(peer: &str, path: &str, lines: Option<String>, number: bool, json: bool)
                     Ok(None)
                 } else {
                     s.trim().parse::<usize>().map(Some).map_err(|_| {
-                        AppError::bad_request(format!("--lines `{spec}` 格式应为 起:止"))
+                        AppError::bad_request(format!("--lines `{spec}` must be START:END"))
                     })
                 }
             };
@@ -1529,10 +1539,10 @@ fn read(peer: &str, path: &str, lines: Option<String>, number: bool, json: bool)
         v["truncated"].as_bool() == Some(true) || first > 1 || total.is_some_and(|t| last < t);
     if partial {
         eprintln!(
-            "\n[agent-cli-x: 显示第 {first}-{last} 行，共 {} 行{}；继续读取用 --lines {}:{}]",
+            "\n[agent-cli-x: showing lines {first}-{last} of {}{}; continue with --lines {}:{}]",
             total.map(|t| t.to_string()).unwrap_or_else(|| "?".into()),
             if v["truncated"].as_bool() == Some(true) {
-                "，已达单次读取上限"
+                ", read limit reached"
             } else {
                 ""
             },
@@ -1545,18 +1555,18 @@ fn read(peer: &str, path: &str, lines: Option<String>, number: bool, json: bool)
 
 fn print_info(name: &str, v: &Value) {
     println!(
-        "{name} → 机器 {} ({})",
+        "{name} → node {} ({})",
         v["node_name"].as_str().unwrap_or("?"),
         v["node_id"].as_str().unwrap_or("-")
     );
     let ver = v["version"].as_str().unwrap_or("?");
     println!(
-        "  主机 {}  {}/{}  agent-cli-x {ver}{}  默认 shell: {}",
+        "  host {}  {}/{}  agent-cli-x {ver}{}  default shell: {}",
         v["hostname"].as_str().unwrap_or("?"),
         v["os"].as_str().unwrap_or("?"),
         v["arch"].as_str().unwrap_or("?"),
         if ver != http::VERSION {
-            format!("（本机 {}，可用 upgrade 统一）", http::VERSION)
+            format!(" (local {}; use upgrade to sync)", http::VERSION)
         } else {
             String::new()
         },
@@ -1564,22 +1574,22 @@ fn print_info(name: &str, v: &Value) {
     );
     if let Some(user) = v["exec_user"].as_str() {
         let elevated = match (v["exec_elevated"] == true, v["os"] == "windows") {
-            (true, true) => "，管理员",
-            (true, false) => "，root",
+            (true, true) => ", admin",
+            (true, false) => ", root",
             _ => "",
         };
         println!(
-            "  exec 身份: {user}{elevated}（exec 不受下方路径权限/禁止访问约束，只受命令黑名单约束）"
+            "  exec identity: {user}{elevated} (exec is not bound by the path rules/deny list below, only the command deny list)"
         );
     }
     if let Some(e) = v["config_error"].as_str() {
         println!(
-            "  配置异常: config.toml 有误，正在用上次可用的配置运行（{e}）。修复后执行 `agent-cli-x restart {name}`"
+            "  Config error: config.toml is invalid, running with the last good config ({e}). After fixing run `agent-cli-x restart {name}`"
         );
     }
     if v["caller_no_relay"] == true {
         println!(
-            "  本机对你禁止借道: 你（{}）在本机 exec 里不能再调用 agent-cli-x 访问其他节点",
+            "  Relay barred for you: your ({}) exec on this machine can't use agent-cli-x to reach other nodes",
             v["caller"].as_str().unwrap_or("?")
         );
     }
@@ -1587,8 +1597,8 @@ fn print_info(name: &str, v: &Value) {
     for w in v["workspaces"].as_array().into_iter().flatten() {
         let n = w["name"].as_str().unwrap_or_default();
         println!(
-            "  工作区 {n}{} = {}",
-            if Some(n) == def { "（默认）" } else { "" },
+            "  workspace {n}{} = {}",
+            if Some(n) == def { " (default)" } else { "" },
             w["path"].as_str().unwrap_or_default()
         );
     }
@@ -1599,7 +1609,7 @@ fn print_info(name: &str, v: &Value) {
         .filter_map(|x| x.as_str())
         .collect();
     if !deny.is_empty() {
-        println!("  禁止访问: {}", deny.join(", "));
+        println!("  denied: {}", deny.join(", "));
     }
     let rules: Vec<String> = v["path_rules"]
         .as_array()
@@ -1614,7 +1624,10 @@ fn print_info(name: &str, v: &Value) {
         })
         .collect();
     if !rules.is_empty() {
-        println!("  路径权限（r 读 c 建 u 改 d 删）: {}", rules.join(", "));
+        println!(
+            "  path permissions (r read, c create, u update, d delete): {}",
+            rules.join(", ")
+        );
     }
 }
 
@@ -1626,21 +1639,21 @@ fn print_write_result(v: &Value, json: bool, verb: &str) {
     let mut extra = String::new();
     if let Some(n) = v["replacements"].as_u64() {
         extra = format!(
-            "，替换 {n} 处，起始第 {} 行",
+            ", {n} replacements, starting at line {}",
             v["line"].as_u64().unwrap_or(0)
         );
     } else if let Some(b) = v["bytes"].as_u64() {
         extra = format!(
-            "，{b} 字节{}",
+            ", {b} bytes{}",
             if v["created"] == true {
-                "，新建"
+                ", created"
             } else {
                 ""
             }
         );
     }
     println!(
-        "已{verb} {}{extra}\n  op_id={}（撤销: agent-cli-x rollback <对端> {}）\n  sha256={}",
+        "{verb} {}{extra}\n  op_id={} (undo: agent-cli-x rollback <peer> {})\n  sha256={}",
         v["path"].as_str().unwrap_or_default(),
         v["op_id"].as_str().unwrap_or_default(),
         v["op_id"].as_str().unwrap_or_default(),
@@ -1659,22 +1672,22 @@ fn human_size(n: u64) -> String {
 
 fn read_local_text(p: &PathBuf) -> Result<String> {
     let bytes = std::fs::read(p)
-        .map_err(|e| AppError::io(format!("读取本地文件 {} 失败: {e}", p.display())))?;
+        .map_err(|e| AppError::io(format!("Failed to read local file {}: {e}", p.display())))?;
     String::from_utf8(bytes)
-        .map_err(|_| AppError::bad_request(format!("{} 不是 UTF-8 文本", p.display())))
+        .map_err(|_| AppError::bad_request(format!("{} is not UTF-8 text", p.display())))
 }
 
 fn read_stdin() -> Result<String> {
     let mut stdin = std::io::stdin();
     if stdin.is_terminal() {
         return Err(AppError::bad_request(
-            "请通过 --content、--from 或管道提供内容",
+            "Provide content via --content, --from or a pipe",
         ));
     }
     let mut s = String::new();
     stdin
         .read_to_string(&mut s)
-        .map_err(|e| AppError::bad_request(format!("标准输入不是 UTF-8 文本: {e}")))?;
+        .map_err(|e| AppError::bad_request(format!("stdin is not UTF-8 text: {e}")))?;
     Ok(s)
 }
 
@@ -1682,6 +1695,6 @@ fn text_arg(inline: Option<String>, file: Option<PathBuf>, name: &str) -> Result
     match (inline, file) {
         (Some(s), _) => Ok(s),
         (None, Some(f)) => read_local_text(&f),
-        (None, None) => Err(AppError::bad_request(format!("缺少 {name}"))),
+        (None, None) => Err(AppError::bad_request(format!("Missing {name}"))),
     }
 }

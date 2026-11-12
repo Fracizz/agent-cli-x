@@ -17,7 +17,7 @@ fn op_dir(home: &Path, op_id: &str) -> Result<PathBuf> {
         && op_id.len() <= 64
         && op_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
     if !ok {
-        return Err(AppError::bad_request(format!("op_id `{op_id}` 无效")));
+        return Err(AppError::bad_request(format!("invalid op_id `{op_id}`")));
     }
     Ok(home.join("backup").join(op_id))
 }
@@ -152,7 +152,7 @@ fn load_op(home: &Path, op_id: &str) -> Result<(PathBuf, Vec<(Value, PathBuf)>)>
         .and_then(|b| serde_json::from_slice(&b).ok())
         .ok_or_else(|| {
             AppError::not_found(format!(
-                "找不到操作 {op_id}（可能已超过 {RETAIN_DAYS} 天被清理，或已 purge）"
+                "op {op_id} not found (may be older than {RETAIN_DAYS} days and cleaned, or purged)"
             ))
         })?;
     // 兼容 0.1.0 的单文件格式
@@ -183,7 +183,7 @@ pub fn rollback(ctx: &Ctx, body: Value) -> Result<Value> {
             .st
             .ws
             .owner_of(&abs)
-            .ok_or_else(|| AppError::denied("该操作的文件已不在任何工作区内"))?;
+            .ok_or_else(|| AppError::denied("the op's file is no longer in any workspace"))?;
         let existed = e["existed"].as_bool().unwrap_or(false);
         let access = match (existed, abs.exists() || abs.is_symlink()) {
             // 原本不存在：回滚 = 删除
@@ -197,13 +197,13 @@ pub fn rollback(ctx: &Ctx, body: Value) -> Result<Value> {
         let display = e["display"].as_str().unwrap_or_default();
         if e["trash"] == true && (abs.exists() || abs.is_symlink()) {
             return Err(AppError::conflict(format!(
-                "{display} 处已存在同名文件或目录，无法从回收站还原；请先移走它"
+                "{display} already exists; cannot restore from recycle bin; move it away first"
             )));
         }
         ctx.st
             .ws
             .check_abs(&ws, &root, &abs, display, access)
-            .map_err(|err| AppError::denied(format!("{}，无法回滚", err.message)))?;
+            .map_err(|err| AppError::denied(format!("{}; cannot roll back", err.message)))?;
         plan.push((e, abs, backup_file));
     }
     let mut files = Vec::new();
@@ -279,11 +279,11 @@ pub fn purge(ctx: &Ctx, body: Value) -> Result<Value> {
             .st
             .ws
             .owner_of(&abs)
-            .ok_or_else(|| AppError::denied("该操作的文件已不在任何工作区内"))?;
+            .ok_or_else(|| AppError::denied("the op's file is no longer in any workspace"))?;
         ctx.st
             .ws
             .check_abs(&ws, &root, &abs, display, Access::Delete)
-            .map_err(|err| AppError::denied(format!("{}，无法彻底删除", err.message)))?;
+            .map_err(|err| AppError::denied(format!("{}; cannot purge", err.message)))?;
     }
     let mut files = Vec::new();
     let mut backups = 0u64;

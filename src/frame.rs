@@ -27,9 +27,10 @@ pub fn read_header<R: BufRead>(r: &mut R) -> Result<Value> {
     let mut buf = Vec::new();
     let n = r.by_ref().take(MAX_HEADER).read_until(b'\n', &mut buf)?;
     if n == 0 || !buf.ends_with(b"\n") {
-        return Err(AppError::io("传输流意外结束"));
+        return Err(AppError::io("transfer stream ended unexpectedly"));
     }
-    serde_json::from_slice(&buf).map_err(|e| AppError::bad_request(format!("传输帧无效: {e}")))
+    serde_json::from_slice(&buf)
+        .map_err(|e| AppError::bad_request(format!("invalid transfer frame: {e}")))
 }
 
 /// 恰好复制 n 字节；源不足 n 字节视为传输中断。
@@ -37,7 +38,7 @@ pub fn copy_exact<R: Read, W: Write>(r: &mut R, w: &mut W, n: u64) -> Result<()>
     let copied = io::copy(&mut r.by_ref().take(n), w)?;
     if copied != n {
         return Err(AppError::io(format!(
-            "传输中断：期望 {n} 字节，实际 {copied} 字节"
+            "transfer interrupted: expected {n} bytes, got {copied}"
         )));
     }
     Ok(())
@@ -48,15 +49,23 @@ pub fn safe_rel(p: &str) -> Result<Vec<String>> {
     let s = p.replace('\\', "/");
     let b = s.as_bytes();
     if s.starts_with('/') || (b.len() >= 2 && b[1] == b':') {
-        return Err(AppError::denied(format!("传输路径 `{p}` 不能是绝对路径")));
+        return Err(AppError::denied(format!(
+            "transfer path `{p}` must not be absolute"
+        )));
     }
     let mut out = Vec::new();
     for part in s.split('/') {
         match part {
             "" | "." => {}
-            ".." => return Err(AppError::denied(format!("传输路径 `{p}` 含 `..`"))),
+            ".." => {
+                return Err(AppError::denied(format!(
+                    "transfer path `{p}` contains `..`"
+                )))
+            }
             x if x.contains(':') || x.contains('\0') => {
-                return Err(AppError::denied(format!("传输路径 `{p}` 含非法字符")))
+                return Err(AppError::denied(format!(
+                    "transfer path `{p}` contains illegal characters"
+                )))
             }
             x => out.push(x.to_string()),
         }

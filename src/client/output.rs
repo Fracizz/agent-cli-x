@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 /// 单行最多保留的字符数（头部、尾部都适用）。
 pub const MAX_LINE_CHARS: usize = 2000;
-const LINE_CUT_MARK: &str = "…[行过长已截断]";
+const LINE_CUT_MARK: &str = "…[line truncated]";
 /// `--full --json` 时每个流在内存中最多保留的字节数。
 const JSON_FULL_CAP: usize = 1024 * 1024;
 
@@ -190,8 +190,8 @@ pub fn clip_text(chunks: &[&str], lim: Limits, log: Option<&str>) -> (String, us
 
 pub fn omit_note(omitted: usize, log: Option<&str>) -> String {
     match log {
-        Some(p) => format!("[agent-cli-x: 中间省略 {omitted} 行，完整输出: {p}]"),
-        None => format!("[agent-cli-x: 中间省略 {omitted} 行]"),
+        Some(p) => format!("[agent-cli-x: {omitted} lines omitted, full output: {p}]"),
+        None => format!("[agent-cli-x: {omitted} lines omitted]"),
     }
 }
 
@@ -322,7 +322,7 @@ impl ExecOutput {
                 emit(is_err, &line);
             }
             if timed_out {
-                eprintln!("[agent-cli-x: 命令超时，已终止进程树]");
+                eprintln!("[agent-cli-x: command timed out, process tree killed]");
             }
         }
         let _ = std::io::stdout().flush();
@@ -373,7 +373,7 @@ mod tests {
         let text: String = (1..=10).map(|i| format!("{i}\n")).collect();
         let (s, n) = run(SMALL, &text);
         assert_eq!(n, 5);
-        assert!(s.starts_with("1\n2\n3\n[agent-cli-x: 中间省略 5 行]\n"));
+        assert!(s.starts_with("1\n2\n3\n[agent-cli-x: 5 lines omitted]\n"));
         assert!(s.ends_with("9\n10\n"));
     }
 
