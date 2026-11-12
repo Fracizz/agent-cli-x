@@ -19,8 +19,8 @@ use crate::error::{AppError, Result};
 use crate::{http, platform, tls, util};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use serde_json::{json, Value};
-use std::io::{BufReader, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{BufReader, Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -29,6 +29,8 @@ use std::time::{Duration, Instant};
 use workspace::Workspaces;
 
 const MAX_CONNECTIONS: usize = 64;
+/// 拒绝请求后仅清空在途 TCP 数据；总时限固定，不能被持续发送拖长。
+const REJECT_DRAIN: Duration = Duration::from_secs(2);
 
 /// 本版本服务端支持的可选能力，客户端据此决定是否使用新接口（info 返回）。
 /// - put_stream：put 接受长度未知的帧流（cp 在两个对端之间直接中转）
@@ -308,12 +310,39 @@ fn handle_conn(st: Arc<State>, tcp: TcpStream) {
     match req {
         Err(e) => {
             let _ = http::write_error(conn.get_mut(), &e);
+            if e.code == "auth" {
+                // Windows 在仍有未读上传数据时 close 会发 RST，可能丢掉已经发出的 401。
+                // 先结束响应方向，再限时清空在途密文；不解析、分配或等待整个请求体。
+                let stream = conn.get_mut();
+                stream.conn.send_close_notify();
+                let _ = stream.flush();
+                let _ = stream.sock.shutdown(Shutdown::Write);
+                drain_rejected(&mut stream.sock, Instant::now() + REJECT_DRAIN);
+                return;
+            }
         }
         Ok((req, caller)) => dispatch(&st, ip, local_port, req, caller, &mut conn),
     }
     let s = conn.get_mut();
     s.conn.send_close_notify();
     let _ = s.flush();
+}
+
+/// 直接读取 TCP，避免 rustls 为尚未鉴权的请求体解密和累积明文。
+fn drain_rejected(tcp: &mut TcpStream, deadline: Instant) {
+    let mut buf = [0u8; 8192];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || tcp.set_read_timeout(Some(remaining)).is_err() {
+            break;
+        }
+        match tcp.read(&mut buf) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
 }
 
 /// 请求体是大块二进制流、由处理函数边读边写的接口。
@@ -479,6 +508,29 @@ fn info_base(ctx: &Ctx) -> Value {
 #[cfg(test)]
 mod connection_tests {
     use super::*;
+
+    #[test]
+    fn rejected_drain_has_a_total_deadline_even_with_continuous_data() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut writer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        writer
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let (mut reader, _) = listener.accept().unwrap();
+        let sender = thread::spawn(move || {
+            for _ in 0..100 {
+                if writer.write_all(&[1u8; 1024]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let started = Instant::now();
+        drain_rejected(&mut reader, started + Duration::from_millis(100));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(reader);
+        sender.join().unwrap();
+    }
 
     #[test]
     fn admission_is_atomic_and_releases_capacity() {

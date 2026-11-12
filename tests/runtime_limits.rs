@@ -245,6 +245,10 @@ fn invalid_token_is_rejected_before_waiting_for_body() {
         }
     }
     assert!(response.starts_with(b"HTTP/1.1 401 "));
+    // TLS EOF is sent immediately, even though the server may still drain the write direction.
+    let started = Instant::now();
+    while tls.read(&mut buf).unwrap() != 0 {}
+    assert!(started.elapsed() < Duration::from_secs(1));
 }
 
 #[test]

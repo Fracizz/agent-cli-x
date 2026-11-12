@@ -20,4 +20,4 @@ Compatibility notes:
 - Legacy or ambiguous recycle-bin records return exit 105 and require manual handling in the system recycle bin. Backup metadata remains available.
 - Default command output shares its budget across stdout and stderr. `ls`/`grep` pagination requires an upgraded peer; old peers retain basic command support.
 
-Validation: 63 unit tests, 12 end-to-end tests and 6 runtime regressions pass on Linux, together with formatting, strict Clippy, the release build and a Rust 1.88 check of all targets.
+Validation: 64 unit tests, 12 end-to-end tests and 6 runtime regressions pass on Linux, together with formatting, strict Clippy, the release build and a Rust 1.88 check of all targets.
