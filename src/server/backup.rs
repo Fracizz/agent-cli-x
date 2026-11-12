@@ -100,12 +100,12 @@ impl Op {
         self.save()
     }
 
-    /// 已移入系统回收站后调用：记录原路径与删除时间，回滚时从回收站还原。
-    pub fn add_trashed(&mut self, abs: &Path, display: &str, since: i64) -> Result<()> {
+    /// 已移入系统回收站后调用：记录原路径与移入前后的时间，回滚 / purge 时据此在回收站里找到本次的条目。
+    pub fn add_trashed(&mut self, abs: &Path, display: &str, since: i64, until: i64) -> Result<()> {
         let idx = self.entries.len();
         self.entries.push(json!({
             "path": abs.to_string_lossy(), "display": display, "existed": true, "idx": idx,
-            "trash": true, "since": since
+            "trash": true, "since": since, "until": until
         }));
         self.save()
     }
@@ -144,21 +144,19 @@ struct RollbackReq {
     op_id: String,
 }
 
-pub fn rollback(ctx: &Ctx, body: Value) -> Result<Value> {
-    let req: RollbackReq =
-        serde_json::from_value(body).map_err(|e| AppError::bad_request(e.to_string()))?;
-    let dir = op_dir(&ctx.st.home, &req.op_id)?;
+/// 读取一次操作的备份记录：返回 (备份目录, [(条目, 备份文件路径)])。
+fn load_op(home: &Path, op_id: &str) -> Result<(PathBuf, Vec<(Value, PathBuf)>)> {
+    let dir = op_dir(home, op_id)?;
     let meta: Value = fs::read(dir.join("meta.json"))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .ok_or_else(|| {
             AppError::not_found(format!(
-                "找不到操作 {}（可能已超过 {RETAIN_DAYS} 天被清理）",
-                req.op_id
+                "找不到操作 {op_id}（可能已超过 {RETAIN_DAYS} 天被清理，或已 purge）"
             ))
         })?;
     // 兼容 0.1.0 的单文件格式
-    let entries: Vec<(Value, PathBuf)> = match meta["entries"].as_array() {
+    let entries = match meta["entries"].as_array() {
         Some(list) => list
             .iter()
             .map(|e| {
@@ -170,6 +168,13 @@ pub fn rollback(ctx: &Ctx, body: Value) -> Result<Value> {
             .collect(),
         None => vec![(meta.clone(), dir.join("content"))],
     };
+    Ok((dir, entries))
+}
+
+pub fn rollback(ctx: &Ctx, body: Value) -> Result<Value> {
+    let req: RollbackReq =
+        serde_json::from_value(body).map_err(|e| AppError::bad_request(e.to_string()))?;
+    let (_, entries) = load_op(&ctx.st.home, &req.op_id)?;
     // 先整体校验，再动手，避免回滚到一半被拒。每条记录按回滚时的实际动作检查 CRUD 权限。
     let mut plan = Vec::new();
     for (e, backup_file) in entries.iter().rev() {
@@ -205,7 +210,7 @@ pub fn rollback(ctx: &Ctx, body: Value) -> Result<Value> {
     for (e, abs, backup_file) in plan {
         let existed = e["existed"].as_bool().unwrap_or(false);
         let action = if e["trash"] == true {
-            super::recycle::restore(&abs, e["since"].as_i64().unwrap_or(0))?;
+            super::recycle::restore(&abs, e["since"].as_i64().unwrap_or(0), e["until"].as_i64())?;
             "untrashed"
         } else if e["dir"] == true && !existed {
             // 只删空目录：回滚后目录里若还有别的文件（非本次操作写入），保留
@@ -255,6 +260,57 @@ pub fn rollback(ctx: &Ctx, body: Value) -> Result<Value> {
         json!({"op_id": req.op_id, "files": files.len()}),
     );
     Ok(json!({"op_id": req.op_id, "files": files}))
+}
+
+/// 彻底清除一次操作留下的东西：回收站里的条目被永久删除，备份副本被删除。
+/// 之后该操作无法再 rollback。回收站条目要求原路径有删除权限（与 rm 相同）。
+pub fn purge(ctx: &Ctx, body: Value) -> Result<Value> {
+    let req: RollbackReq =
+        serde_json::from_value(body).map_err(|e| AppError::bad_request(e.to_string()))?;
+    let (dir, entries) = load_op(&ctx.st.home, &req.op_id)?;
+    // 先整体校验权限，再动手
+    for (e, _) in &entries {
+        if e["trash"] != true {
+            continue;
+        }
+        let abs = PathBuf::from(e["path"].as_str().unwrap_or_default());
+        let display = e["display"].as_str().unwrap_or_default();
+        let (ws, root) = ctx
+            .st
+            .ws
+            .owner_of(&abs)
+            .ok_or_else(|| AppError::denied("该操作的文件已不在任何工作区内"))?;
+        ctx.st
+            .ws
+            .check_abs(&ws, &root, &abs, display, Access::Delete)
+            .map_err(|err| AppError::denied(format!("{}，无法彻底删除", err.message)))?;
+    }
+    let mut files = Vec::new();
+    let mut backups = 0u64;
+    for (e, backup_file) in &entries {
+        let display = e["display"].clone();
+        if e["trash"] == true {
+            let abs = PathBuf::from(e["path"].as_str().unwrap_or_default());
+            let gone =
+                super::recycle::purge(&abs, e["since"].as_i64().unwrap_or(0), e["until"].as_i64())?;
+            files.push(json!({
+                "path": display,
+                "action": if gone { "purged" } else { "not_in_trash" },
+            }));
+        } else if backup_file.is_file() {
+            backups += 1;
+        }
+    }
+    let freed = util::dir_size(&dir);
+    fs::remove_dir_all(&dir)?;
+    ctx.st.audit.log(
+        &ctx.ip,
+        &ctx.caller,
+        "purge",
+        true,
+        json!({"op_id": req.op_id, "files": files.len(), "backups": backups}),
+    );
+    Ok(json!({"op_id": req.op_id, "files": files, "backups": backups, "backup_bytes": freed}))
 }
 
 #[cfg(unix)]

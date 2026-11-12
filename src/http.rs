@@ -7,6 +7,8 @@ use std::io::{BufRead, Read, Write};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const VERSION_HEADER: &str = "X-Agent-Cli-Version";
+/// 请求体为长度未知的帧流（不带 Content-Length），值为 `frames`。
+pub const STREAM_HEADER: &str = "X-Agent-Cli-Stream";
 const MAX_LINE: usize = 8 * 1024;
 const MAX_HEADERS: usize = 64;
 
@@ -167,6 +169,25 @@ pub fn write_request_head<W: Write>(
     write!(
         w,
         "POST {path} HTTP/1.1\r\nHost: agent-cli-x\r\nAuthorization: Bearer {token}\r\nContent-Type: {content_type}\r\nContent-Length: {len}\r\nX-Agent-Cli-Version: {VERSION}\r\n\r\n"
+    )
+}
+
+/// 长度未知的帧流请求头：不带 Content-Length，由帧格式自身的结束帧界定请求体。
+pub fn write_stream_request_head<W: Write>(
+    w: &mut W,
+    path: &str,
+    token: &str,
+) -> std::io::Result<()> {
+    write!(
+        w,
+        "POST {path} HTTP/1.1
+Host: agent-cli-x
+Authorization: Bearer {token}
+Content-Type: application/octet-stream
+{STREAM_HEADER}: frames
+X-Agent-Cli-Version: {VERSION}
+
+"
     )
 }
 

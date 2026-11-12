@@ -85,7 +85,9 @@ pub(super) fn apply_base_env(c: &mut Command) {
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_PAGER", "cat")
         .env("PAGER", "cat")
-        .env("AGENT_CLI_X", "1");
+        .env("AGENT_CLI_X", "1")
+        // 不继承 serve 自身环境里的借道标记，是否设置只由本次调用方决定
+        .env_remove(crate::config::NO_RELAY_ENV);
     if cfg!(unix) {
         c.env("TERM", "dumb");
     }
@@ -150,7 +152,13 @@ pub(super) fn prepare(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     apply_base_env(&mut command);
-    for (k, v) in &req.env {
+    let mut env = req.env;
+    // 禁止借道的调用方：放在用户 --env 之后，不能被覆盖或清空；同时进入预热 shell 的载荷
+    env.retain(|k, _| !k.eq_ignore_ascii_case(crate::config::NO_RELAY_ENV));
+    if ctx.no_relay {
+        env.insert(crate::config::NO_RELAY_ENV.to_string(), ctx.caller.clone());
+    }
+    for (k, v) in &env {
         command.env(k, v);
     }
     Ok(Prepared {
@@ -160,7 +168,7 @@ pub(super) fn prepare(
         timeout: Duration::from_secs(timeout),
         command,
         cwd: cwd.abs.clone(),
-        env: req.env,
+        env,
     })
 }
 

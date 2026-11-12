@@ -29,6 +29,11 @@ use workspace::Workspaces;
 
 const MAX_CONNECTIONS: usize = 64;
 
+/// 本版本服务端支持的可选能力，客户端据此决定是否使用新接口（info 返回）。
+/// - put_stream：put 接受长度未知的帧流（cp 在两个对端之间直接中转）
+/// - purge：按 op_id 彻底清除回收站条目与备份
+pub const FEATURES: &[&str] = &["put_stream", "purge"];
+
 pub struct State {
     pub cfg: Config,
     pub ws: Workspaces,
@@ -49,6 +54,8 @@ pub struct Ctx {
     pub ip: String,
     /// 通过鉴权的 token 名称（默认 token 为 `default`）。
     pub caller: String,
+    /// 该调用方被禁止借道（`token add --no-relay`）：exec 子进程会带上标记环境变量。
+    pub no_relay: bool,
 }
 
 /// 启动服务端。`wait_port_secs > 0` 时端口被占用会重试这么久（升级后新进程等待旧进程退出）。
@@ -212,8 +219,8 @@ fn is_streaming_upload(path: &str) -> bool {
     matches!(path, "/v1/fs/put" | "/v1/upgrade")
 }
 
-/// 鉴权通过时返回调用方名称。
-fn authorize(st: &State, req: &http::Request) -> Option<String> {
+/// 鉴权通过时返回调用方。
+fn authorize(st: &State, req: &http::Request) -> Option<auth::Caller> {
     let got = req
         .header("authorization")
         .and_then(|v| v.strip_prefix("Bearer "))
@@ -232,10 +239,18 @@ fn dispatch(st: &Arc<State>, ip: String, req: http::Request, conn: &mut Conn) {
     let ctx = Ctx {
         st: Arc::clone(st),
         ip,
-        caller,
+        caller: caller.name,
+        no_relay: caller.no_relay,
     };
     match req.path.as_str() {
-        "/v1/fs/put" => return transfer::put(&ctx, req.content_length, conn),
+        "/v1/fs/put" => {
+            // 带 X-Agent-Cli-Stream: frames 时请求体长度未知（cp 中转），按帧读到结束帧为止
+            let len = match req.header(http::STREAM_HEADER) {
+                Some(v) if v.eq_ignore_ascii_case("frames") => None,
+                _ => Some(req.content_length),
+            };
+            return transfer::put(&ctx, len, conn);
+        }
         "/v1/upgrade" => return upgrade::handle(&ctx, req.content_length, conn),
         _ => {}
     }
@@ -275,6 +290,7 @@ fn dispatch(st: &Arc<State>, ip: String, req: http::Request, conn: &mut Conn) {
             return;
         }
         "/v1/rollback" => backup::rollback(&ctx, body),
+        "/v1/purge" => backup::purge(&ctx, body),
         other => Err(AppError::not_found(format!("未知接口 {other}"))),
     };
     if let Err(e) = &result {
@@ -315,6 +331,13 @@ fn info(ctx: &Ctx) -> Value {
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
         "shell": platform::default_shell().name(),
+        // exec 以 serve 进程的身份运行：路径权限只约束文件类接口，不约束 exec
+        "exec_user": platform::current_user(),
+        "exec_elevated": platform::is_elevated(),
+        "features": FEATURES,
+        // 本次调用方及其限制：no_relay 时在本机 exec 里不能再调用 agent-cli-x 访问其他节点
+        "caller": ctx.caller,
+        "caller_no_relay": ctx.no_relay,
         "workspaces": ws,
         "default_workspace": ctx.st.ws.default_name(),
         "deny_paths": ctx.st.ws.deny_rules(),

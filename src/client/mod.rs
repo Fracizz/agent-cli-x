@@ -259,6 +259,41 @@ impl Client {
         Ok(v)
     }
 
+    /// 长度未知的帧流上传（cp 中转用，对端需支持 put_stream）。
+    /// `write_body` 出错时（例如源端中断）主动结束发送，让服务端尽快回错误（含可撤销的 op_id）。
+    pub fn upload_frames(
+        &self,
+        path: &str,
+        timeout: Duration,
+        write_body: impl FnOnce(&mut Stream) -> Result<()>,
+    ) -> Result<Value> {
+        let (mut s, _) = connect(&self.peer.addr, Some(&self.peer.fingerprint), timeout)?;
+        http::write_stream_request_head(&mut s, path, &self.peer.token).map_err(map_io)?;
+        let body_res = write_body(&mut s);
+        let _ = s.flush();
+        if body_res.is_err() {
+            s.conn.send_close_notify();
+            let _ = s.flush();
+            let _ = s.sock.shutdown(std::net::Shutdown::Write);
+        }
+        let mut br = BufReader::new(s);
+        let head = match http::read_response_head(&mut br) {
+            Ok(h) => h,
+            Err(e) => return Err(body_res.err().unwrap_or(e)),
+        };
+        self.note_version(&head);
+        let mut data = Vec::new();
+        read_all(&mut br, &mut data)?;
+        let v: Value = serde_json::from_slice(&data).unwrap_or(Value::Null);
+        match (body_res, head.status) {
+            // 服务端已回错误（例如权限不足提前拒绝）：以服务端为准
+            (_, status) if status != 200 => Err(self.remote_error(&v, status)),
+            (Err(e), _) => Err(e),
+            (Ok(()), _) if v.is_null() => Err(AppError::internal("响应不是有效 JSON")),
+            (Ok(()), _) => Ok(v),
+        }
+    }
+
     /// 流式下载：返回定位在响应体开头的读取器。
     pub fn download(
         &self,
@@ -274,6 +309,27 @@ impl Client {
             return Err(self.remote_error(&v, status));
         }
         Ok(br)
+    }
+}
+
+/// 上传过程中服务端是否已经发回应用数据或关闭了连接（不消费数据）。
+/// 帧流上传成功时服务端只在读完结束帧后才响应，提前到达的应用数据必然是错误响应，
+/// 调用方应停止发送、转去读取它。不能直接 peek socket：TLS 1.3 服务端握手后会主动
+/// 发送会话票据，那不是响应；这里交给 rustls 解析后只看明文。
+pub fn peer_replied(s: &mut Stream) -> bool {
+    if s.sock.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let read = s.conn.read_tls(&mut s.sock);
+    let _ = s.sock.set_nonblocking(false);
+    match read {
+        // 对端关闭了连接
+        Ok(0) => true,
+        Ok(_) => match s.conn.process_new_packets() {
+            Ok(st) => st.plaintext_bytes_to_read() > 0 || st.peer_has_closed(),
+            Err(_) => true,
+        },
+        Err(_) => false,
     }
 }
 

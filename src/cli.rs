@@ -109,8 +109,15 @@ enum Cmd {
         /// 不截断输出
         #[arg(long)]
         full: bool,
+        /// 执行本地脚本文件的内容（`-` 表示标准输入），免去多层引号转义；不能与命令同时给出
+        #[arg(long, value_name = "FILE", conflicts_with = "command")]
+        script: Option<PathBuf>,
         /// 要执行的命令（多个参数会以空格拼接）
-        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        #[arg(
+            required_unless_present = "script",
+            trailing_var_arg = true,
+            allow_hyphen_values = true
+        )]
         command: Vec<String>,
     },
     /// 管理后台任务
@@ -208,6 +215,22 @@ enum Cmd {
         #[arg(long)]
         exclude: Vec<String>,
     },
+    /// 在两个对端之间直接复制文件或目录（经本机流式转发，不落本机磁盘）
+    #[command(
+        after_help = "示例：agent-cli-x cp win127 dl:pkg ub40 home:\n语义同 put：目标是已存在目录时放到其下。目标端需 0.0.4 及以上，旧版本自动退回本机临时目录中转（用完即删）。"
+    )]
+    Cp {
+        /// 源对端
+        src_peer: String,
+        /// 源路径（工作区:相对路径）
+        src: String,
+        /// 目标对端
+        dst_peer: String,
+        /// 目标路径（工作区:相对路径）
+        dest: String,
+        #[arg(long)]
+        exclude: Vec<String>,
+    },
     /// 删除文件或目录：默认移入对端回收站，可用 rollback 还原（需要对端路径权限含 d）
     Rm {
         peer: String,
@@ -221,6 +244,8 @@ enum Cmd {
     },
     /// 撤销一次 write / edit / put / rm
     Rollback { peer: String, op_id: String },
+    /// 彻底清除一次操作留下的回收站条目和备份（释放空间，之后无法 rollback）
+    Purge { peer: String, op_id: String },
 }
 
 #[derive(Subcommand)]
@@ -245,8 +270,23 @@ enum PeerCmd {
 #[derive(Subcommand)]
 enum TokenCmd {
     /// 为一个调用方签发 token，并打印对方需要执行的 `peer add` 命令
-    Add { name: String },
-    /// 列出已签发的 token（只显示名称与创建时间）
+    Add {
+        name: String,
+        /// 禁止借道：该调用方在本机 exec 里不能再用 agent-cli-x 访问其他节点或管理凭据
+        #[arg(long)]
+        no_relay: bool,
+    },
+    /// 修改已签发 token 的限制（不更换 token）
+    Set {
+        name: String,
+        /// 禁止借道
+        #[arg(long, required_unless_present = "allow_relay")]
+        no_relay: bool,
+        /// 取消禁止借道
+        #[arg(long, conflicts_with = "no_relay")]
+        allow_relay: bool,
+    },
+    /// 列出已签发的 token（名称、创建时间与限制）
     List,
     /// 吊销一个调用方的 token（serve 运行中几秒内生效）
     Remove { name: String },
@@ -276,9 +316,31 @@ enum JobCmd {
     Kill { peer: String, id: String },
 }
 
+/// 在“禁止借道”的 exec 环境里，只放行不联网、不涉及凭据的本地命令。
+fn check_no_relay(cmd: &Cmd) -> Result<bool> {
+    let Some(who) = std::env::var(config::NO_RELAY_ENV)
+        .ok()
+        .filter(|v| !v.is_empty())
+    else {
+        return Ok(false);
+    };
+    match cmd {
+        Cmd::Skill | Cmd::Fingerprint | Cmd::Doctor { .. } | Cmd::Whoami { pair: false } => {
+            Ok(true)
+        }
+        _ => Err(AppError::denied(format!(
+            "当前命令运行在调用方 `{who}` 发起的 exec 中，本机禁止借道：不能再用 agent-cli-x \
+             访问其他节点或管理本机凭据。请在你自己的机器上直接操作；需要访问其他节点请告知用户，\
+             不要尝试绕过（读取凭据文件、清除 {} 环境变量或直连）",
+            config::NO_RELAY_ENV
+        ))),
+    }
+}
+
 pub fn run() -> Result<i32> {
     let cli = Cli::parse();
     let json = cli.json;
+    let no_relay = check_no_relay(&cli.cmd)?;
     match cli.cmd {
         Cmd::Init {
             name,
@@ -288,7 +350,8 @@ pub fn run() -> Result<i32> {
         } => init(name, &listen, &workspaces, force, json),
         Cmd::Serve { wait_port } => server::serve(&config::home_dir(), wait_port).map(|_| 0),
         Cmd::Whoami { pair } => whoami(pair, json),
-        Cmd::Doctor { no_peers } => doctor::run(json, !no_peers),
+        // 禁止借道时不探测对端
+        Cmd::Doctor { no_peers } => doctor::run(json, !no_peers && !no_relay),
         Cmd::Token(t) => token(t, json),
         Cmd::Upgrade {
             peer,
@@ -330,9 +393,14 @@ pub fn run() -> Result<i32> {
             envs,
             detach,
             full,
+            script,
             command,
         } => {
-            let body = exec_body(cwd, shell, timeout, envs, command.join(" "))?;
+            let cmd = match &script {
+                Some(f) => script_text(f, shell.as_deref())?,
+                None => command.join(" "),
+            };
+            let body = exec_body(cwd, shell, timeout, envs, cmd)?;
             if multi::is_multi(&peer) {
                 if detach {
                     return Err(AppError::bad_request("--detach 一次只能用于一个对端"));
@@ -502,6 +570,37 @@ pub fn run() -> Result<i32> {
             }
             Ok(0)
         }
+        Cmd::Cp {
+            src_peer,
+            src,
+            dst_peer,
+            dest,
+            exclude,
+        } => cp(&src_peer, &src, &dst_peer, &dest, &exclude, json),
+        Cmd::Purge { peer, op_id } => {
+            let v =
+                Client::load(&peer)?.call("/v1/purge", &json!({"op_id": op_id}), CALL_TIMEOUT)?;
+            if json {
+                println!("{v}");
+            } else {
+                for f in v["files"].as_array().into_iter().flatten() {
+                    let action = match f["action"].as_str() {
+                        Some("purged") => "已从回收站彻底删除",
+                        _ => "回收站中已不存在（可能已清空或还原）",
+                    };
+                    println!("{action}: {}", f["path"].as_str().unwrap_or_default());
+                }
+                let n = v["backups"].as_u64().unwrap_or(0);
+                if n > 0 {
+                    println!(
+                        "已删除 {n} 个备份副本（{}）",
+                        human_size(v["backup_bytes"].as_u64().unwrap_or(0))
+                    );
+                }
+                println!("操作 {op_id} 已清除，无法再 rollback");
+            }
+            Ok(0)
+        }
         Cmd::Rm {
             peer,
             path,
@@ -538,7 +637,7 @@ pub fn run() -> Result<i32> {
                     parts.join("、")
                 );
                 if let Some(op) = v["op_id"].as_str() {
-                    println!("  op_id={op}（撤销: agent-cli-x rollback {peer} {op}）");
+                    println!("  op_id={op}（撤销: agent-cli-x rollback {peer} {op}；释放空间: agent-cli-x purge {peer} {op}）");
                 }
                 if let Some(e) = v["trash_error"].as_str() {
                     eprintln!("[agent-cli-x: 回收站不可用（{e}），已改为备份后删除]");
@@ -724,7 +823,7 @@ fn token(cmd: TokenCmd, json: bool) -> Result<i32> {
         }
     };
     match cmd {
-        TokenCmd::Add { name } => {
+        TokenCmd::Add { name, no_relay } => {
             config::validate_name(&name, "token")?;
             if name == DEFAULT_TOKEN_NAME || tokens.tokens.contains_key(&name) {
                 return Err(AppError::conflict(format!(
@@ -737,10 +836,37 @@ fn token(cmd: TokenCmd, json: bool) -> Result<i32> {
                 TokenEntry {
                     sha256: util::sha256_hex(tok.as_bytes()),
                     created: util::now_iso(),
+                    no_relay,
                 },
             );
             config::save_tokens(&home, &tokens)?;
             issued(&name, &tok, "签发");
+            if no_relay && !json {
+                println!("该调用方已禁止借道：它在本机 exec 里不能再调用 agent-cli-x 访问其他节点");
+            }
+        }
+        TokenCmd::Set {
+            name,
+            no_relay,
+            allow_relay: _,
+        } => {
+            if name == DEFAULT_TOKEN_NAME {
+                return Err(AppError::bad_request(
+                    "默认 token 不支持限制，请为该调用方单独 `token add <名称> --no-relay`",
+                ));
+            }
+            let Some(e) = tokens.tokens.get_mut(&name) else {
+                return Err(AppError::not_found(format!("没有名为 `{name}` 的 token")));
+            };
+            e.no_relay = no_relay;
+            config::save_tokens(&home, &tokens)?;
+            if json {
+                println!("{}", json!({"name": name, "no_relay": no_relay}));
+            } else if no_relay {
+                println!("token `{name}` 已禁止借道（运行中的 serve 几秒内生效）");
+            } else {
+                println!("token `{name}` 已取消禁止借道（运行中的 serve 几秒内生效）");
+            }
         }
         TokenCmd::Rotate { name } => {
             let tok = util::random_hex(24);
@@ -778,19 +904,19 @@ fn token(cmd: TokenCmd, json: bool) -> Result<i32> {
         TokenCmd::List => {
             if json {
                 let list: Vec<Value> =
-                    std::iter::once(json!({"name": DEFAULT_TOKEN_NAME, "created": null}))
-                        .chain(
-                            tokens
-                                .tokens
-                                .iter()
-                                .map(|(n, e)| json!({"name": n, "created": e.created})),
-                        )
-                        .collect();
+                    std::iter::once(
+                        json!({"name": DEFAULT_TOKEN_NAME, "created": null, "no_relay": false}),
+                    )
+                    .chain(tokens.tokens.iter().map(
+                        |(n, e)| json!({"name": n, "created": e.created, "no_relay": e.no_relay}),
+                    ))
+                    .collect();
                 println!("{}", Value::Array(list));
             } else {
                 println!("{DEFAULT_TOKEN_NAME}\t(config.toml)");
                 for (n, e) in &tokens.tokens {
-                    println!("{n}\t{}", e.created);
+                    let flag = if e.no_relay { "\t禁止借道" } else { "" };
+                    println!("{n}\t{}{flag}", e.created);
                 }
             }
         }
@@ -898,7 +1024,46 @@ fn peer(cmd: PeerCmd, json: bool) -> Result<i32> {
             Ok(0)
         }
         PeerCmd::List => {
-            let peers = config::load_peers(&home)?;
+            let mut peers = config::load_peers(&home)?;
+            // 缓存缺系统信息的对端（旧版本登记的）：联网补全。补不全（离线或对端太旧）的
+            // 记下尝试时间，24 小时内不再重试，避免每次 peer list 都卡在连接超时上
+            const RETRY_SECS: i64 = 24 * 3600;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64);
+            let missing: Vec<String> = peers
+                .peers
+                .iter()
+                .filter(|(_, p)| p.os.is_none() || p.shell.is_none())
+                .filter(|(_, p)| p.info_tried.map_or(true, |t| now - t >= RETRY_SECS))
+                .map(|(n, _)| n.clone())
+                .collect();
+            if !missing.is_empty() {
+                client::disable_version_warning();
+                let got = multi::parallel(&missing, |p| (p.to_string(), multi::probe(p).ok()));
+                let fresh: Vec<(&str, &Value)> = got
+                    .iter()
+                    .filter_map(|(p, r)| r.as_ref().map(|(v, _)| (p.as_str(), v)))
+                    .collect();
+                let _ = config::remember_peer_infos(&home, &fresh);
+                peers = config::load_peers(&home)?;
+                let mut tried = false;
+                for n in &missing {
+                    if let Some(p) = peers.peers.get_mut(n) {
+                        if p.os.is_none() || p.shell.is_none() {
+                            p.info_tried = Some(now);
+                            tried = true;
+                        }
+                    }
+                }
+                if tried {
+                    let _ = config::save_peers(&home, &peers);
+                }
+                if !fresh.is_empty() && !json {
+                    let names: Vec<&str> = fresh.iter().map(|(n, _)| *n).collect();
+                    eprintln!("[agent-cli-x: 已联网补全 {} 的系统信息]", names.join(", "));
+                }
+            }
             if json {
                 let list: Vec<Value> = peers
                     .peers
@@ -967,6 +1132,25 @@ fn exec_body(
         env.insert(k.to_string(), v.to_string());
     }
     Ok(json!({"cmd": command, "cwd": cwd, "shell": shell, "timeout_secs": timeout, "env": env}))
+}
+
+/// 读取 --script 的内容：去掉 BOM、统一为 LF（sh 不认 CRLF）；cmd 不支持多行脚本。
+fn script_text(f: &std::path::Path, shell: Option<&str>) -> Result<String> {
+    let raw = if f.as_os_str() == "-" {
+        read_stdin()?
+    } else {
+        read_local_text(&f.to_path_buf())?
+    };
+    let text = raw.trim_start_matches('\u{feff}').replace("\r\n", "\n");
+    if text.trim().is_empty() {
+        return Err(AppError::bad_request("脚本内容为空"));
+    }
+    if shell.is_some_and(|s| s.eq_ignore_ascii_case("cmd")) && text.trim_end().contains('\n') {
+        return Err(AppError::bad_request(
+            "cmd 不支持多行 --script，请改用 pwsh / powershell，或先用 write 写成 .bat 再执行",
+        ));
+    }
+    Ok(text)
 }
 
 fn exec(peer: &str, body: &Value, timeout: Option<u64>, full: bool, json: bool) -> Result<i32> {
@@ -1104,6 +1288,81 @@ fn job(cmd: JobCmd, json: bool) -> Result<i32> {
     }
 }
 
+fn cp(
+    src_peer: &str,
+    src: &str,
+    dst_peer: &str,
+    dest: &str,
+    exclude: &[String],
+    json: bool,
+) -> Result<i32> {
+    let sc = Client::load(src_peer)?;
+    let dc = Client::load(dst_peer)?;
+    let dinfo = dc.call("/v1/info", &json!({}), CALL_TIMEOUT)?;
+    let _ = config::remember_peer_infos(&config::home_dir(), &[(dst_peer, &dinfo)]);
+    let direct = dinfo["features"]
+        .as_array()
+        .is_some_and(|f| f.iter().any(|x| x == "put_stream"));
+    let started = std::time::Instant::now();
+    let mut v = if direct {
+        let show = !json && std::io::stderr().is_terminal();
+        let mut last = std::time::Instant::now();
+        let r = client::transfer::relay(&sc, src, &dc, dest, exclude, |files, bytes| {
+            if show && last.elapsed() >= Duration::from_millis(500) {
+                last = std::time::Instant::now();
+                eprint!(
+                    "\r[agent-cli-x: 已转发 {files} 个文件（{}）]   ",
+                    human_size(bytes)
+                );
+            }
+        });
+        if show {
+            eprint!("\r\x1b[K");
+        }
+        let mut v = r?;
+        v["via"] = json!("relay");
+        v
+    } else {
+        // 目标端版本较旧：经本机临时目录中转，结束后删除
+        let tmp = std::env::temp_dir().join(format!("agent-cli-x-cp-{}", util::random_hex(4)));
+        std::fs::create_dir_all(&tmp)?;
+        let r = (|| {
+            let got = client::transfer::get(&sc, src, &tmp, exclude)?;
+            let local = PathBuf::from(got["dest"].as_str().unwrap_or_default());
+            client::transfer::put(&dc, &local, dest, &[])
+        })();
+        let _ = std::fs::remove_dir_all(&tmp);
+        let mut v = r?;
+        v["via"] = json!("local_temp");
+        if !json {
+            eprintln!(
+                "[agent-cli-x: {dst_peer} 版本 {} 不支持直传，已经本机临时目录中转（已删除）；升级对端后可直传]",
+                dinfo["version"].as_str().unwrap_or("?")
+            );
+        }
+        v
+    };
+    let ms = started.elapsed().as_millis() as u64;
+    v["ms"] = json!(ms);
+    if json {
+        println!("{v}");
+    } else {
+        let bytes = v["bytes"].as_u64().unwrap_or(0);
+        println!(
+            "已复制 {} 个文件（{}，{:.1}s，{}/s）: {src_peer} {src} → {dst_peer} {}",
+            v["files"],
+            human_size(bytes),
+            ms as f64 / 1000.0,
+            human_size(bytes * 1000 / ms.max(1)),
+            v["dest"].as_str().unwrap_or_default()
+        );
+        if let Some(op) = v["op_id"].as_str() {
+            println!("  op_id={op}（撤销: agent-cli-x rollback {dst_peer} {op}）");
+        }
+    }
+    Ok(0)
+}
+
 fn read(peer: &str, path: &str, lines: Option<String>, number: bool, json: bool) -> Result<i32> {
     let (start, end) = match lines.as_deref() {
         None => (None, None),
@@ -1180,6 +1439,22 @@ fn print_info(name: &str, v: &Value) {
         },
         v["shell"].as_str().unwrap_or("?")
     );
+    if let Some(user) = v["exec_user"].as_str() {
+        let elevated = match (v["exec_elevated"] == true, v["os"] == "windows") {
+            (true, true) => "，管理员",
+            (true, false) => "，root",
+            _ => "",
+        };
+        println!(
+            "  exec 身份: {user}{elevated}（exec 不受下方路径权限/禁止访问约束，只受命令黑名单约束）"
+        );
+    }
+    if v["caller_no_relay"] == true {
+        println!(
+            "  本机对你禁止借道: 你（{}）在本机 exec 里不能再调用 agent-cli-x 访问其他节点",
+            v["caller"].as_str().unwrap_or("?")
+        );
+    }
     let def = v["default_workspace"].as_str();
     for w in v["workspaces"].as_array().into_iter().flatten() {
         let n = w["name"].as_str().unwrap_or_default();

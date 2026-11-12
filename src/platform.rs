@@ -314,6 +314,64 @@ pub fn hostname() -> String {
         .unwrap_or_default()
 }
 
+/// 运行 serve（也就是 exec 命令）的用户名。
+pub fn current_user() -> String {
+    let from_env = || {
+        std::env::var("USERNAME")
+            .or_else(|_| std::env::var("USER"))
+            .or_else(|_| std::env::var("LOGNAME"))
+            .ok()
+            .filter(|s| !s.is_empty())
+    };
+    #[cfg(unix)]
+    {
+        // 以 sudo / systemd 运行时环境变量可能不准，root 以 euid 为准
+        let uid = unsafe { libc::geteuid() };
+        if uid == 0 {
+            "root".into()
+        } else {
+            from_env().unwrap_or_else(|| format!("uid {uid}"))
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        from_env().unwrap_or_else(|| "?".into())
+    }
+}
+
+/// 是否以管理员（Windows 提升权限）或 root 身份运行。
+#[cfg(unix)]
+pub fn is_elevated() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// 是否以管理员（Windows 提升权限）或 root 身份运行。
+#[cfg(windows)]
+pub fn is_elevated() -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return false;
+        }
+        let mut elev: TOKEN_ELEVATION = std::mem::zeroed();
+        let mut len = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            &mut elev as *mut _ as *mut _,
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut len,
+        ) != 0;
+        CloseHandle(token);
+        ok && elev.TokenIsElevated != 0
+    }
+}
+
 /// 物理内存总量（字节）；取不到时返回 None。
 #[cfg(windows)]
 pub fn total_memory_bytes() -> Option<u64> {

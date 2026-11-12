@@ -166,6 +166,18 @@ pub fn prune_older_than(dir: &Path, days: u64) {
     }
 }
 
+/// 目录下所有文件的总字节数（不跟随符号链接，读不到的条目忽略）。
+pub fn dir_size(dir: &Path) -> u64 {
+    let Ok(rd) = fs::read_dir(dir) else { return 0 };
+    rd.flatten()
+        .map(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => dir_size(&e.path()),
+            Ok(t) if t.is_file() => e.metadata().map(|m| m.len()).unwrap_or(0),
+            _ => 0,
+        })
+        .sum()
+}
+
 /// 本机对外的主 IP：对公网地址做一次 UDP connect 让系统选路（不会发出任何数据包）。
 pub fn local_ip() -> Option<String> {
     let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;

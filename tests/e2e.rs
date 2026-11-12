@@ -430,8 +430,10 @@ fn identity_grep_transfer_jobs() {
         .map(|l| format!("{l}\n"))
         .collect();
     fs::write(&peers_toml, old).unwrap();
-    assert!(cached(c)["os"].is_null());
+    assert!(!fs::read_to_string(&peers_toml).unwrap().contains("os ="));
     assert!(run(c, &["info", "b"]).status.success());
+    let t = fs::read_to_string(&peers_toml).unwrap();
+    assert!(t.contains("os =") && t.contains("shell ="), "{t}");
     assert_eq!(cached(c)["os"], info["os"]);
     assert_eq!(cached(c)["shell"], info["shell"]);
 
@@ -890,4 +892,303 @@ fn upgrade_restarts_server() {
     kill_pid(pid1);
     assert_ne!(pid0, pid1);
     assert_eq!(v["results"][0]["new_version"], env!("CARGO_PKG_VERSION"));
+}
+
+#[test]
+fn cp_purge_script_info() {
+    let env = setup();
+    let c = &env.client_home;
+
+    // info 报告 exec 身份与能力
+    let o = run(c, &["info", "b", "--json"]);
+    let v = json_of(&o);
+    assert!(
+        v["exec_user"].as_str().is_some_and(|u| !u.is_empty()),
+        "{v}"
+    );
+    assert!(v["exec_elevated"].is_boolean(), "{v}");
+    let feats: Vec<&str> = v["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|x| x.as_str())
+        .collect();
+    assert!(
+        feats.contains(&"put_stream") && feats.contains(&"purge"),
+        "{v}"
+    );
+    assert!(text(&run(c, &["info", "b"])).contains("exec 身份"));
+
+    // peer list：缓存缺系统信息时自动联网补全
+    let peers = c.join("peers.toml");
+    let t = fs::read_to_string(&peers).unwrap();
+    let stripped: String = t
+        .lines()
+        .filter(|l| !l.starts_with("os =") && !l.starts_with("shell ="))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    fs::write(&peers, stripped).unwrap();
+    let o = run(c, &["peer", "list"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains("已联网补全"), "{}", text(&o));
+    assert!(fs::read_to_string(&peers).unwrap().contains("os ="));
+    // 已补全后不再联网
+    assert!(!text(&run(c, &["peer", "list"])).contains("已联网补全"));
+
+    // cp：对端之间直接中转（这里源和目标是同一台，同样走 get → put 流）
+    fs::create_dir_all(env.ws.join("pkg/sub")).unwrap();
+    fs::write(env.ws.join("pkg/a.bin"), vec![7u8; 300_000]).unwrap();
+    fs::write(env.ws.join("pkg/sub/b.txt"), "B").unwrap();
+    fs::write(env.ws.join("pkg/skip.log"), "x").unwrap();
+    fs::create_dir_all(env.ws.join("out")).unwrap();
+    let o = run(
+        c,
+        &[
+            "cp",
+            "b",
+            "proj:pkg",
+            "b",
+            "proj:out",
+            "--exclude",
+            "*.log",
+            "--json",
+        ],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    let v = json_of(&o);
+    assert_eq!(v["via"], "relay", "{v}");
+    assert_eq!(v["files"], 2, "{v}");
+    assert_eq!(v["dest"], "proj:out/pkg", "{v}");
+    assert_eq!(
+        fs::read(env.ws.join("out/pkg/a.bin")).unwrap().len(),
+        300_000
+    );
+    assert_eq!(
+        fs::read_to_string(env.ws.join("out/pkg/sub/b.txt")).unwrap(),
+        "B"
+    );
+    assert!(!env.ws.join("out/pkg/skip.log").exists());
+    // cp 的结果可以 rollback
+    let o = run(c, &["rollback", "b", v["op_id"].as_str().unwrap()]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(!env.ws.join("out/pkg").exists());
+    // 单个文件改名复制
+    let o = run(c, &["cp", "b", "proj:pkg/sub/b.txt", "b", "proj:out/c.txt"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains("已复制 1 个文件"), "{}", text(&o));
+    assert_eq!(fs::read_to_string(env.ws.join("out/c.txt")).unwrap(), "B");
+    // 目标只读：由目标端拒绝（102）
+    let o = run(c, &["cp", "b", "proj:pkg", "b", "proj:docs"]);
+    assert_eq!(o.status.code(), Some(102), "{}", text(&o));
+    assert!(!env.ws.join("docs/pkg").exists());
+    // 大文件中途被目标端拒绝：中转方应尽快停止发送，并拿到目标端的错误
+    fs::create_dir_all(env.ws.join("big")).unwrap();
+    fs::write(env.ws.join("big/x.bin"), vec![1u8; 64 << 20]).unwrap();
+    let t = Instant::now();
+    let o = run(c, &["cp", "b", "proj:big", "b", "proj:docs"]);
+    assert_eq!(o.status.code(), Some(102), "{}", text(&o));
+    assert!(t.elapsed() < Duration::from_secs(20), "{:?}", t.elapsed());
+    fs::remove_dir_all(env.ws.join("big")).unwrap();
+    // 源不存在（103）/ 源在黑名单（102）
+    let o = run(c, &["cp", "b", "proj:nope", "b", "proj:out"]);
+    assert_eq!(o.status.code(), Some(103), "{}", text(&o));
+    let o = run(c, &["cp", "b", "proj:secrets", "b", "proj:out"]);
+    assert_eq!(o.status.code(), Some(102), "{}", text(&o));
+
+    // purge：rm 进回收站后彻底清除，之后无法 rollback
+    let o = run(c, &["rm", "b", "-r", "proj:pkg", "--json"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let rm = json_of(&o);
+    let op = rm["op_id"].as_str().unwrap().to_string();
+    let o = run(c, &["purge", "b", &op, "--json"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let v = json_of(&o);
+    if rm["method"] == "trash" {
+        assert_eq!(v["files"][0]["action"], "purged", "{v}");
+    } else {
+        assert!(v["backups"].as_u64().unwrap() >= 2, "{v}");
+    }
+    assert_eq!(
+        run(c, &["rollback", "b", &op]).status.code(),
+        Some(103),
+        "purge 后不应能 rollback"
+    );
+    assert_eq!(run(c, &["purge", "b", &op]).status.code(), Some(103));
+    assert!(!env.ws.join("pkg").exists());
+    // write 的备份也可以 purge
+    let o = run(
+        c,
+        &["write", "b", "proj:out/c.txt", "--content", "C", "--json"],
+    );
+    let op = json_of(&o)["op_id"].as_str().unwrap().to_string();
+    let o = run(c, &["purge", "b", &op]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains("备份副本"), "{}", text(&o));
+    assert_eq!(fs::read_to_string(env.ws.join("out/c.txt")).unwrap(), "C");
+
+    // exec --script：多行脚本免转义，CRLF 也能在 sh 下运行
+    let script = env.server_home.parent().unwrap().join("s.txt");
+    let body = if cfg!(windows) {
+        "$a = 'x\"y'\r\n$b = 2\r\nWrite-Output \"$a-$($b + 1)\"\r\n"
+    } else {
+        "a='x\"y'\r\nb=2\r\necho \"$a-$((b + 1))\"\r\n"
+    };
+    fs::write(&script, format!("\u{feff}{body}")).unwrap();
+    let o = run(c, &["exec", "b", "--script", script.to_str().unwrap()]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(
+        String::from_utf8_lossy(&o.stdout).contains("x\"y-3"),
+        "{}",
+        text(&o)
+    );
+    // 脚本与命令不能同时给出；cmd 不支持多行
+    let o = run(
+        c,
+        &["exec", "b", "--script", script.to_str().unwrap(), "echo"],
+    );
+    assert!(!o.status.success(), "{}", text(&o));
+    if cfg!(windows) {
+        let o = run(
+            c,
+            &[
+                "exec",
+                "b",
+                "--shell",
+                "cmd",
+                "--script",
+                script.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(o.status.code(), Some(110), "{}", text(&o));
+    }
+}
+
+/// 禁止借道：受限调用方在服务端 exec 里不能再用 agent-cli-x 访问其他节点或管理凭据。
+#[test]
+fn no_relay_blocks_hop() {
+    let env = setup();
+    let c = &env.client_home;
+    let s = &env.server_home;
+
+    // 服务端自己登记一个对端（模拟 C 持有 A 的凭据）；serve 的 exec 子进程继承同一个数据目录
+    let tok = cfg_token(&s.join("config.toml"));
+    let o = run(
+        s,
+        &[
+            "peer",
+            "add",
+            "self",
+            &env.listen,
+            "--token",
+            &tok,
+            "--fingerprint",
+            &env.fp,
+        ],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+
+    // 受限调用方 g
+    let o = run(s, &["token", "add", "guest", "--no-relay", "--json"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let gt = json_of(&o)["token"].as_str().unwrap().to_string();
+    let o = run(
+        c,
+        &[
+            "peer",
+            "add",
+            "g",
+            &env.listen,
+            "--token",
+            &gt,
+            "--fingerprint",
+            &env.fp,
+        ],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    let list = json_of(&run(s, &["token", "list", "--json"]));
+    assert!(
+        list.as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"] == "guest" && t["no_relay"] == true),
+        "{list}"
+    );
+
+    let call = |args: &str| {
+        if cfg!(windows) {
+            format!("& '{BIN}' {args}")
+        } else {
+            format!("'{BIN}' {args}")
+        }
+    };
+    let hop = call("info self");
+
+    // 不受限的调用方可以借道
+    let o = run(c, &["exec", "b", &hop]);
+    assert!(o.status.success(), "{}", text(&o));
+
+    // 受限：借道、凭据管理被拒（102），--env 也清不掉标记
+    let o = run(c, &["exec", "g", &hop]);
+    assert_eq!(o.status.code(), Some(102), "{}", text(&o));
+    assert!(text(&o).contains("禁止借道"), "{}", text(&o));
+    let o = run(c, &["exec", "g", "--env", "AGENT_CLI_X_NO_RELAY=", &hop]);
+    assert_eq!(o.status.code(), Some(102), "{}", text(&o));
+    for args in ["token add evil", "whoami --pair", "peer list"] {
+        let o = run(c, &["exec", "g", &call(args)]);
+        assert_eq!(o.status.code(), Some(102), "{args}: {}", text(&o));
+    }
+    // 不联网、不涉及凭据的本地命令放行
+    for args in ["whoami", "fingerprint", "doctor --json"] {
+        let o = run(c, &["exec", "g", &call(args)]);
+        assert_ne!(o.status.code(), Some(102), "{args}: {}", text(&o));
+    }
+
+    // 后台任务同样受限
+    let o = run(c, &["exec", "g", "--detach", "--json", &hop]);
+    assert!(o.status.success(), "{}", text(&o));
+    let id = json_of(&o)["job_id"].as_str().unwrap().to_string();
+    let o = run(c, &["job", "logs", "g", &id, "--follow"]);
+    assert_eq!(o.status.code(), Some(102), "{}", text(&o));
+
+    // info 告知调用方自己的限制
+    let v = json_of(&run(c, &["info", "g", "--json"]));
+    assert_eq!(v["caller"], "guest", "{v}");
+    assert_eq!(v["caller_no_relay"], true, "{v}");
+    assert!(text(&run(c, &["info", "g"])).contains("禁止借道"));
+
+    // 取消限制后几秒内生效
+    let o = run(s, &["token", "set", "guest", "--allow-relay"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let o = wait_code(c, &["exec", "g", &hop], 0);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    assert_eq!(
+        run(s, &["token", "set", "default", "--no-relay"])
+            .status
+            .code(),
+        Some(110)
+    );
+}
+
+/// peer list：补不全系统信息的离线对端记下尝试时间，之后不再每次联网重试。
+#[test]
+fn peer_list_offline_not_retried() {
+    let env = setup();
+    let c = &env.client_home;
+    let peers_toml = c.join("peers.toml");
+    let mut body = fs::read_to_string(&peers_toml).unwrap();
+    body.push_str(
+        "\n[peers.dead]\naddr = \"127.0.0.1:1\"\ntoken = \"x\"\nfingerprint = \"sha256:00\"\n",
+    );
+    fs::write(&peers_toml, body).unwrap();
+
+    let o = run(c, &["peer", "list", "--json"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let body = fs::read_to_string(&peers_toml).unwrap();
+    let dead = body.split("[peers.dead]").nth(1).unwrap();
+    assert!(dead.contains("info_tried"), "{body}");
+
+    // 第二次不再联网：文件不变
+    let o = run(c, &["peer", "list"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert_eq!(fs::read_to_string(&peers_toml).unwrap(), body);
 }

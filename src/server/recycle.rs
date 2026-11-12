@@ -1,5 +1,5 @@
 //! 回收站：rm 默认把文件移入系统回收站（Windows 回收站 / Linux freedesktop Trash / macOS 废纸篓），
-//! rollback 时再从回收站还原（Windows、Linux 支持；macOS 需手动从废纸篓恢复）。
+//! rollback 时再从回收站还原，purge 时从回收站彻底删除（Windows、Linux 支持；macOS 需在废纸篓中手动处理）。
 
 use crate::error::{AppError, Result};
 use std::path::Path;
@@ -31,31 +31,96 @@ fn same_path(a: &Path, b: &Path) -> bool {
     n(a) == n(b)
 }
 
-/// 从回收站还原 `abs`：取原路径相同、删除时间不早于 `since` 的最近一条。
+/// 系统记录的删除时间与本机记录的 since / until 之间的容差（秒）。
+#[cfg(any(windows, all(unix, not(target_os = "macos")), test))]
+const SLACK: i64 = 5;
+/// 旧版本的记录没有 until（移入完成的时间）时，假定移入不超过这么久。
+#[cfg(any(windows, all(unix, not(target_os = "macos")), test))]
+const MAX_AFTER: i64 = 600;
+
+/// 本次删除对应的条目：[since, until] 窗口内最早的一条。同一路径之后再被删除（另一个 op）时，
+/// 取最新的会误选到那一次的条目，purge 时就会永久删错。
+#[cfg(any(windows, all(unix, not(target_os = "macos")), test))]
+fn pick(times: impl Iterator<Item = i64>, since: i64, until: Option<i64>) -> Option<usize> {
+    let hi = until.unwrap_or(since + MAX_AFTER) + SLACK;
+    times
+        .enumerate()
+        .filter(|(_, t)| (since - SLACK..=hi).contains(t))
+        .min_by_key(|(_, t)| *t)
+        .map(|(i, _)| i)
+}
+
+/// 在回收站中找到本次删除的 `abs`。
 #[cfg(any(windows, all(unix, not(target_os = "macos"))))]
-pub fn restore(abs: &Path, since: i64) -> Result<()> {
-    use trash::os_limited;
-    let items =
-        os_limited::list().map_err(|e| AppError::internal(format!("读取回收站失败: {e}")))?;
-    // 留几秒余量：删除时间由系统记录，可能与本机记录的时间有细微差异
-    let item = items
+fn find(abs: &Path, since: i64, until: Option<i64>) -> Result<trash::TrashItem> {
+    let mut items: Vec<_> = trash::os_limited::list()
+        .map_err(|e| AppError::internal(format!("读取回收站失败: {e}")))?
         .into_iter()
-        .filter(|i| i.time_deleted >= since - 5 && same_path(&i.original_path(), abs))
-        .max_by_key(|i| i.time_deleted)
+        .filter(|i| same_path(&i.original_path(), abs))
+        .collect();
+    pick(items.iter().map(|i| i.time_deleted), since, until)
+        .map(|idx| items.swap_remove(idx))
         .ok_or_else(|| {
             AppError::not_found(format!(
                 "回收站中找不到 {}（可能已被清空或手动还原）",
                 abs.display()
             ))
-        })?;
-    os_limited::restore_all([item])
+        })
+}
+
+/// 从回收站还原 `abs`。
+#[cfg(any(windows, all(unix, not(target_os = "macos"))))]
+pub fn restore(abs: &Path, since: i64, until: Option<i64>) -> Result<()> {
+    let item = find(abs, since, until)?;
+    trash::os_limited::restore_all([item])
         .map_err(|e| AppError::internal(format!("从回收站还原失败: {e}")))
 }
 
+/// 从回收站彻底删除 `abs`。返回 false 表示回收站里已经没有它（被清空或手动还原过）。
+#[cfg(any(windows, all(unix, not(target_os = "macos"))))]
+pub fn purge(abs: &Path, since: i64, until: Option<i64>) -> Result<bool> {
+    let item = match find(abs, since, until) {
+        Ok(i) => i,
+        Err(e) if e.code == "not_found" => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    trash::os_limited::purge_all([item])
+        .map_err(|e| AppError::internal(format!("从回收站彻底删除失败: {e}")))?;
+    Ok(true)
+}
+
 #[cfg(target_os = "macos")]
-pub fn restore(abs: &Path, _since: i64) -> Result<()> {
+pub fn restore(abs: &Path, _since: i64, _until: Option<i64>) -> Result<()> {
     Err(AppError::bad_request(format!(
         "macOS 不支持自动从废纸篓还原，请在废纸篓中手动恢复 {}",
+        abs.display()
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pick;
+
+    #[test]
+    fn pick_earliest_in_window() {
+        // 本次删除（100 附近）之后同一路径又被删了一次（130）：必须选 100 那条
+        assert_eq!(pick([130, 101, 99].into_iter(), 100, Some(101)), Some(2));
+        // 系统时间略早于记录时间：在容差内仍能找到
+        assert_eq!(pick([96].into_iter(), 100, Some(100)), Some(0));
+        // 本次条目已被还原，之后又删了一次（30 秒后）：有 until 时不会误选
+        assert_eq!(pick([130].into_iter(), 100, Some(101)), None);
+        // 旧记录没有 until：按 600 秒上限
+        assert_eq!(pick([130].into_iter(), 100, None), Some(0));
+        assert_eq!(pick([100 + 606].into_iter(), 100, None), None);
+        // 更早的删除不属于本次
+        assert_eq!(pick([50].into_iter(), 100, Some(100)), None);
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn purge(abs: &Path, _since: i64, _until: Option<i64>) -> Result<bool> {
+    Err(AppError::bad_request(format!(
+        "macOS 不支持自动清除废纸篓中的单个条目，请在废纸篓中手动删除 {}",
         abs.display()
     )))
 }

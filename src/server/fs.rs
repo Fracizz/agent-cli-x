@@ -587,8 +587,9 @@ pub fn rm(ctx: &Ctx, body: Value) -> Result<Value> {
             let since = super::recycle::now_secs();
             match super::recycle::move_to_trash(&r.abs) {
                 Ok(()) => {
+                    let until = super::recycle::now_secs();
                     let mut op = backup::Op::new(&ctx.st.home)?;
-                    op.add_trashed(&r.abs, &r.display(), since)?;
+                    op.add_trashed(&r.abs, &r.display(), since, until)?;
                     op_id = Some(op.id.clone());
                     op.finish();
                     true

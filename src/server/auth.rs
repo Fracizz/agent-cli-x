@@ -16,8 +16,14 @@ struct Inner {
     cfg_mtime: Option<SystemTime>,
     tok_mtime: Option<SystemTime>,
     default: String,
-    /// (名称, token 的 sha256)
-    named: Vec<(String, String)>,
+    /// (名称, token 的 sha256, 是否禁止借道)
+    named: Vec<(String, String, bool)>,
+}
+
+/// 通过鉴权的调用方。
+pub struct Caller {
+    pub name: String,
+    pub no_relay: bool,
 }
 
 fn mtime(p: &Path) -> Option<SystemTime> {
@@ -60,7 +66,7 @@ impl Auth {
                     .tokens
                     .into_iter()
                     .filter(|(n, _)| n != DEFAULT_TOKEN_NAME)
-                    .map(|(n, e)| (n, e.sha256.to_ascii_lowercase()))
+                    .map(|(n, e)| (n, e.sha256.to_ascii_lowercase(), e.no_relay))
                     .collect();
             }
             // 解析失败时保留旧列表，避免一次误编辑让所有调用方掉线
@@ -87,8 +93,8 @@ impl Auth {
         }
     }
 
-    /// 校验 token，成功时返回调用方名称。
-    pub fn check(&self, got: &str) -> Option<String> {
+    /// 校验 token，成功时返回调用方。
+    pub fn check(&self, got: &str) -> Option<Caller> {
         if got.is_empty() {
             return None;
         }
@@ -96,12 +102,18 @@ impl Auth {
         self.maybe_reload(&mut g);
         let mut who = None;
         if util::ct_eq(got.as_bytes(), g.default.as_bytes()) {
-            who = Some(DEFAULT_TOKEN_NAME.to_string());
+            who = Some(Caller {
+                name: DEFAULT_TOKEN_NAME.to_string(),
+                no_relay: false,
+            });
         }
         let h = util::sha256_hex(got.as_bytes());
-        for (name, sha) in &g.named {
+        for (name, sha, no_relay) in &g.named {
             if util::ct_eq(h.as_bytes(), sha.as_bytes()) && who.is_none() {
-                who = Some(name.clone());
+                who = Some(Caller {
+                    name: name.clone(),
+                    no_relay: *no_relay,
+                });
             }
         }
         who

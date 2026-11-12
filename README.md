@@ -64,15 +64,18 @@ Then teach your agent the tool: copy [`skills/agent-cli-x/SKILL.md`](skills/agen
 |---|---|
 | `init` / `serve` / `whoami [--pair]` / `fingerprint` | set up, run and identify this machine |
 | `doctor [--no-peers]` | check config, local service, start at boot, firewall, peers and their versions |
-| `token add\|list\|remove\|rotate` | per-caller tokens for this machine (`rotate default` replaces the config token) |
-| `peer add\|list\|remove` | manage peers (`~/.agent-cli-x/peers.toml`); `list` shows the cached OS/arch and shell, refreshed by `peer add`, `info` and `upgrade` |
-| `info <peer>` | OS, shell, workspaces, deny rules; `info @all` is a one-line-per-peer overview |
+| `token add\|list\|set\|remove\|rotate` | per-caller tokens for this machine (`rotate default` replaces the config token); `add <name> --no-relay` / `set <name> --no-relay\|--allow-relay` stops that caller from hopping to other machines through this one |
+| `peer add\|list\|remove` | manage peers (`~/.agent-cli-x/peers.toml`); `list` shows the cached OS/arch and shell, refreshed by `peer add`, `info`, `upgrade` and `cp`; peers with no cached OS (registered by an older version) are looked up automatically (an unreachable one is retried at most once a day) |
+| `info <peer>` | OS, shell, the user `exec` runs as, workspaces, deny rules; `info @all` is a one-line-per-peer overview |
 | `exec <peer> [--cwd] [--shell] [--timeout] [--env K=V] <cmd>` | run a command, streamed; `A,B` or `@all` runs on several peers in parallel |
+| `exec <peer> --script <file>` | run the contents of a local script file (`-` = stdin) with the peer's shell: no nested quoting; CRLF and BOM are normalized |
 | `upgrade <peer> [--binary <file>] [--force]` | replace the peer's binary and restart its `serve` (`A,B` / `@all` allowed) |
 | `exec <peer> --detach <cmd>`, `job list\|logs\|kill` | background jobs (`job logs --follow` exits with the job's code) |
 | `ls` / `grep` / `read` / `write` / `edit` | file operations inside workspaces |
 | `rm <peer> <path> [-r] [--permanent]` | delete a file or directory: moved to the peer's recycle bin by default (undo with `rollback`); `--permanent` deletes for good |
+| `purge <peer> <op_id>` | permanently remove what an operation left behind (its recycle-bin entries and backups) to free space; it can no longer be rolled back |
 | `put <peer> <local> <dest>` / `get <peer> <src> <local>` | transfer files or directories (`--exclude`) |
+| `cp <src-peer> <src> <dst-peer> <dest>` | copy between two peers: streamed through this machine without touching its disk (`--exclude`; undo on the destination with `rollback`). The destination needs 0.0.4+; with an older one it falls back to a temporary local copy that is deleted afterwards |
 | `rollback <peer> <op_id>` | undo a write/edit/put/rm |
 | `skill` | print the agent guide |
 
@@ -90,6 +93,22 @@ Every machine runs `serve` and registers the others as peers, so A, B and C can 
   - Everywhere else (Task Scheduler, a terminal, `nohup`), it starts the new `serve` detached and exits.
   - Set `AGENT_CLI_X_RESTART=exit` to force the exit-and-restart behaviour for another supervisor.
 - **Not supported:** relaying through another machine (A → B → C) or automatic discovery. Every pair of machines must reach each other directly on the listen port.
+
+### One-way access
+
+Access is per direction: A can call B only with a token B issued. B never calls back on its own, so if A issues no token to B, B cannot call A directly.
+
+B can still go **through a third machine**. If B may `exec` on C and C holds a token for A, B can run `agent-cli-x exec A …` on C, because commands run as C's user with C's credentials. To stop this, issue B's token on C with `--no-relay`:
+
+```bash
+# On C
+agent-cli-x token add B --no-relay      # new token
+agent-cli-x token set B --no-relay      # or restrict an existing one (no new token needed)
+```
+
+B's `exec` and background jobs on C then carry `AGENT_CLI_X_NO_RELAY=B`. Inside them, `agent-cli-x` refuses everything that talks to peers or touches credentials (exit 102): `exec`/`info`/file commands to any peer, `peer`, `token`, `whoami --pair`, `upgrade`, `init`, `serve`. Local read-only commands (`whoami`, `fingerprint`, `doctor` without peer checks, `skill`) still work. B cannot clear the variable with `--env`, and `info C` tells B about the restriction. Only C needs this version; A and B need no change. The default token from `config.toml` cannot be restricted, so give restricted callers their own token.
+
+**This prevents mistakes, not attacks.** A command can unset the variable or read C's `~/.agent-cli-x/peers.toml` directly. For a hard boundary, run a second `serve` on C as a separate low-privilege OS user with its own `AGENT_CLI_X_HOME`, port and binary copy. Give B only that instance, and make sure that user cannot read your home directory and that you never run code B can write.
 
 ## Configuration
 
@@ -143,7 +162,7 @@ How permissions are resolved for a path:
 2. Otherwise walk from the path up to the root; the first level with a matching `[[policy.paths]]` rule decides. At that level, rules without wildcards win over glob rules; several rules of the same kind are intersected. (A glob like `**/*.lock` matches the file itself, so it is more specific than a rule on its directory.)
 3. No match → full access (`rcud`).
 
-`readonly_paths = [...]` from older configs still works and equals `allow = "r"`. `exec` commands are not covered by path permissions.
+`readonly_paths = [...]` from older configs still works and equals `allow = "r"`. **`exec` commands are not covered by path permissions or `deny_paths`**: they run with the full rights of the user `serve` runs as (shown by `info` as "exec 身份"), limited only by `deny_commands`.
 
 ### Performance
 
@@ -156,16 +175,16 @@ Intended for machines you own on a trusted network.
 - Traffic is TLS. Clients pin the server certificate fingerprint; a changed fingerprint is a hard error (exit 106).
 - Access requires a token: the `default` one from `config.toml`, or a per-caller token from `token add`. Tokens are compared in constant time, and failures are delayed and audited.
 - File operations are confined to workspaces: canonicalized paths, no `..`, no absolute paths, no symlink/junction escapes, deny-list checked on every ancestor. The agent-cli-x data folder is always denied.
-- Path permissions are enforced per operation: `ls`/`read`/`grep`/`get` and the `exec` working directory need `r`; `write`/`put` need `c` for new files and `u` for existing ones; `edit` needs `u`; `rm` needs `d` on **every** entry it would remove (otherwise nothing is deleted); `rollback` checks the action it performs (restore = `u`, re-create = `c`, remove = `d`). **A shell command itself cannot be sandboxed**: `exec "cat secrets/x"` or `exec "rm x"` still works. For hard isolation, run `serve` as a dedicated low-privilege OS user and protect directories with file-system permissions.
+- Path permissions are enforced per operation: `ls`/`read`/`grep`/`get` and the `exec` working directory need `r`; `write`/`put` need `c` for new files and `u` for existing ones; `edit` needs `u`; `rm` needs `d` on **every** entry it would remove (otherwise nothing is deleted); `rollback` checks the action it performs (restore = `u`, re-create = `c`, remove = `d`). **A shell command itself cannot be sandboxed**: `exec "cat secrets/x"` or `exec "rm x"` still works, and if `serve` runs as root/Administrator so can `exec "npm install -g …"` into a read-only `/usr`. `info` prints the exec user and whether it is elevated so callers can see this. For hard isolation, run `serve` as a dedicated low-privilege OS user and protect directories with file-system permissions.
 - `init` writes OS-specific presets, which you are free to edit:
   - Windows: `C:/` read-only, `C:/Windows/System32/config` denied; commands such as `rd /s /q c:\`, `Remove-Item -Recurse -Force C:\Windows`, `format c:`, `diskpart`, `bcdedit` blocked. **If your workspaces live on `C:`, add a more specific `[[policy.paths]]` rule for them (e.g. `allow = "rcud"`) to allow writes.**
   - Linux: `/bin`, `/sbin`, `/lib*`, `/usr`, `/etc`, `/boot`, `/var/lib`, `/proc`, `/sys`, `/dev` read-only; `/etc/shadow`, `/etc/gshadow`, `/etc/sudoers*`, `/root/.ssh` denied; `rm -rf /etc` (and other system dirs), `--no-preserve-root`, `mkfs`, `reboot` etc. blocked.
   - macOS: `/System`, `/Library`, `/usr`, `/bin`, `/sbin`, `/private/etc`, `/private/var/db`, `/Applications` read-only.
-- `deny_commands` is a guard rail against accidents, not a security boundary.
+- `deny_commands` is a guard rail against accidents, not a security boundary. So is `token add --no-relay` (see [One-way access](#one-way-access)).
 - `grep`, `get` and `ls` skip unreadable paths; `put` refuses to write where it lacks `c`/`u`.
 - Background jobs run as the same user; their output lives in `~/.agent-cli-x/jobs/` (7 days). Jobs still running when `serve` restarts are marked `lost`.
 - Every write/edit/put is backed up to `~/.agent-cli-x/backup/` (7 days). All requests are logged to `~/.agent-cli-x/audit/YYYY-MM-DD.jsonl` with the client IP and token name.
-- `rm` moves files to the system recycle bin (Windows Recycle Bin, freedesktop Trash on Linux, Trash on macOS), so it is fast and has no size cap; `rollback` restores them from there (Windows/Linux; on macOS restore from the Trash by hand). It refuses to restore over a path that exists again. If the recycle bin is unavailable (e.g. a Linux mount without a writable `.Trash` dir) or `rm_use_trash = false`, it falls back to backing up to `~/.agent-cli-x/backup/` and deleting, limited to `max_transfer_mb`. `rm --permanent` skips both and cannot be undone.
+- `rm` moves files to the system recycle bin (Windows Recycle Bin, freedesktop Trash on Linux, Trash on macOS), so it is fast and has no size cap; `rollback` restores them from there (Windows/Linux; on macOS restore from the Trash by hand). It refuses to restore over a path that exists again. If the recycle bin is unavailable (e.g. a Linux mount without a writable `.Trash` dir) or `rm_use_trash = false`, it falls back to backing up to `~/.agent-cli-x/backup/` and deleting, limited to `max_transfer_mb`. `rm --permanent` skips both and cannot be undone. `purge <op_id>` permanently deletes an earlier `rm`'s recycle-bin entries (needs `d` on the original paths) and removes the operation's backups, freeing the space without waiting for the 7-day cleanup.
 - `serve` writes its own log (startup, token reloads, upgrades, internal errors, panics) to `~/.agent-cli-x/serve-logs/` (7 days) as well as to stderr. When it runs at boot with no console, check this log first.
 
 ## Start at boot (recommended)

@@ -7,7 +7,7 @@ use crate::http;
 use crate::server::transfer::{exclude_set, excluded};
 use serde_json::{json, Value};
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -214,4 +214,105 @@ pub fn get(client: &Client, src: &str, local: &Path, exclude: &[String]) -> Resu
         }
     }
     Ok(json!({"dest": base.to_string_lossy(), "files": files, "bytes": bytes}))
+}
+
+/// 对端到对端复制：从 `src` 下载的帧流直接转发给 `dst` 的 put，本机不落盘。
+/// 目标端需支持 put_stream（0.0.4 起）；调用方负责事先确认。
+pub fn relay(
+    src: &Client,
+    src_path: &str,
+    dst: &Client,
+    dest: &str,
+    exclude: &[String],
+    mut progress: impl FnMut(u64, u64),
+) -> Result<Value> {
+    let mut br = src.download(
+        "/v1/fs/get",
+        &json!({"src": src_path, "exclude": exclude}),
+        TIMEOUT,
+    )?;
+    let meta = frame::read_header(&mut br)?;
+    if meta.get("error").is_some() {
+        return Err(http::remote_error(&meta, 500));
+    }
+    let kind = meta["kind"].as_str().unwrap_or_default().to_string();
+    let name = meta["name"].as_str().unwrap_or_default().to_string();
+    if frame::safe_rel(&name)?.len() != 1 {
+        return Err(AppError::bad_request("源端返回的名称无效"));
+    }
+    let (mut files, mut bytes) = (0u64, 0u64);
+    // 源端出错时记下原因：目标端随后也会因流被截断而报错，两者合并告诉用户
+    let mut src_err: Option<AppError> = None;
+    let res = dst.upload_frames("/v1/fs/put", TIMEOUT, |s| {
+        frame::write_header(s, &json!({"dest": dest, "kind": kind, "name": name}))?;
+        loop {
+            let h = match frame::read_header(&mut br) {
+                Ok(h) => h,
+                Err(e) => {
+                    src_err = Some(AppError::io(format!("源端 {}: {}", src.name, e.message)));
+                    return Err(AppError::io("源端中断"));
+                }
+            };
+            if h.get("error").is_some() {
+                let mut e = http::remote_error(&h, 500);
+                e.message = format!("源端 {}: {}", src.name, e.message);
+                src_err = Some(e);
+                return Err(AppError::io("源端出错"));
+            }
+            if super::peer_replied(s) {
+                return Err(AppError::io("目标端提前结束了接收"));
+            }
+            if h["end"] == true {
+                frame::write_header(s, &json!({"end": true}))?;
+                return Ok(());
+            }
+            frame::safe_rel(h["p"].as_str().unwrap_or_default())?;
+            match h["k"].as_str() {
+                Some("d") => frame::write_header(s, &json!({"p": h["p"], "k": "d"}))?,
+                Some("f") => {
+                    let n = h["n"]
+                        .as_u64()
+                        .ok_or_else(|| AppError::bad_request("文件帧缺少大小"))?;
+                    frame::write_header(
+                        s,
+                        &json!({"p": h["p"], "k": "f", "n": n, "x": h["x"] == true}),
+                    )?;
+                    // 逐块转发：区分是源端读不到，还是写往目标端失败
+                    let mut left = n;
+                    let mut buf = vec![0u8; 256 * 1024];
+                    while left > 0 {
+                        let want = left.min(buf.len() as u64) as usize;
+                        let got = match br.read(&mut buf[..want]) {
+                            Ok(0) | Err(_) => {
+                                src_err = Some(AppError::io(format!(
+                                    "源端 {} 传输中断：文件还差 {left} 字节",
+                                    src.name
+                                )));
+                                return Err(AppError::io("源端中断"));
+                            }
+                            Ok(k) => k,
+                        };
+                        if super::peer_replied(s) {
+                            return Err(AppError::io("目标端提前结束了接收"));
+                        }
+                        s.write_all(&buf[..got])?;
+                        left -= got as u64;
+                    }
+                    files += 1;
+                    bytes += n;
+                    progress(files, bytes);
+                }
+                _ => return Err(AppError::bad_request("未知的条目类型")),
+            }
+        }
+    });
+    match (res, src_err) {
+        (Ok(v), _) => Ok(v),
+        (Err(dst_e), Some(mut e)) => {
+            e.message
+                .push_str(&format!("；目标端 {}: {}", dst.name, dst_e.message));
+            Err(e)
+        }
+        (Err(e), None) => Err(e),
+    }
 }

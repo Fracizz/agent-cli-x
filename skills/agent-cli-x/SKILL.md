@@ -32,6 +32,7 @@ Absolute paths, `..`, anything outside a workspace and deny-listed paths are rej
 agent-cli-x exec B cargo test                          # exit code is passed through
 agent-cli-x exec B --cwd proj:web --timeout 1200 "pnpm build"   # options go BEFORE the command
 agent-cli-x exec B --shell cmd "dir"                   # pwsh | powershell | cmd | sh | bash
+agent-cli-x exec B --script ./check.sh                 # run a local script file's contents: no nested quoting
 agent-cli-x exec B --detach "pnpm build"              # background job, returns a job id
 agent-cli-x job logs B <id> --follow                   # stream until done; exits with the job's code
 agent-cli-x job list B | job kill B <id>
@@ -43,8 +44,10 @@ agent-cli-x edit B proj:src/main.rs --old-file old.txt --new-file new.txt   # mu
 agent-cli-x write B proj:notes.md --content "..."      # or --from <local file>, or stdin
 agent-cli-x put B ./dist proj:web/dist --exclude node_modules   # upload file/dir (like cp -r)
 agent-cli-x get B proj:logs ./logs                     # download file/dir
+agent-cli-x cp A dl:pkg B home:                        # copy peer A → peer B directly (streamed, nothing stored here)
 agent-cli-x rm B proj:build/tmp -r                     # delete file / dir (-r) into the recycle bin; undo with rollback
 agent-cli-x rollback B <op_id>                         # undo a write/edit/put/rm
+agent-cli-x purge B <op_id>                            # free the space an rm/put left in the recycle bin / backups (no undo after)
 agent-cli-x exec B,C "git pull && cargo build"         # several peers in parallel, output grouped per peer
 agent-cli-x exec @all --json "uname -a"                # every registered peer; one result per peer
 agent-cli-x upgrade B                                  # push this binary to B and restart its serve
@@ -60,7 +63,7 @@ Add `--json` to any command for machine-readable output.
 - Long output shows the first and last ~200 lines; the full log path is printed to stderr and can be read locally.
 - `edit` needs `--old` to match **exactly once** (including indentation). Widen the context or use `--all`. CRLF/LF is handled.
 - `read` before `edit`. To guard against concurrent changes, take `sha256` from `read --json` and pass `--expect-sha`.
-- Every write/edit/put/rm returns an `op_id`; use `rollback` if something goes wrong. Prefer `rm` over `exec "rm ..."`: it checks permissions and can be undone. Use `rm --permanent` (no recycle bin, no undo) only when the user explicitly asks for permanent deletion.
+- Every write/edit/put/rm returns an `op_id`; use `rollback` if something goes wrong. Prefer `rm` over `exec "rm ..."`: it checks permissions and can be undone. Use `rm --permanent` (no recycle bin, no undo) only when the user explicitly asks for permanent deletion. If something was already moved to the recycle bin and the user wants it gone for good, run `purge <peer> <op_id>`; do not rollback and delete again.
 - Raise `--timeout` for long builds (capped by the peer). On timeout the whole process tree is killed (exit 104).
 - Anything longer than a few minutes (builds, test suites, servers): use `exec --detach`, then `job logs --follow`.
 - Prefer `grep` over `exec "grep ..."`: it respects .gitignore and deny rules and works the same on Windows.
@@ -68,7 +71,11 @@ Add `--json` to any command for machine-readable output.
 - A `版本不一致` hint means a peer runs a different version. Run `agent-cli-x upgrade <peer>`, or `--binary <file>` if its OS/arch differs from yours. An upgrade is refused while background jobs are running (exit 105). Only use `--force` if interrupting those jobs is acceptable.
 - If a peer is unreachable (exit 100), run `agent-cli-x doctor` here. On the peer itself, check `doctor` and `~/.agent-cli-x/serve-logs/`.
 - Setting up start at boot for `serve` on a machine you run on: follow README "Start at boot". On Windows, the scheduled task needs `ExecutionTimeLimit 0`, both battery options turned off, and restart on failure. On Linux, use a systemd user unit with `Restart=on-failure` plus `loginctl enable-linger`. Confirm with `agent-cli-x doctor` afterwards.
-- `put`/`get`: if the destination is an existing directory the source goes inside it; otherwise the destination is the new path. Overwritten files on the peer are backed up (`rollback <op_id>`); local files are overwritten by `get`.
+- `put`/`get`/`cp`: if the destination is an existing directory the source goes inside it; otherwise the destination is the new path. Overwritten files on the peer are backed up (`rollback <op_id>`); local files are overwritten by `get`.
+- Moving files between two peers: use `cp A <src> B <dest>`, not `get` + `put`. It streams through this machine without a local copy, so there is nothing to clean up here.
+- Multi-line commands or anything with tricky quotes (`node -e`, `python -c`, here-docs): write the script to a local file and use `exec --script <file>` instead of escaping it through several shells.
+- Path permissions (`path=rcud`) and deny rules apply to the file commands only. `exec` runs with the full rights of the user `serve` runs as (`info` shows it as `exec 身份`, e.g. `root`). Do not use `exec` to change paths the owner marked read-only or denied unless the user explicitly asked for exactly that change, and tell the user when you do.
+- No relaying: don't run `agent-cli-x` inside a peer's `exec` unless the user asked for that hop, and never read a peer's `~/.agent-cli-x`. On `禁止借道` (exit 102), stop and tell the user. Do not work around it.
 
 ## Exit codes
 
@@ -77,7 +84,7 @@ Add `--json` to any command for machine-readable output.
 | other | the remote command's own exit code |
 | 100 | cannot connect (peer not running, network, firewall) |
 | 101 | invalid token |
-| 102 | denied by policy (deny-listed path/command, path escape) |
+| 102 | denied by policy (deny-listed path/command, path escape, relay blocked) |
 | 103 | file or workspace not found |
 | 104 | timeout |
 | 105 | conflict (edit no/multiple match, sha mismatch) |

@@ -536,6 +536,10 @@ pub struct Peer {
     pub arch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell: Option<String>,
+    /// `peer list` 上次尝试补全上面缓存的时间（Unix 秒）。补不全（离线或对端太旧）时
+    /// 一段时间内不再重试，避免每次 `peer list` 都卡在连接超时上。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub info_tried: Option<i64>,
 }
 
 impl Peer {
@@ -619,7 +623,15 @@ pub struct TokenEntry {
     pub sha256: String,
     #[serde(default)]
     pub created: String,
+    /// 禁止借道：此调用方发起的 exec / 后台任务里不能再调用 agent-cli-x 访问其他节点
+    /// 或管理本机凭据（防 AI 误操作，不是安全边界）。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_relay: bool,
 }
+
+/// exec 子进程中的标记环境变量：值为被禁止借道的调用方名称。
+/// 客户端检测到它时只允许不联网、不涉及凭据的命令。
+pub const NO_RELAY_ENV: &str = "AGENT_CLI_X_NO_RELAY";
 
 pub fn tokens_path(home: &Path) -> PathBuf {
     home.join("tokens.toml")

@@ -63,15 +63,23 @@ fn set_exec(_p: &Path) {}
 
 // ---------------- put ----------------
 
-pub fn put<S: Read + Write>(ctx: &Ctx, len: u64, conn: &mut BufReader<S>) {
+/// `len` 为 None 时请求体长度未知（cp 中转的帧流）：读到结束帧为止，总量仍受 max_transfer_mb 限制。
+pub fn put<S: Read + Write>(ctx: &Ctx, len: Option<u64>, conn: &mut BufReader<S>) {
     let mut op: Option<Op> = None;
-    let mut body = conn.by_ref().take(len);
-    let res = put_inner(ctx, len, &mut body, &mut op);
-    // 读完剩余请求体再回错误：否则连接带着未读数据关闭会触发 TCP RST，
-    // 客户端可能在读到错误响应之前就收到“连接被重置”。超过传输上限的请求不读，直接断开。
-    if res.is_err() && len <= max_put_bytes(ctx) {
-        let _ = std::io::copy(&mut body, &mut std::io::sink());
-    }
+    let limit = len.unwrap_or_else(|| max_put_bytes(ctx));
+    let (res, remaining) = {
+        let mut body = conn.by_ref().take(limit);
+        let res = put_inner(ctx, limit, &mut body, &mut op);
+        // 读完剩余请求体再回错误：否则连接带着未读数据关闭会触发 TCP RST，
+        // 客户端可能在读到错误响应之前就收到“连接被重置”。超过传输上限的请求不读，直接断开。
+        if res.is_err() && len.is_some_and(|n| n <= max_put_bytes(ctx)) {
+            let _ = std::io::copy(&mut body, &mut std::io::sink());
+        }
+        (res, body.limit())
+    };
+    // 长度未知的流（cp 中转）不知道还剩多少：先回错误，再读掉对方仍在发送的数据直到它停止；
+    // 中转方发现已有响应就会停止发送并关闭写方向。
+    let drain_after = res.is_err() && len.is_none();
     let op_id = op.as_ref().filter(|o| !o.is_empty()).map(|o| o.id.clone());
     if let Some(o) = op {
         o.finish();
@@ -99,6 +107,9 @@ pub fn put<S: Read + Write>(ctx: &Ctx, len: u64, conn: &mut BufReader<S>) {
             );
             let _ = http::write_error(w, &e);
         }
+    }
+    if drain_after {
+        let _ = std::io::copy(&mut conn.by_ref().take(remaining), &mut std::io::sink());
     }
 }
 
