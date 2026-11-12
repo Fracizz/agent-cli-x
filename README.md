@@ -10,7 +10,7 @@ Machine B: Codex       ──> agent-cli-x ──TLS──> Machine A: agent-cli
 - **One binary, both roles.** Every machine runs `agent-cli-x serve`, and every machine can call its peers.
 - **Lightweight.** Synchronous std + rustls, no async runtime, no OpenSSL. Short-lived HTTPS request per call.
 - **Machine identity.** Every node has a configurable `node_name` and a random `node_id` (UUID), so agents know exactly which machine they are talking to.
-- **Built for agents.** Exit codes pass through, long output is trimmed to head/tail with the full log saved locally, `--json` everywhere, exact-match `edit`, `rollback`.
+- **Built for agents.** Exit codes pass through, long output is trimmed to head/tail (also with `--json`) with the full log saved locally, `read` and `ls` return bounded windows by default, exact-match `edit`, `rollback`.
 - **Many machines.** Run one command on several peers at once (`exec A,B,C` / `@all`), issue a separate revocable token per caller, push upgrades remotely, and check everything with `doctor`.
 - **Guard rails.** Token auth, self-signed TLS with fingerprint pinning, workspace allow-list, path deny-list, command deny-list, automatic backups, audit log.
 
@@ -72,6 +72,7 @@ Then teach your agent the tool: copy [`skills/agent-cli-x/SKILL.md`](skills/agen
 | `upgrade <peer> [--binary <file>] [--force]` | replace the peer's binary and restart its `serve` (`A,B` / `@all` allowed) |
 | `exec <peer> --detach <cmd>`, `job list\|logs\|kill` | background jobs (`job logs --follow` exits with the job's code) |
 | `ls` / `grep` / `read` / `write` / `edit` | file operations inside workspaces |
+| Output limits | `exec` / `job logs` keep the first and last 100 lines (at most 16 KB each, lines cut at 2000 chars); each peer of a multi-peer `exec` keeps 50 + 50 lines (8 KB each). `--json` applies the same limits and reports `truncated`, `omitted_lines` and the local `log`; `--full` turns trimming off. `read` without an end line returns at most 2000 lines / 64 KB and prints the next `--lines` range; an explicit range is capped by `max_read_kb`. `ls` lists at most 500 entries (`--max`), `grep` 200 matches (`--max`) |
 | `rm <peer> <path> [-r] [--permanent]` | delete a file or directory: moved to the peer's recycle bin by default (undo with `rollback`); `--permanent` deletes for good |
 | `purge <peer> <op_id>` | permanently remove what an operation left behind (its recycle-bin entries and backups) to free space; it can no longer be rolled back |
 | `put <peer> <local> <dest>` / `get <peer> <src> <local>` | transfer files or directories (`--exclude`) |
