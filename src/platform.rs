@@ -497,10 +497,11 @@ pub fn spawn_detached(build: impl Fn() -> Command) -> std::io::Result<Child> {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            // 真正脱离控制台，避免控制台宿主继续持有启动器的重定向管道。
+            const DETACHED_PROCESS: u32 = 0x0000_0008;
             const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
             const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
-            let mut flags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP;
+            let mut flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
             if breakaway {
                 flags |= CREATE_BREAKAWAY_FROM_JOB;
             }

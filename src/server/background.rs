@@ -10,6 +10,8 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 pub fn start(home: &Path, wait_port_secs: u64) -> Result<u32> {
+    #[cfg(windows)]
+    protect_launcher_pipes()?;
     let exe = std::env::current_exe()?;
     let mut child = platform::spawn_detached(|| {
         let mut c = Command::new(&exe);
@@ -62,6 +64,29 @@ pub fn start(home: &Path, wait_port_secs: u64) -> Result<u32> {
             ),
         )
     })
+}
+
+// Windows 会继承额外的可继承句柄；外层调用者的捕获管道必须在启动前去掉此标志，
+// 否则启动器已退出，调用者仍要等常驻服务退出才能读到 EOF。
+#[cfg(windows)]
+fn protect_launcher_pipes() -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+    use windows_sys::Win32::Storage::FileSystem::{GetFileType, FILE_TYPE_PIPE};
+    for handle in [
+        std::io::stdin().as_raw_handle(),
+        std::io::stdout().as_raw_handle(),
+        std::io::stderr().as_raw_handle(),
+    ] {
+        unsafe {
+            if GetFileType(handle as _) == FILE_TYPE_PIPE
+                && SetHandleInformation(handle as _, HANDLE_FLAG_INHERIT, 0) == 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn notify(result: Result<u32>) -> Result<()> {
