@@ -49,7 +49,7 @@ agent-cli-x restart B ; agent-cli-x set-port B 48000   # use these, not manual c
 - Timeout kills the process tree (exit 104); raise `--timeout` or use `--detach` for anything over a few minutes.
 - `exec` runs with the full rights of the `serve` user. Do not use it to change read-only/denied paths unless the user asked for exactly that, and say so.
 - No relaying: don't run `agent-cli-x` inside a peer's `exec` unless asked, never read a peer's `~/.agent-cli-x`. On `禁止借道` stop and tell the user.
-- Unreachable peer (100): run `doctor`. Autostart and legacy trash recovery: see README.
+- Unreachable peer (100): run `doctor`. `serve` defaults to background (windowless, returns once ready); use `serve --foreground` for service managers/debugging. Autostart and legacy trash recovery: see README.
 
 ## Exit codes
 

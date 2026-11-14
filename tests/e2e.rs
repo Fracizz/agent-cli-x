@@ -120,7 +120,7 @@ fn setup_with(copy_bin: bool) -> Env {
         PathBuf::from(BIN)
     };
     let child = Command::new(&server_bin)
-        .arg("serve")
+        .args(["serve", "--foreground"])
         .env("AGENT_CLI_X_HOME", &server_home)
         // CI 运行器本身可能在 systemd 下（带 INVOCATION_ID），强制用“自行拉起新进程”的重启方式
         .env("AGENT_CLI_X_RESTART", "spawn")
@@ -1463,6 +1463,81 @@ fn wait_closed(addr: &str) -> bool {
 }
 
 #[test]
+fn background_serve_reports_startup_and_survives_launcher_exit() {
+    let mut env = setup();
+    let s = &env.server_home;
+    let c = &env.client_home;
+
+    // 不能把 spawn 成功误报成服务就绪：端口冲突保持 I/O 退出码，原服务继续工作。
+    let original_pid = server_pid(c);
+    assert_eq!(original_pid, u64::from(env._server.child.id()));
+    assert!(env._server.child.try_wait().unwrap().is_none());
+    let o = run(s, &["serve", "--background", "--json"]);
+    assert_eq!(o.status.code(), Some(107), "{}", text(&o));
+    assert!(o.stdout.is_empty());
+    assert!(text(&o).contains("port in use"), "{}", text(&o));
+    assert_eq!(server_pid(c), original_pid);
+
+    env._server.child.kill().unwrap();
+    env._server.child.wait().unwrap();
+    assert!(wait_closed(&env.listen));
+
+    // 配置错误同样透传，且后台子进程的错误有落盘记录。
+    let cfg_path = s.join("config.toml");
+    let saved = s.join("config.saved");
+    fs::rename(&cfg_path, &saved).unwrap();
+    let o = run(s, &["serve"]);
+    assert_eq!(o.status.code(), Some(109), "{}", text(&o));
+    assert!(o.stdout.is_empty());
+    assert!(text(&o).contains("serve-logs"));
+    fs::rename(&saved, &cfg_path).unwrap();
+
+    // output() 要等启动器退出且关闭其管道；真正的服务应仍能鉴权和执行命令。
+    let o = run(s, &["serve", "--json"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(o.stderr.is_empty(), "{}", text(&o));
+    let pid = json_of(&o)["pid"].as_u64().unwrap();
+    let _guard = PidGuard(std::cell::Cell::new(pid));
+    assert_ne!(pid, original_pid);
+    assert_eq!(server_pid(c), pid);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // 无控制台的探针尝试附加到服务；ERROR_INVALID_HANDLE 表示服务没有控制台。
+        let probe = Command::new("powershell")
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+            .arg(
+                r#"Add-Type -TypeDefinition '
+using System.Runtime.InteropServices;
+public static class BackgroundConsoleProbe {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool AttachConsole(uint pid);
+    [DllImport("kernel32.dll")]
+    static extern bool FreeConsole();
+    public static int Check(uint pid) {
+        if (AttachConsole(pid)) { FreeConsole(); return 1; }
+        return Marshal.GetLastWin32Error() == 6 ? 0 : 2;
+    }
+}'; exit ([BackgroundConsoleProbe]::Check([uint32]$env:AGENT_CLI_X_TEST_SERVER_PID))"#,
+            )
+            .env("AGENT_CLI_X_TEST_SERVER_PID", pid.to_string())
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .output()
+            .unwrap();
+        assert!(probe.status.success(), "console probe: {}", text(&probe));
+    }
+    let o = run(c, &["exec", "b", "echo background-ready"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains("background-ready"));
+    let logs: String = fs::read_dir(s.join("serve-logs"))
+        .unwrap()
+        .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect();
+    assert!(logs.contains(&format!("serving (pid {pid})")));
+    assert!(logs.contains("serve exited:"));
+}
+
+#[test]
 fn restart_set_port_config_fallback() {
     let env = setup();
     let c = &env.client_home;
@@ -1515,7 +1590,7 @@ fn restart_set_port_config_fallback() {
     kill_pid(pid1);
     assert!(wait_closed(&new_listen), "serve 未退出");
     let mut child = Command::new(BIN)
-        .arg("serve")
+        .args(["serve", "--foreground"])
         .env("AGENT_CLI_X_HOME", s)
         .env("AGENT_CLI_X_RESTART", "spawn")
         .stdout(Stdio::null())

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.0.8
+
+- Make `serve` default to detached, windowless startup with readiness confirmation, file logs and the original startup error codes. Use `serve --foreground` for debugging and service managers; update existing Task Scheduler/systemd actions to include it. `--background` remains an explicit alias for the default.
+
 ## 0.0.7
 
 Fixes for safe file recovery, process supervision and bounded agent output.

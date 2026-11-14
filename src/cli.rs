@@ -48,7 +48,7 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
-    /// Run server in foreground (logs also go to ~/.agent-cli-x/serve-logs/)
+    /// Run server in background by default (logs go to ~/.agent-cli-x/serve-logs/)
     Serve {
         /// Max seconds to wait if the port is in use (new process waits for old one on upgrade)
         #[arg(long, hide = true, default_value_t = 0)]
@@ -56,6 +56,15 @@ enum Cmd {
         /// Only validate config.toml and cert, don't start (use after manual edits)
         #[arg(long)]
         check: bool,
+        /// Explicitly select background mode (the default)
+        #[arg(long, conflicts_with_all = ["check", "foreground"])]
+        background: bool,
+        /// Stay in foreground for troubleshooting or service managers
+        #[arg(long, conflicts_with = "check")]
+        foreground: bool,
+        /// Internal startup handshake for the detached server
+        #[arg(long, hide = true, conflicts_with_all = ["background", "foreground", "check"])]
+        background_child: bool,
     },
     /// Show this node's name, ID, fingerprint and workspaces (offline)
     Whoami {
@@ -397,7 +406,29 @@ pub fn run() -> Result<i32> {
             }
             Ok(0)
         }
-        Cmd::Serve { wait_port, .. } => server::serve(&config::home_dir(), wait_port).map(|_| 0),
+        Cmd::Serve {
+            wait_port,
+            foreground: false,
+            background_child: false,
+            ..
+        } => {
+            let home = config::home_dir();
+            let pid = server::background::start(&home, wait_port)?;
+            if json {
+                println!("{}", json!({"pid": pid}));
+            } else {
+                eprintln!(
+                    "Serving in background (pid {pid}); logs: {}",
+                    server::log::dir(&home).display()
+                );
+            }
+            Ok(0)
+        }
+        Cmd::Serve {
+            wait_port,
+            background_child,
+            ..
+        } => server::serve(&config::home_dir(), wait_port, background_child).map(|_| 0),
         Cmd::Whoami { pair } => whoami(pair, json),
         // 禁止借道时不探测对端
         Cmd::Doctor { no_peers } => doctor::run(json, !no_peers && !no_relay),

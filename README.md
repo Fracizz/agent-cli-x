@@ -37,8 +37,10 @@ On **each** machine:
 
 ```bash
 agent-cli-x init --name build-01 --workspace proj=/home/me/proj   # prints node id, token, fingerprint
-agent-cli-x serve                                   # keep running; set up start at boot (see below)
+agent-cli-x serve                                   # background by default; set up start at boot (see below)
 ```
+
+`serve` runs in the background by default, without a console window on Windows, and survives closing the launching terminal. It prints the PID only after the listener is ready (`--json`: `{"pid":1234}`); startup failures return the original error code. Logs stay in `~/.agent-cli-x/serve-logs/`. Use `serve --foreground` for troubleshooting and service managers; `--background` remains an explicit alias for the default.
 
 `init` prints a ready-to-paste `peer add` command. To give each caller its own token instead, run on B:
 
@@ -64,7 +66,7 @@ Then teach your agent the tool: copy [`skills/agent-cli-x/SKILL.md`](skills/agen
 
 | Command | Purpose |
 |---|---|
-| `init` / `serve` / `whoami [--pair]` / `fingerprint` | set up, run and identify this machine; `serve --check` only validates `config.toml` and the certificate (run it after editing the config by hand) |
+| `init` / `serve [--foreground]` / `whoami [--pair]` / `fingerprint` | set up, run in background by default and identify this machine; `serve --check` only validates `config.toml` and the certificate (run it after editing the config by hand) |
 | `doctor [--no-peers]` | check config, local service, start at boot, firewall, peers and their versions |
 | `token add\|list\|set\|remove\|rotate` | per-caller tokens for this machine (`rotate default` replaces the config token); `add <name> --no-relay` / `set <name> --no-relay\|--allow-relay` stops that caller from hopping to other machines through this one |
 | `peer add\|set\|list\|remove` | manage peers (`~/.agent-cli-x/peers.toml`); `list` shows the cached OS/arch and shell, refreshed by `peer add`, `info`, `upgrade` and `cp`; `set <name> --addr <ip:port>` / `--token <t>` changes a peer's address or token after checking it against the registered fingerprint; peers with no cached OS (registered by an older version) are looked up automatically (an unreachable one is retried at most once a day) |
@@ -231,7 +233,7 @@ Description=agent-cli-x serve
 After=network-online.target
 
 [Service]
-ExecStart=%h/.local/bin/agent-cli-x serve
+ExecStart=%h/.local/bin/agent-cli-x serve --foreground
 Restart=on-failure
 RestartSec=5
 # keep background jobs running when serve restarts or is upgraded
@@ -251,7 +253,7 @@ sudo loginctl enable-linger $USER   # start at boot and keep running after logou
 
 ```powershell
 $exe       = (Get-Command agent-cli-x).Source
-$action    = New-ScheduledTaskAction -Execute $exe -Argument 'serve'
+$action    = New-ScheduledTaskAction -Execute $exe -Argument 'serve --foreground'
 $trigger   = New-ScheduledTaskTrigger -AtStartup
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType S4U -RunLevel Limited
 $settings  = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) `
@@ -265,6 +267,8 @@ netsh advfirewall firewall add rule name="agent-cli-x" dir=in action=allow progr
 ```
 
 Why these settings: Task Scheduler's defaults stop a task after 3 days and skip or stop it on battery power. `S4U` runs it at boot without anyone logged in, with no console window and no stored password. The trade-off is that the task has no network credentials, so mapped drives and Credential Manager logins are unavailable to `exec`. If you need them, use `-AtLogOn` with `-LogonType Interactive` instead. That variant only starts after you log in and shows a console window, and closing the window stops `serve`.
+
+For a manual windowless start, run `agent-cli-x serve`. For windowless autostart, use the `S4U` task above. Use `serve --foreground` in Task Scheduler/systemd actions so the manager tracks the actual server and can restart it on failure; default background mode exits the launching process after startup. Update existing task actions/unit files to add `--foreground` when upgrading.
 
 After a reboot, run `agent-cli-x doctor` on the machine. On Windows it flags a task that will stop after 72 hours, a task that stops or won't start on battery, a task that launches a different binary path, and a missing firewall rule. On Linux it flags a unit that isn't enabled and linger that is off. Also run `agent-cli-x info <peer>` from another machine to confirm the peer can be reached.
 

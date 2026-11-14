@@ -3,6 +3,7 @@
 mod admin;
 pub mod audit;
 mod auth;
+pub mod background;
 mod backup;
 mod exec;
 mod fs;
@@ -74,11 +75,14 @@ pub fn job_run(dir: &Path) -> Result<i32> {
     jobs::run(dir)
 }
 
-pub fn serve(home: &Path, wait_port_secs: u64) -> Result<()> {
+pub fn serve(home: &Path, wait_port_secs: u64, background_child: bool) -> Result<()> {
     log::init(home);
-    let r = serve_inner(home, wait_port_secs);
+    let r = serve_inner(home, wait_port_secs, background_child);
     if let Err(e) = &r {
         crate::slog!("serve exited: {e}");
+        if background_child {
+            let _ = background::notify(Err(e.clone()));
+        }
     }
     r
 }
@@ -142,7 +146,7 @@ fn load_or_fallback(home: &Path) -> Result<(Config, Workspaces, Option<String>)>
     }
 }
 
-fn serve_inner(home: &Path, wait_port_secs: u64) -> Result<()> {
+fn serve_inner(home: &Path, wait_port_secs: u64, background_child: bool) -> Result<()> {
     // config.toml 有误时这里会失败，交给 load_or_fallback 处理
     let _ = config::ensure_node_id(home);
     let (cfg, ws, config_error) = load_or_fallback(home)?;
@@ -235,6 +239,9 @@ fn serve_inner(home: &Path, wait_port_secs: u64) -> Result<()> {
     // 监听器在独立线程上运行（换端口时会被替换），主线程只需保持进程存活
     let h = admin::spawn_accept(&st, listener, &listen)?;
     st.net.set_active(h);
+    if background_child {
+        background::notify(Ok(std::process::id()))?;
+    }
     loop {
         thread::park();
     }

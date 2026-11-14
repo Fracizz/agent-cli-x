@@ -73,7 +73,7 @@ impl Server {
         )
         .unwrap();
         let child = Command::new(BIN)
-            .arg("serve")
+            .args(["serve", "--foreground"])
             .env("AGENT_CLI_X_HOME", &home)
             .env_remove("AGENT_CLI_X_NO_RELAY")
             .stdin(Stdio::null())

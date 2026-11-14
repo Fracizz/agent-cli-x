@@ -4,7 +4,7 @@
 //! 重启方式：
 //! - 在 systemd 下（存在 `INVOCATION_ID`）或 `AGENT_CLI_X_RESTART=exit`：以退出码 75 退出，
 //!   由服务管理器按 `Restart=` 拉起（systemd 会在服务停止时杀掉整个 cgroup，自己拉起子进程无效）；
-//! - 其他情况（Windows 任务计划、手动运行）：启动一个脱离当前进程的新 `serve --wait-port`，再退出。
+//! - 其他情况（Windows 任务计划、手动运行）：启动一个脱离当前进程的新 `serve --foreground --wait-port`，再退出。
 
 use super::Ctx;
 use crate::error::{AppError, Result};
@@ -316,7 +316,7 @@ fn spawn_detached() -> Result<u32> {
     let exe = current_exe()?;
     let child = platform::spawn_detached(|| {
         let mut c = Command::new(&exe);
-        c.args(["serve", "--wait-port", "30"])
+        c.args(["serve", "--foreground", "--wait-port", "30"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
