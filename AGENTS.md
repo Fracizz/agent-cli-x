@@ -16,7 +16,8 @@ agent-cli-x 的主要使用者是 AI agent，它的每一行输出都会进入�
   | 多对端 `exec` 的每个对端 | 头尾各 50 行、各 8KB | `src/client/output.rs` `PER_PEER` |
   | `read`（未给结束行） | 2000 行 / 64KB | `src/cli.rs` `READ_WINDOW_*` |
   | `ls` | 500 条（`--max`） | `src/cli.rs` / `src/server/fs.rs` |
-  | `grep` | 200 条、单行 300 字符（`--max`） | `src/server/fs.rs` |
+  | `find` | 200 条（`--max`），按修改时间倒序 | `src/server/fs.rs` |
+  | `grep` | 200 条匹配/文件、单行 300 字符、含上下文共 64KB（`--max`，截断给 `--skip`） | `src/server/fs.rs` |
 
 - 截断逻辑统一复用 `client::output::HeadTail` / `clip_text`，不要再各自实现。
 

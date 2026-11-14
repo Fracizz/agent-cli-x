@@ -148,6 +148,20 @@ enum Cmd {
         #[arg(long, default_value_t = 500)]
         max: usize,
     },
+    /// Find files by name glob, newest first (honors .gitignore, hides denied paths)
+    #[command(
+        after_help = "Pattern is relative to the search dir; without `/` it matches at any depth.\nExamples: find B '*.rs' proj:src   find B 'src/**/test_*.py'   find B 'Cargo.toml'"
+    )]
+    Find {
+        peer: String,
+        /// Glob, e.g. "*.rs", "src/**/*.ts"
+        pattern: String,
+        /// Search dir (workspace:relative/path), default: default workspace root
+        path: Option<String>,
+        /// Max paths to return
+        #[arg(long, default_value_t = 200)]
+        max: usize,
+    },
     /// Search file contents on a peer (regex, honors .gitignore, skips binaries and denied paths)
     Grep {
         peer: String,
@@ -163,9 +177,27 @@ enum Cmd {
         /// Match literally (not regex)
         #[arg(short = 'F', long)]
         fixed: bool,
-        /// Max matching lines to return
+        /// Lines of context around each match (max 50)
+        #[arg(short = 'C', long, value_name = "N")]
+        context: Option<usize>,
+        /// Lines of context after each match
+        #[arg(short = 'A', long, value_name = "N")]
+        after: Option<usize>,
+        /// Lines of context before each match
+        #[arg(short = 'B', long, value_name = "N")]
+        before: Option<usize>,
+        /// Only list files that contain a match
+        #[arg(short = 'l', long, conflicts_with_all = ["count", "context", "after", "before"])]
+        files: bool,
+        /// Count matching lines per file
+        #[arg(short = 'c', long, conflicts_with_all = ["context", "after", "before"])]
+        count: bool,
+        /// Max matching lines to return (files with -l / -c)
         #[arg(long, default_value_t = 200)]
         max: usize,
+        /// Skip the first N results (continue after a truncated search)
+        #[arg(long, default_value_t = 0)]
+        skip: usize,
     },
     /// Read a text file
     Read {
@@ -195,9 +227,15 @@ enum Cmd {
         expect_sha: Option<String>,
     },
     /// Exact text replace in a file (old must match uniquely)
+    #[command(
+        after_help = "Several edits in one call (applied in order, all or nothing):\n  agent-cli-x edit B proj:a.rs --edits - <<'EOF'\n  [{\"old\": \"fn a()\", \"new\": \"fn b()\"}, {\"old\": \"x\", \"new\": \"y\", \"all\": true}]\n  EOF"
+    )]
     Edit {
         peer: String,
         path: String,
+        /// JSON array [{"old","new","all"?}] from a file or `-` (stdin); replaces --old/--new
+        #[arg(long, value_name = "FILE", conflicts_with_all = ["old", "old_file", "new", "new_file", "all"])]
+        edits: Option<PathBuf>,
         #[arg(long, conflicts_with = "old_file")]
         old: Option<String>,
         /// Read old text from a local file (avoids shell escaping)
@@ -491,6 +529,40 @@ pub fn run() -> Result<i32> {
             }
             Ok(0)
         }
+        Cmd::Find {
+            peer,
+            pattern,
+            path,
+            max,
+        } => {
+            let v = Client::load(&peer)?.call(
+                "/v1/fs/find",
+                &json!({"pattern": pattern, "path": path.unwrap_or_default(), "max": max}),
+                CALL_TIMEOUT,
+            )?;
+            let paths = v["paths"].as_array().cloned().unwrap_or_default();
+            if json {
+                println!("{v}");
+            } else {
+                let ws = v["ws"].as_str().unwrap_or_default();
+                for p in &paths {
+                    println!("{ws}:{}", p.as_str().unwrap_or_default());
+                }
+                if v["truncated"].as_bool() == Some(true) {
+                    let more = if v["total_capped"].as_bool() == Some(true) {
+                        "+"
+                    } else {
+                        ""
+                    };
+                    eprintln!(
+                        "[agent-cli-x: showing {} of {}{more} files (newest first); narrow the pattern/dir or raise --max]",
+                        paths.len(),
+                        v["total"]
+                    );
+                }
+            }
+            Ok(if paths.is_empty() { 1 } else { 0 })
+        }
         Cmd::Grep {
             peer,
             pattern,
@@ -498,8 +570,23 @@ pub fn run() -> Result<i32> {
             glob,
             ignore_case,
             fixed,
+            context,
+            after,
+            before,
+            files,
+            count,
             max,
+            skip,
         } => {
+            let mode = if files {
+                "files"
+            } else if count {
+                "count"
+            } else {
+                "lines"
+            };
+            let before = before.or(context).unwrap_or(0);
+            let after = after.or(context).unwrap_or(0);
             let v = Client::load(&peer)?.call(
                 "/v1/fs/grep",
                 &json!({
@@ -509,28 +596,25 @@ pub fn run() -> Result<i32> {
                     "ignore_case": ignore_case,
                     "fixed": fixed,
                     "max": max,
+                    "skip": skip,
+                    "mode": mode,
+                    "before": before,
+                    "after": after,
                 }),
                 CALL_TIMEOUT,
             )?;
-            let matches = v["matches"].as_array().cloned().unwrap_or_default();
-            if json {
-                println!("{v}");
-            } else {
-                let ws = v["ws"].as_str().unwrap_or_default();
-                for m in &matches {
-                    println!(
-                        "{ws}:{}:{}:{}",
-                        m["path"].as_str().unwrap_or_default(),
-                        m["line"],
-                        m["text"].as_str().unwrap_or_default()
-                    );
-                }
-                if v["truncated"].as_bool() == Some(true) {
-                    eprintln!("[agent-cli-x: --max {max} limit reached; narrow the scope or filter with --glob]");
-                }
+            // 旧版对端会忽略新参数，返回结果里没有 mode：不能把它当成正确结果
+            if v["mode"].is_null() && (mode != "lines" || before + after + skip > 0) {
+                return Err(AppError::bad_request(format!(
+                    "peer does not support -l/-c/-C/-A/-B/--skip (older version); run `agent-cli-x upgrade {peer}`"
+                )));
             }
+            print_grep(&v, mode, before + after > 0, max, json);
             // 与 grep 一致：无匹配返回 1
-            Ok(if matches.is_empty() { 1 } else { 0 })
+            let n = v["count"]
+                .as_u64()
+                .unwrap_or_else(|| v["matches"].as_array().map_or(0, |a| a.len() as u64));
+            Ok(if n == 0 { 1 } else { 0 })
         }
         Cmd::Read {
             peer,
@@ -562,6 +646,7 @@ pub fn run() -> Result<i32> {
         Cmd::Edit {
             peer,
             path,
+            edits,
             old,
             old_file,
             new,
@@ -569,13 +654,28 @@ pub fn run() -> Result<i32> {
             all,
             expect_sha,
         } => {
-            let old = text_arg(old, old_file, "--old / --old-file")?;
-            let new = text_arg(new, new_file, "--new / --new-file")?;
-            let v = Client::load(&peer)?.call(
-                "/v1/fs/edit",
-                &json!({"path": path, "old": old, "new": new, "replace_all": all, "expect_sha": expect_sha}),
-                CALL_TIMEOUT,
-            )?;
+            let body = match edits {
+                Some(f) => {
+                    let list = parse_edits(&f)?;
+                    json!({"path": path, "edits": list, "expect_sha": expect_sha})
+                }
+                None => {
+                    let old = text_arg(old, old_file, "--old / --old-file (or --edits)")?;
+                    let new = text_arg(new, new_file, "--new / --new-file")?;
+                    json!({"path": path, "old": old, "new": new, "replace_all": all, "expect_sha": expect_sha})
+                }
+            };
+            let v = Client::load(&peer)?
+                .call("/v1/fs/edit", &body, CALL_TIMEOUT)
+                .map_err(|mut e| {
+                    // 旧版对端不认识 edits，只会报缺少 old 字段
+                    if body.get("edits").is_some() && e.message.contains("missing field `old`") {
+                        e.message = format!(
+                            "peer does not support --edits (older version); run `agent-cli-x upgrade {peer}` or use --old/--new"
+                        );
+                    }
+                    e
+                })?;
             print_write_result(&v, json, "edited");
             Ok(0)
         }
@@ -1629,6 +1729,80 @@ fn print_info(name: &str, v: &Value) {
             rules.join(", ")
         );
     }
+}
+
+/// grep 普通输出：匹配行 `ws:path:line:text`，上下文行 `ws:path-line-text`，
+/// 不连续的块之间用 `--` 分隔（与 rg / grep 相同）；-l 只输出路径，-c 输出 `ws:path:count`。
+fn print_grep(v: &Value, mode: &str, context: bool, max: usize, json: bool) {
+    if json {
+        println!("{v}");
+    } else {
+        let ws = v["ws"].as_str().unwrap_or_default();
+        let mut prev: Option<(&str, u64)> = None;
+        for m in v["matches"].as_array().into_iter().flatten() {
+            let path = m["path"].as_str().unwrap_or_default();
+            match mode {
+                "files" => println!("{ws}:{path}"),
+                "count" => println!("{ws}:{path}:{}", m["count"]),
+                _ => {
+                    let line = m["line"].as_u64().unwrap_or(0);
+                    if context && prev.is_some_and(|(p, l)| p != path || l + 1 != line) {
+                        println!("--");
+                    }
+                    prev = Some((path, line));
+                    let sep = if m["ctx"].as_bool() == Some(true) {
+                        '-'
+                    } else {
+                        ':'
+                    };
+                    println!(
+                        "{ws}:{path}{sep}{line}{sep}{}",
+                        m["text"].as_str().unwrap_or_default()
+                    );
+                }
+            }
+        }
+    }
+    if v["truncated"].as_bool() == Some(true) {
+        let unit = if mode == "lines" { "matches" } else { "files" };
+        let why = if v["byte_limit"].as_bool() == Some(true) {
+            "64KB output limit".to_string()
+        } else {
+            format!("--max {max} {unit}")
+        };
+        match v["next_skip"].as_u64() {
+            Some(n) => eprintln!(
+                "[agent-cli-x: stopped at {why}; continue with --skip {n}, or narrow the path/--glob]"
+            ),
+            None => eprintln!(
+                "[agent-cli-x: --max {max} limit reached; narrow the scope or filter with --glob]"
+            ),
+        }
+    }
+}
+
+/// 读取 --edits 的 JSON 数组（文件或 `-` 表示 stdin），本地先校验形状，错误提示更直接。
+fn parse_edits(f: &PathBuf) -> Result<Value> {
+    let text = if f.as_os_str() == "-" {
+        read_stdin()?
+    } else {
+        read_local_text(f)?
+    };
+    let v: Value = serde_json::from_str(&text)
+        .map_err(|e| AppError::bad_request(format!("--edits is not valid JSON: {e}")))?;
+    let ok = v.as_array().is_some_and(|a| {
+        !a.is_empty()
+            && a.iter().all(|e| {
+                let has = |k: &str, alt: &str| e[k].is_string() || e[alt].is_string();
+                has("old", "old_string") && has("new", "new_string")
+            })
+    });
+    if !ok {
+        return Err(AppError::bad_request(
+            r#"--edits must be a non-empty JSON array like [{"old": "a", "new": "b", "all": false}]"#,
+        ));
+    }
+    Ok(v)
 }
 
 fn print_write_result(v: &Value, json: bool, verb: &str) {
