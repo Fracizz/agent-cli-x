@@ -1515,6 +1515,7 @@ public static class BackgroundConsoleProbe {
     [DllImport("kernel32.dll")]
     static extern bool FreeConsole();
     public static int Check(uint pid) {
+        FreeConsole();
         if (AttachConsole(pid)) { FreeConsole(); return 1; }
         return Marshal.GetLastWin32Error() == 6 ? 0 : 2;
     }
