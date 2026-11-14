@@ -21,22 +21,26 @@ agent-cli-x exec B --cwd proj:web --timeout 1200 "pnpm build"  # options BEFORE 
 agent-cli-x exec B --script ./check.sh        # multi-line / tricky quoting: write a local file, no nested escaping
 agent-cli-x exec B --detach "cargo test"      # long jobs; then: job logs B <id> --follow | job list B | job kill B <id>
 agent-cli-x exec B,C "git pull"               # or @all; parallel, grouped per peer, exit 0 only if all succeed
-agent-cli-x grep B "fn main" proj:src --glob "*.rs"   # -i, -F; exit 1 = no match
+agent-cli-x find B "*.rs" proj:src            # files by name, newest first; exit 1 = none
+agent-cli-x grep B "fn main" proj:src --glob "*.rs" -C 2  # -i -F; -l files only; -c counts; exit 1 = none
 agent-cli-x ls   B proj:src --depth 2
 agent-cli-x read B proj:src/main.rs --lines 100:200 -n
-agent-cli-x edit B proj:src/main.rs --old "a" --new "b"   # --old-file/--new-file for multi-line; --all
+agent-cli-x edit B proj:src/main.rs --old "a" --new "b"   # --all
+agent-cli-x edit B proj:src/main.rs --edits - <<'EOF'  # or --edits f.json; multi-line/several, in order, all or nothing
+[{"old": "fn a()", "new": "fn b()"}, {"old": "x", "new": "y", "all": true}]
+EOF
 agent-cli-x write B proj:notes.md --from ./notes.md       # or --content / stdin
 agent-cli-x put B ./dist proj:web/dist --exclude node_modules ; agent-cli-x get B proj:logs ./logs
 agent-cli-x cp A dl:pkg B home:               # peer → peer, streamed, nothing kept locally
 agent-cli-x rm B proj:build/tmp -r            # to recycle bin; rollback B <op_id> undoes write/edit/put/rm
-agent-cli-x upgrade B                         # on a `版本不一致` hint
-agent-cli-x restart B ; agent-cli-x set-port B 48000   # use these, not manual config edits
+agent-cli-x upgrade B                         # on a `version mismatch` hint
+agent-cli-x restart B ; agent-cli-x set-port B 48000   # never hand-edit a peer's config/firewall for these
 ```
 
 ## Keep output small
 
-- Bounded output (also JSON): `exec`/`job logs` share head + tail 100 lines / 16KB each (multi-peer: 50 / 8KB each); any cut retains a full local log. `read` without an end: ≤2000 lines / 64KB, 2000 chars/line; follow `next_start`/the `--lines N:` hint, use the printed `get` command for clipped lines. `ls` ≤500 entries, `grep` ≤200 matches / 300 chars; pages ≤60KB of entries. Continue with `--offset` / `next_offset`; `--max` changes the count, `--full` removes byte/line clipping.
-- Locate with `grep` first, then `read --lines` around the hit. Avoid reading whole large files or `ls --depth` on big trees.
+- Bounded output (also JSON): `exec`/`job logs` share head + tail 100 lines / 16KB each (multi-peer: 50 / 8KB each); any cut retains a full local log. `read` without an end: ≤2000 lines / 64KB, 2000 chars/line; follow `next_start`/the `--lines N:` hint, use the printed `get` command for clipped lines. `ls` ≤500 entries, `find` ≤200 paths (newest first), `grep` ≤200 matches / 300 chars; pages ≤60KB of entries. Continue with `--offset` / `next_offset`; `--max` changes the count, `--full` removes byte/line clipping.
+- Locate with `find` / `grep -l` first, then `grep -C` or `read --lines` around the hit. Avoid reading whole large files or `ls --depth` on big trees.
 - `--json` for fields (`sha256`, `op_id`, job id); `--full` for essential trimmed text. Full JSON caps at 1MB (multi-peer full: 8MB/peer); remainder stays in the log.
 
 ## Rules
@@ -48,7 +52,7 @@ agent-cli-x restart B ; agent-cli-x set-port B 48000   # use these, not manual c
 - `rm --permanent` only when the user asks; to free space after `rm`, use `purge <peer> <op_id>`.
 - Timeout kills the process tree (exit 104); raise `--timeout` or use `--detach` for anything over a few minutes.
 - `exec` runs with the full rights of the `serve` user. Do not use it to change read-only/denied paths unless the user asked for exactly that, and say so.
-- No relaying: don't run `agent-cli-x` inside a peer's `exec` unless asked, never read a peer's `~/.agent-cli-x`. On `禁止借道` stop and tell the user.
+- No relaying: don't run `agent-cli-x` inside a peer's `exec` unless asked, never read a peer's `~/.agent-cli-x`. On `not allowed to relay` stop and tell the user.
 - Unreachable peer (100): run `doctor`. `serve` defaults to background (windowless, returns once ready); use `serve --foreground` for service managers/debugging. Autostart and legacy trash recovery: see README.
 
 ## Exit codes

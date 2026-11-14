@@ -450,6 +450,7 @@ fn identity_grep_transfer_jobs() {
     );
     let o = run(c, &["grep", "b", "-F", "(\"hi\")", "--glob", "*.rs"]);
     assert!(o.status.success(), "{}", text(&o));
+    find_grep_modes_batch_edit(&env);
 
     // put 目录（含排除）→ 远端；get 回本地
     let local = env.server_home.parent().unwrap().join("upload/site");
@@ -729,6 +730,111 @@ fn identity_grep_transfer_jobs() {
     assert!(started.elapsed() < Duration::from_secs(20));
     let list = String::from_utf8_lossy(&run(c, &["job", "list", "b"]).stdout).to_string();
     assert!(list.contains(&id) && list.contains("killed"), "{list}");
+}
+
+/// find / grep 上下文与文件模式 / edit --edits（复用 identity_grep_transfer_jobs 的环境，少起一个 serve）。
+fn find_grep_modes_batch_edit(env: &Env) {
+    let c = &env.client_home;
+    let stdout = |o: &Output| String::from_utf8_lossy(&o.stdout).replace("\r\n", "\n");
+    fs::create_dir_all(env.ws.join("lib/deep")).unwrap();
+    fs::write(
+        env.ws.join("lib/a.rs"),
+        "a1\nhit one\na3\na4\na5\nhit two\n",
+    )
+    .unwrap();
+    fs::write(env.ws.join("lib/deep/b.rs"), "hit three\n").unwrap();
+    fs::write(env.ws.join("lib/c.txt"), "hit four\n").unwrap();
+
+    // find：不含 / 的模式匹配任意层级，黑名单目录不出现，无结果返回 1
+    let o = run(c, &["find", "b", "*.rs", "proj:lib"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let out = stdout(&o);
+    assert!(out.contains("proj:lib/a.rs\n"), "{out}");
+    assert!(out.contains("proj:lib/deep/b.rs\n"), "{out}");
+    assert!(!out.contains("c.txt"), "{out}");
+    let o = run(c, &["find", "b", "lib/*.rs"]);
+    assert_eq!(stdout(&o), "proj:lib/a.rs\n", "{}", text(&o));
+    assert_eq!(run(c, &["find", "b", "token.txt"]).status.code(), Some(1));
+    let o = run(c, &["find", "b", "*", "proj:lib", "--max", "1"]);
+    assert_eq!(stdout(&o).lines().count(), 1);
+    assert!(text(&o).contains("showing 1 of 3 files"), "{}", text(&o));
+
+    // grep -C：上下文行用 `-`，不连续的块之间 `--`
+    let o = run(c, &["grep", "b", "hit", "proj:lib/a.rs", "-C", "1"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert_eq!(
+        stdout(&o),
+        "proj:lib/a.rs-1-a1\nproj:lib/a.rs:2:hit one\nproj:lib/a.rs-3-a3\n--\n\
+         proj:lib/a.rs-5-a5\nproj:lib/a.rs:6:hit two\n"
+    );
+    // -l / -c
+    let o = run(c, &["grep", "b", "hit", "proj:lib", "-l"]);
+    assert_eq!(
+        stdout(&o),
+        "proj:lib/a.rs\nproj:lib/c.txt\nproj:lib/deep/b.rs\n"
+    );
+    let o = run(c, &["grep", "b", "hit", "proj:lib", "-c", "--glob", "*.rs"]);
+    assert_eq!(stdout(&o), "proj:lib/a.rs:2\nproj:lib/deep/b.rs:1\n");
+    // 截断时给出 --offset，按提示继续能拿到剩余结果
+    let o = run(c, &["grep", "b", "hit", "proj:lib", "--max", "2"]);
+    assert_eq!(stdout(&o).lines().count(), 2);
+    assert!(text(&o).contains("--offset 2"), "{}", text(&o));
+    let o = run(c, &["grep", "b", "hit", "proj:lib", "--offset", "2"]);
+    assert_eq!(
+        stdout(&o),
+        "proj:lib/c.txt:1:hit four\nproj:lib/deep/b.rs:1:hit three\n"
+    );
+
+    // edit --edits：多处多行修改一次完成；任一项失败则整体不写入
+    let edits = env.ws.parent().unwrap().join("edits.json");
+    fs::write(
+        &edits,
+        r#"[{"old": "a1\nhit one", "new": "A1\nHIT"}, {"old_string": "a", "new_string": "Z", "replace_all": true}]"#,
+    )
+    .unwrap();
+    let e = edits.to_str().unwrap();
+    let o = run(c, &["edit", "b", "proj:lib/a.rs", "--edits", e]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains("4 replacements"), "{}", text(&o));
+    assert_eq!(
+        fs::read_to_string(env.ws.join("lib/a.rs")).unwrap(),
+        "A1\nHIT\nZ3\nZ4\nZ5\nhit two\n"
+    );
+    fs::write(
+        &edits,
+        r#"[{"old": "HIT", "new": "x"}, {"old": "missing", "new": "y"}]"#,
+    )
+    .unwrap();
+    let o = run(c, &["edit", "b", "proj:lib/a.rs", "--edits", e]);
+    assert_eq!(o.status.code(), Some(105), "{}", text(&o));
+    assert!(text(&o).contains("edit #2 of 2"), "{}", text(&o));
+    assert!(fs::read_to_string(env.ws.join("lib/a.rs"))
+        .unwrap()
+        .contains("HIT"));
+    fs::write(&edits, r#"{"old": "a"}"#).unwrap();
+    let o = run(c, &["edit", "b", "proj:lib/a.rs", "--edits", e]);
+    assert_eq!(o.status.code(), Some(110), "{}", text(&o));
+    // stdin
+    let mut child = Command::new(BIN)
+        .args(["edit", "b", "proj:lib/a.rs", "--edits", "-"])
+        .env("AGENT_CLI_X_HOME", c)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write as _;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"[{"old": "hit two", "new": "done"}]"#)
+        .unwrap();
+    let o = child.wait_with_output().unwrap();
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(fs::read_to_string(env.ws.join("lib/a.rs"))
+        .unwrap()
+        .ends_with("done\n"));
 }
 
 fn json_of(o: &Output) -> serde_json::Value {

@@ -1,5 +1,6 @@
-//! 文件接口：ls / read / write / edit / rm。所有路径都经过 Workspaces 解析（边界 + CRUD 权限）。
+//! 文件接口：ls / find / grep / read / write / edit / rm。所有路径都经过 Workspaces 解析（边界 + CRUD 权限）。
 
+use super::workspace::Resolved;
 use super::{backup, Ctx};
 use crate::client::output::{clip_line, clip_line_bytes, MAX_LINE_CHARS};
 use crate::error::{AppError, Result};
@@ -138,7 +139,138 @@ pub fn ls(ctx: &Ctx, body: Value) -> Result<Value> {
         "omitted_chars": omitted_chars, "next_offset": next}))
 }
 
+// ---------------- 共用：遍历 ----------------
+
+/// 与 ls 相同的遍历规则：遵守 .gitignore、跳过 .git 与黑名单路径；
+/// 按文件名排序，保证分页（grep --offset）在多次调用之间结果一致。
+fn walker(ctx: &Ctx, r: &Resolved, globs: &[String]) -> Result<ignore::Walk> {
+    let st = Arc::clone(&ctx.st);
+    let ws_name = r.ws.clone();
+    let root = r.root.clone();
+    let mut builder = ignore::WalkBuilder::new(&r.abs);
+    builder
+        .hidden(false)
+        .git_ignore(true)
+        .git_exclude(true)
+        .git_global(false)
+        .require_git(false)
+        .parents(true)
+        .sort_by_file_name(|a, b| a.cmp(b))
+        .filter_entry(move |e| {
+            e.file_name() != ".git" && st.ws.denied_by(&ws_name, &root, e.path()).is_none()
+        });
+    if !globs.is_empty() {
+        let mut ob = ignore::overrides::OverrideBuilder::new(&r.abs);
+        for g in globs {
+            ob.add(g)
+                .map_err(|e| AppError::bad_request(format!("invalid glob `{g}`: {e}")))?;
+        }
+        builder.overrides(
+            ob.build()
+                .map_err(|e| AppError::bad_request(format!("invalid glob: {e}")))?,
+        );
+    }
+    Ok(builder.build())
+}
+
+fn rel_of(item: &ignore::DirEntry, root: &std::path::Path) -> String {
+    item.path()
+        .strip_prefix(root)
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default()
+}
+
+// ---------------- find ----------------
+
+#[derive(Deserialize)]
+struct FindReq {
+    /// glob，相对搜索目录；不含 `/` 时匹配任意层级（与 grep --glob 相同的 gitignore 语义）
+    pattern: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default = "find_max")]
+    max: usize,
+}
+fn find_max() -> usize {
+    200
+}
+
+/// 匹配数超过它就停止遍历（total 只是下限）。
+const FIND_SCAN_LIMIT: usize = 100_000;
+
+/// 按文件名模式查找文件，最近修改的排在前面。
+pub fn find(ctx: &Ctx, body: Value) -> Result<Value> {
+    let req: FindReq = parse(body)?;
+    if req.pattern.trim().is_empty() {
+        return Err(AppError::bad_request("pattern must not be empty"));
+    }
+    let r = ctx.st.ws.resolve(&req.path)?;
+    if !r.abs.is_dir() {
+        return Err(AppError::bad_request(format!(
+            "{} is not a directory",
+            r.display()
+        )));
+    }
+    let max = req.max.clamp(1, 20_000);
+    let mut found: Vec<(std::time::SystemTime, String)> = Vec::new();
+    let mut capped = false;
+    for item in walker(ctx, &r, std::slice::from_ref(&req.pattern))?.flatten() {
+        if !item.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        if found.len() >= FIND_SCAN_LIMIT {
+            capped = true;
+            break;
+        }
+        let mtime = item
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        found.push((mtime, rel_of(&item, &r.root)));
+    }
+    let total = found.len();
+    found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let paths: Vec<String> = found.into_iter().take(max).map(|(_, p)| p).collect();
+    ctx.st.audit.log(
+        &ctx.ip,
+        &ctx.caller,
+        "find",
+        true,
+        json!({"path": r.display(), "pattern": req.pattern, "count": total}),
+    );
+    Ok(json!({
+        "ws": r.ws,
+        "paths": paths,
+        "total": total,
+        "total_capped": capped,
+        "truncated": total > max,
+    }))
+}
+
 // ---------------- grep ----------------
+
+#[derive(Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum GrepMode {
+    /// 输出匹配行（可带上下文）
+    #[default]
+    Lines,
+    /// 只输出含匹配的文件
+    Files,
+    /// 每个文件的匹配行数
+    Count,
+}
+
+impl GrepMode {
+    fn name(self) -> &'static str {
+        match self {
+            GrepMode::Lines => "lines",
+            GrepMode::Files => "files",
+            GrepMode::Count => "count",
+        }
+    }
+}
 
 #[derive(Deserialize)]
 struct GrepReq {
@@ -153,12 +285,22 @@ struct GrepReq {
     /// 按字面量匹配（不当作正则）
     #[serde(default)]
     fixed: bool,
+    /// lines 模式下限制匹配行数；files / count 模式下限制文件数
     #[serde(default = "grep_max")]
     max: usize,
+    /// 跳过前 N 个结果（匹配行或文件），用于截断后继续
     #[serde(default)]
     offset: usize,
+    /// 取消字节与单行上限（条数仍受 max 限制）
     #[serde(default)]
     full: bool,
+    #[serde(default)]
+    mode: GrepMode,
+    /// 匹配行前后的上下文行数（仅 lines 模式）
+    #[serde(default)]
+    before: usize,
+    #[serde(default)]
+    after: usize,
 }
 fn grep_max() -> usize {
     200
@@ -166,6 +308,163 @@ fn grep_max() -> usize {
 
 const GREP_FILE_LIMIT: u64 = 8 * 1024 * 1024;
 const GREP_LINE_CHARS: usize = 300;
+const GREP_MAX_CONTEXT: usize = 50;
+
+/// 跨文件累积的 grep 结果与配额。
+struct GrepAcc {
+    mode: GrepMode,
+    max: usize,
+    offset: usize,
+    full: bool,
+    before: usize,
+    after: usize,
+    ws_len: usize,
+    /// 已遇到的结果数（含被 offset 跳过的）
+    seen: usize,
+    /// 实际返回的结果数（不含上下文行）
+    returned: usize,
+    bytes: usize,
+    omitted_chars: usize,
+    items: Vec<Value>,
+    truncated: bool,
+}
+
+impl GrepAcc {
+    fn new(req: &GrepReq, ws_len: usize) -> Self {
+        let lines = req.mode == GrepMode::Lines;
+        let ctx = |n: usize| if lines { n.min(GREP_MAX_CONTEXT) } else { 0 };
+        GrepAcc {
+            mode: req.mode,
+            max: req.max.clamp(1, 5000),
+            offset: req.offset,
+            full: req.full,
+            before: ctx(req.before),
+            after: ctx(req.after),
+            ws_len,
+            seen: 0,
+            returned: 0,
+            bytes: 2,
+            omitted_chars: 0,
+            items: Vec::new(),
+            truncated: false,
+        }
+    }
+
+    /// 构造一条结果：(条目, 占用字节, 被截掉的字符数)。
+    fn entry(
+        &self,
+        rel: &str,
+        line: Option<(usize, &[u8], bool)>,
+        count: Option<usize>,
+    ) -> (Value, usize, usize) {
+        let (path, mut cut) = if self.full {
+            (rel.to_string(), 0)
+        } else {
+            clip_line(rel, MAX_LINE_CHARS)
+        };
+        let mut e = json!({"path": path});
+        if let Some((idx, raw, is_ctx)) = line {
+            let text = String::from_utf8_lossy(raw);
+            let text = text.trim_end_matches('\r');
+            let (text, c) = if self.full {
+                (text.to_string(), 0)
+            } else {
+                clip_line(text, GREP_LINE_CHARS)
+            };
+            cut += c;
+            e["line"] = json!(idx + 1);
+            e["text"] = json!(text);
+            if is_ctx {
+                e["ctx"] = json!(true);
+            }
+        }
+        if let Some(n) = count {
+            e["count"] = json!(n);
+        }
+        if cut > 0 {
+            e["omitted_chars"] = json!(cut);
+        }
+        let cost = serde_json::to_vec(&e).map_or(0, |v| v.len()) + 1;
+        let cost = cost.max(
+            path_display_bytes(&e["path"])
+                + e["text"].as_str().map_or(0, str::len)
+                + self.ws_len
+                + 40,
+        );
+        (e, cost, cut)
+    }
+
+    /// 尝试收下一组条目（一个匹配及其前置上下文）；条数或字节超限返回 false。
+    fn commit(&mut self, group: Vec<(Value, usize, usize)>) -> bool {
+        let cost: usize = group.iter().map(|g| g.1).sum();
+        if self.returned >= self.max || (!self.full && self.bytes + cost > PAGE_BYTES) {
+            self.truncated = true;
+            return false;
+        }
+        self.bytes += cost;
+        self.returned += 1;
+        for (e, _, cut) in group {
+            self.omitted_chars += cut;
+            self.items.push(e);
+        }
+        true
+    }
+
+    /// 处理一个文件；返回 false 表示配额已满，应停止遍历。
+    fn scan(&mut self, rel: &str, data: &[u8], re: &regex::bytes::Regex) -> bool {
+        let mut lines: Vec<&[u8]> = data.split(|&b| b == b'\n').collect();
+        if data.ends_with(b"\n") {
+            lines.pop();
+        }
+        if self.mode != GrepMode::Lines {
+            let n = if self.mode == GrepMode::Files {
+                usize::from(lines.iter().any(|l| re.is_match(l)))
+            } else {
+                lines.iter().filter(|l| re.is_match(l)).count()
+            };
+            if n == 0 {
+                return true;
+            }
+            if self.seen < self.offset {
+                self.seen += 1;
+                return true;
+            }
+            let item = self.entry(rel, None, (self.mode == GrepMode::Count).then_some(n));
+            return self.commit(vec![item]);
+        }
+        // emitted：已输出到第几行（下标 + 1），上下文重叠时不重复输出
+        let mut emitted = 0usize;
+        let mut after_until = 0usize;
+        for (i, line) in lines.iter().enumerate() {
+            if re.is_match(line) {
+                if self.seen < self.offset {
+                    self.seen += 1;
+                    continue;
+                }
+                let from = i.saturating_sub(self.before).max(emitted);
+                let mut group: Vec<_> = (from..i)
+                    .map(|j| self.entry(rel, Some((j, lines[j], true)), None))
+                    .collect();
+                group.push(self.entry(rel, Some((i, line, false)), None));
+                if !self.commit(group) {
+                    return false;
+                }
+                emitted = i + 1;
+                after_until = i + 1 + self.after;
+            } else if i < after_until && i >= emitted {
+                if !self.full && self.bytes >= PAGE_BYTES {
+                    continue;
+                }
+                let (e, cost, cut) = self.entry(rel, Some((i, line, true)), None);
+                self.bytes += cost;
+                self.omitted_chars += cut;
+                self.items.push(e);
+                emitted = i + 1;
+            }
+        }
+        true
+    }
+}
 
 pub fn grep(ctx: &Ctx, body: Value) -> Result<Value> {
     let req: GrepReq = parse(body)?;
@@ -189,42 +488,9 @@ pub fn grep(ctx: &Ctx, body: Value) -> Result<Value> {
             r.display()
         )));
     }
-    let max = req.max.clamp(1, 5000);
-
-    let st = Arc::clone(&ctx.st);
-    let ws_name = r.ws.clone();
-    let root = r.root.clone();
-    let mut builder = ignore::WalkBuilder::new(&r.abs);
-    builder
-        .hidden(false)
-        .git_ignore(true)
-        .git_exclude(true)
-        .git_global(false)
-        .require_git(false)
-        .parents(true)
-        .sort_by_file_name(|a, b| a.cmp(b))
-        .filter_entry(move |e| {
-            e.file_name() != ".git" && st.ws.denied_by(&ws_name, &root, e.path()).is_none()
-        });
-    if !req.glob.is_empty() {
-        let mut ob = ignore::overrides::OverrideBuilder::new(&r.abs);
-        for g in &req.glob {
-            ob.add(g)
-                .map_err(|e| AppError::bad_request(format!("invalid glob `{g}`: {e}")))?;
-        }
-        builder.overrides(
-            ob.build()
-                .map_err(|e| AppError::bad_request(format!("invalid glob: {e}")))?,
-        );
-    }
-
-    let mut matches = Vec::new();
+    let mut acc = GrepAcc::new(&req, r.ws.len());
     let mut files_scanned = 0usize;
-    let mut truncated = false;
-    let mut seen = 0usize;
-    let mut bytes = 2;
-    let mut omitted_chars = 0usize;
-    'walk: for item in builder.build().flatten() {
+    for item in walker(ctx, &r, &req.glob)?.flatten() {
         if !item.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
@@ -238,52 +504,8 @@ pub fn grep(ctx: &Ctx, body: Value) -> Result<Value> {
             continue;
         }
         files_scanned += 1;
-        let rel = item
-            .path()
-            .strip_prefix(&r.root)
-            .map(|p| p.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_default();
-        for (i, line) in data.split(|&b| b == b'\n').enumerate() {
-            if !re.is_match(line) {
-                continue;
-            }
-            if seen < req.offset {
-                seen += 1;
-                continue;
-            }
-            let text = String::from_utf8_lossy(line);
-            let text = text.trim_end_matches('\r');
-            let (text, cut) = if req.full {
-                (text.to_string(), 0)
-            } else {
-                clip_line(text, GREP_LINE_CHARS)
-            };
-            let (path, path_cut) = if req.full {
-                (rel.clone(), 0)
-            } else {
-                clip_line(&rel, MAX_LINE_CHARS)
-            };
-            let mut entry = json!({"path": path, "line": i + 1, "text": text});
-            if cut + path_cut > 0 {
-                entry["omitted_chars"] = json!(cut + path_cut);
-            }
-            let cost = serde_json::to_vec(&entry)
-                .map_err(|e| AppError::internal(e.to_string()))?
-                .len()
-                + 1;
-            let cost = cost.max(
-                path_display_bytes(&entry["path"])
-                    + entry["text"].as_str().map_or(0, str::len)
-                    + r.ws.len()
-                    + 40,
-            );
-            if matches.len() >= max || (!req.full && bytes + cost > PAGE_BYTES) {
-                truncated = true;
-                break 'walk;
-            }
-            bytes += cost;
-            omitted_chars += cut + path_cut;
-            matches.push(entry);
+        if !acc.scan(&rel_of(&item, &r.root), &data, &re) {
+            break;
         }
     }
     ctx.st.audit.log(
@@ -291,16 +513,20 @@ pub fn grep(ctx: &Ctx, body: Value) -> Result<Value> {
         &ctx.caller,
         "grep",
         true,
-        json!({"path": r.display(), "pattern": req.pattern, "matches": matches.len()}),
+        json!({"path": r.display(), "pattern": req.pattern, "matches": acc.returned}),
     );
-    let next = truncated.then(|| req.offset.saturating_add(matches.len()));
+    let next = acc
+        .truncated
+        .then(|| req.offset.saturating_add(acc.returned));
     Ok(json!({
         "ws": r.ws,
-        "matches": matches,
+        "mode": req.mode.name(),
+        "matches": acc.items,
+        "count": acc.returned,
         "files_scanned": files_scanned,
-        "truncated": truncated || omitted_chars > 0,
-        "omitted_matches_at_least": usize::from(truncated),
-        "omitted_chars": omitted_chars,
+        "truncated": acc.truncated || acc.omitted_chars > 0,
+        "omitted_matches_at_least": usize::from(acc.truncated),
+        "omitted_chars": acc.omitted_chars,
         "next_offset": next,
     }))
 }
@@ -605,12 +831,29 @@ pub fn write(ctx: &Ctx, body: Value) -> Result<Value> {
 #[derive(Deserialize)]
 struct EditReq {
     path: String,
-    old: String,
-    new: String,
+    #[serde(default)]
+    old: Option<String>,
+    #[serde(default)]
+    new: Option<String>,
     #[serde(default)]
     replace_all: bool,
+    /// 批量修改：按顺序作用于同一文件，全部成功才写入
+    #[serde(default)]
+    edits: Option<Vec<EditItem>>,
     #[serde(default)]
     expect_sha: Option<String>,
+}
+
+/// 批量修改中的一项。接受 Claude Code Edit 工具的字段名作为别名，减少 AI 写错字段重试。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditItem {
+    #[serde(alias = "old_string")]
+    pub old: String,
+    #[serde(alias = "new_string")]
+    pub new: String,
+    #[serde(default, alias = "replace_all")]
+    pub all: bool,
 }
 
 pub struct EditOutcome {
@@ -659,8 +902,59 @@ pub fn apply_edit(original: &str, old: &str, new: &str, replace_all: bool) -> Re
     })
 }
 
+/// 依次应用多项修改（后一项看到前一项的结果），任何一项失败则整体失败。
+/// 返回的 first_line 是第一项修改的起始行。
+pub fn apply_edits(original: &str, edits: &[EditItem]) -> Result<EditOutcome> {
+    if edits.is_empty() {
+        return Err(AppError::bad_request("edits must not be empty"));
+    }
+    let mut text = original.to_string();
+    let (mut replacements, mut first_line) = (0, 0);
+    for (i, e) in edits.iter().enumerate() {
+        let out = apply_edit(&text, &e.old, &e.new, e.all).map_err(|err| {
+            if edits.len() == 1 {
+                err
+            } else {
+                AppError::new(
+                    &err.code,
+                    format!(
+                        "edit #{} of {}: {} (nothing written)",
+                        i + 1,
+                        edits.len(),
+                        err.message
+                    ),
+                )
+            }
+        })?;
+        if i == 0 {
+            first_line = out.first_line;
+        }
+        replacements += out.replacements;
+        text = out.text;
+    }
+    Ok(EditOutcome {
+        text,
+        replacements,
+        first_line,
+    })
+}
+
 pub fn edit(ctx: &Ctx, body: Value) -> Result<Value> {
     let req: EditReq = parse(body)?;
+    let edits = match (req.edits, req.old, req.new) {
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+            return Err(AppError::bad_request(
+                "use either edits or old/new, not both",
+            ))
+        }
+        (Some(list), None, None) => list,
+        (None, Some(old), Some(new)) => vec![EditItem {
+            old,
+            new,
+            all: req.replace_all,
+        }],
+        (None, _, _) => return Err(AppError::bad_request("missing old/new or edits")),
+    };
     let r = ctx.st.ws.resolve_write(&req.path)?;
     if !r.exists || !r.abs.is_file() {
         return Err(AppError::not_found(format!(
@@ -687,7 +981,7 @@ pub fn edit(ctx: &Ctx, body: Value) -> Result<Value> {
             )));
         }
     }
-    let out = apply_edit(original, &req.old, &req.new, req.replace_all)?;
+    let out = apply_edits(original, &edits)?;
     let mut data = Vec::with_capacity(out.text.len() + 3);
     if bom {
         data.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
@@ -989,5 +1283,100 @@ mod tests {
             apply_edit("abc", "", "y", false).err().unwrap().code,
             "bad_request"
         );
+    }
+
+    fn item(old: &str, new: &str) -> EditItem {
+        EditItem {
+            old: old.into(),
+            new: new.into(),
+            all: false,
+        }
+    }
+
+    #[test]
+    fn edits_sequential_all_or_nothing() {
+        let o = apply_edits("a\nb\nc\n", &[item("b", "B"), item("B\nc", "X")]).unwrap();
+        assert_eq!(o.text, "a\nX\n");
+        assert_eq!(o.replacements, 2);
+        assert_eq!(o.first_line, 2);
+        let e = apply_edits("a\nb\n", &[item("a", "A"), item("zzz", "y")])
+            .err()
+            .unwrap();
+        assert_eq!(e.code, "conflict");
+        assert!(e.message.starts_with("edit #2 of 2:"), "{}", e.message);
+        assert_eq!(apply_edits("a", &[]).err().unwrap().code, "bad_request");
+        // 兼容 Claude Code Edit 工具的字段名；未知字段报错
+        let v: Vec<EditItem> =
+            serde_json::from_str(r#"[{"old_string":"a","new_string":"b","replace_all":true}]"#)
+                .unwrap();
+        assert!(v[0].all);
+        assert!(serde_json::from_str::<Vec<EditItem>>(r#"[{"old":"a","neww":"b"}]"#).is_err());
+    }
+
+    fn scan(acc: &mut GrepAcc, data: &str) -> Vec<String> {
+        let re = regex::bytes::Regex::new("hit").unwrap();
+        acc.scan("f.txt", data.as_bytes(), &re);
+        acc.items
+            .iter()
+            .map(|v| {
+                let sep = if v["ctx"] == true { '-' } else { ':' };
+                format!("{}{sep}{}", v["line"], v["text"].as_str().unwrap())
+            })
+            .collect()
+    }
+
+    fn mk(mode: GrepMode, max: usize, offset: usize, before: usize, after: usize) -> GrepAcc {
+        let req = GrepReq {
+            pattern: "hit".into(),
+            path: String::new(),
+            glob: vec![],
+            ignore_case: false,
+            fixed: false,
+            max,
+            offset,
+            full: false,
+            mode,
+            before,
+            after,
+        };
+        GrepAcc::new(&req, 4)
+    }
+
+    #[test]
+    fn grep_context_merges_overlap() {
+        let data = "a\nhit1\nb\nhit2\nc\nd\ne\nhit3\n";
+        let mut acc = mk(GrepMode::Lines, 200, 0, 1, 1);
+        assert_eq!(
+            scan(&mut acc, data),
+            ["1-a", "2:hit1", "3-b", "4:hit2", "5-c", "7-e", "8:hit3"]
+        );
+        assert_eq!(acc.returned, 3);
+        assert!(!acc.truncated);
+    }
+
+    #[test]
+    fn grep_max_and_offset() {
+        let data = "hit1\nx\nhit2\nhit3\n";
+        let mut acc = mk(GrepMode::Lines, 2, 0, 0, 0);
+        assert_eq!(scan(&mut acc, data), ["1:hit1", "3:hit2"]);
+        assert!(acc.truncated);
+        let mut acc = mk(GrepMode::Lines, 2, 2, 0, 0);
+        assert_eq!(scan(&mut acc, data), ["4:hit3"]);
+        assert!(!acc.truncated);
+    }
+
+    #[test]
+    fn grep_files_and_count_modes() {
+        let re = regex::bytes::Regex::new("hit").unwrap();
+        let mut acc = mk(GrepMode::Count, 200, 0, 3, 3);
+        assert_eq!(acc.before, 0);
+        acc.scan("a", b"hit\nhit\nno\n", &re);
+        acc.scan("b", b"no\n", &re);
+        assert_eq!(acc.items, vec![json!({"path": "a", "count": 2})]);
+        let mut acc = mk(GrepMode::Files, 1, 0, 0, 0);
+        assert!(acc.scan("a", b"hit\nhit\n", &re));
+        assert!(!acc.scan("b", b"hit\n", &re));
+        assert_eq!(acc.items, vec![json!({"path": "a"})]);
+        assert!(acc.truncated);
     }
 }
