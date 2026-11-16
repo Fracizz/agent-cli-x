@@ -339,7 +339,7 @@ fn pixels(rect: Rect, width: u32, height: u32) -> Result<Vec<u8>> {
     let count = width as usize * height as usize;
     let bgra = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), count * 4) };
     let mut rgb = Vec::with_capacity(count * 3);
-    for pixel in bgra.chunks_exact(4) {
+    for pixel in bgra.as_chunks::<4>().0 {
         rgb.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
     }
     Ok(rgb)

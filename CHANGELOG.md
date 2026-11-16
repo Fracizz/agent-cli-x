@@ -1,10 +1,11 @@
 # Changelog
 
-## 0.0.11
+## 0.0.12
 
 - Add native Windows desktop observation with `desktop windows` and `desktop screenshot`, gated by `policy.desktop_capture` and reported by `info`.
 - Support title filters, window IDs and physical-pixel regions; transfer PNG captures directly to a local file without remote capture scripts or image files.
 - Bound window listings and screenshot sizes by default, with pagination and explicit `--full` support. Report locked or unavailable desktops with actionable errors.
+- Keep Windows desktop pixel conversion compatible with strict Clippy checks on current Rust toolchains. The 0.0.11 release build was cancelled before publication.
 
 ## 0.0.10
 
