@@ -62,6 +62,10 @@ fn setup() -> Env {
 
 /// `copy_bin` 为 true 时把二进制复制到临时目录再运行 serve（upgrade 测试会替换它）。
 fn setup_with(copy_bin: bool) -> Env {
+    setup_options(copy_bin, false)
+}
+
+fn setup_options(copy_bin: bool, desktop_capture: bool) -> Env {
     let base = std::env::temp_dir().join(format!(
         "agent-cli-x-e2e-{}-{}",
         std::process::id(),
@@ -100,6 +104,11 @@ fn setup_with(copy_bin: bool) -> Env {
     // 追加目录黑名单
     let cfg_path = server_home.join("config.toml");
     let cfg = fs::read_to_string(&cfg_path).unwrap();
+    let cfg = if desktop_capture {
+        cfg.replace("desktop_capture = false", "desktop_capture = true")
+    } else {
+        cfg
+    };
     let cfg = cfg.replacen("deny_paths = [", "deny_paths = [\n  \"secrets\",", 1);
     // 预设只读规则（Windows 为整个 C 盘）会让临时目录里的工作区只读：
     // 用更具体的规则放开工作区（顺带验证“最具体规则优先”），docs 只读、drafts 只能读和新建
@@ -190,6 +199,108 @@ fn setup_with(copy_bin: bool) -> Env {
         fp,
         _server: server,
     }
+}
+
+/// Run explicitly in an unlocked Windows user session. It only reads displayed
+/// pixels; no focus changes, temporary UI windows, or existing serve upgrades.
+#[cfg(windows)]
+#[test]
+#[ignore = "requires an unlocked interactive Windows desktop"]
+fn native_desktop_roundtrip() {
+    let env = setup_options(false, true);
+    let c = &env.client_home;
+    let o = run(c, &["desktop", "windows", "b", "--max", "1", "--json"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let page: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert!(page["windows"].as_array().unwrap().len() <= 1);
+    assert!(o.stdout.len() < 2048);
+
+    let out = c.join("native-preview.png");
+    let o = run(
+        c,
+        &[
+            "desktop",
+            "screenshot",
+            "b",
+            "--region",
+            "0,0,320,180",
+            "--max-edge",
+            "160",
+            "--out",
+            out.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    let meta: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(meta["width"], 160);
+    assert_eq!(meta["height"], 90);
+    assert_eq!(meta["scale_x"], 2.0);
+    assert_eq!(meta["scale_y"], 2.0);
+    assert!(meta["dpi"].is_null());
+    assert!(Path::new(meta["path"].as_str().unwrap()).is_absolute());
+    assert!(o.stdout.len() < 2048);
+    let bytes = fs::read(&out).unwrap();
+    assert!(bytes.len() <= 1024 * 1024);
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(&bytes))
+        .read_info()
+        .unwrap();
+    let mut pixels = vec![0; decoder.output_buffer_size()];
+    let frame = decoder.next_frame(&mut pixels).unwrap();
+    assert_eq!((frame.width, frame.height), (160, 90));
+
+    let o = run(
+        c,
+        &["desktop", "screenshot", "b", "--out", out.to_str().unwrap()],
+    );
+    assert_eq!(o.status.code(), Some(105), "{}", text(&o));
+    assert_eq!(fs::read(out).unwrap(), bytes);
+
+    let o = run(
+        c,
+        &["desktop", "screenshot", "b", "--max-edge", "160", "--json"],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    let foreground: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let id = foreground["window"].as_str().unwrap();
+    assert!(id.starts_with("0x"));
+    assert!(foreground["dpi"].as_u64().unwrap() > 0);
+    assert!(foreground["width"].as_u64().unwrap() <= 160);
+    assert!(foreground["height"].as_u64().unwrap() <= 160);
+    let o = run(
+        c,
+        &[
+            "desktop",
+            "screenshot",
+            "b",
+            "--window",
+            id,
+            "--max-edge",
+            "160",
+            "--json",
+        ],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    let explicit: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(explicit["window"], id);
+
+    let o = run(
+        c,
+        &[
+            "desktop",
+            "screenshot",
+            "b",
+            "--region",
+            "0,0,320,180",
+            "--full",
+            "--json",
+        ],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    let meta: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(meta["width"], 320);
+    assert_eq!(meta["height"], 180);
+    assert!(Path::new(meta["path"].as_str().unwrap()).starts_with(c.join("screenshots")));
 }
 
 fn cfg_token(p: &Path) -> String {
@@ -1437,6 +1548,27 @@ fn peer_list_offline_not_retried() {
 fn output_limits_save_context() {
     let env = setup();
     let c = &env.client_home;
+
+    // Desktop reads use the same bounded interface in text/JSON; disabled permission
+    // must reject before touching an interactive desktop, including on Windows CI.
+    for json in [false, true] {
+        let mut args = vec!["desktop", "windows", "b", "--max", "1"];
+        if json {
+            args.push("--json");
+        }
+        let o = run(c, &args);
+        assert_eq!(
+            o.status.code(),
+            Some(if cfg!(windows) { 102 } else { 113 }),
+            "{}",
+            text(&o)
+        );
+        assert!(o.stdout.is_empty());
+    }
+    let o = run(c, &["desktop", "windows", "b", "--max", "0"]);
+    assert_eq!(o.status.code(), Some(110), "{}", text(&o));
+    let o = run(c, &["desktop", "screenshot", "b", "--region", "0,0,0,10"]);
+    assert_eq!(o.status.code(), Some(110), "{}", text(&o));
 
     // exec：长输出头尾截断，--json 同样截断，完整日志留在本地
     let many = if cfg!(windows) {

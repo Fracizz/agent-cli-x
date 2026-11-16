@@ -5,6 +5,7 @@ pub mod audit;
 mod auth;
 pub mod background;
 mod backup;
+mod desktop;
 mod exec;
 mod fs;
 mod jobs;
@@ -37,7 +38,14 @@ const REJECT_DRAIN: Duration = Duration::from_secs(2);
 /// - put_stream：put 接受长度未知的帧流（cp 在两个对端之间直接中转）
 /// - purge：按 op_id 彻底清除回收站条目与备份
 /// - restart / set_port：`/v1/restart` 与 `/v1/port`
-pub const FEATURES: &[&str] = &["put_stream", "purge", "restart", "set_port"];
+pub const FEATURES: &[&str] = &[
+    "put_stream",
+    "purge",
+    "restart",
+    "set_port",
+    #[cfg(windows)]
+    "desktop_capture",
+];
 
 pub struct State {
     pub cfg: Config,
@@ -407,6 +415,11 @@ fn dispatch(
     };
     let result = match req.path.as_str() {
         "/v1/info" => Ok(info(&ctx)),
+        "/v1/desktop/windows" => desktop::windows(&ctx, body),
+        "/v1/desktop/screenshot" => {
+            desktop::screenshot(&ctx, body, w);
+            return;
+        }
         "/v1/exec" => {
             exec::run(&ctx, body, w);
             return;
@@ -491,6 +504,7 @@ fn info_base(ctx: &Ctx) -> Value {
         "exec_user": platform::current_user(),
         "exec_elevated": platform::is_elevated(),
         "features": FEATURES,
+        "desktop": {"supported": crate::desktop::supported(), "capture_allowed": ctx.st.cfg.policy.desktop_capture},
         // 本次调用方及其限制：no_relay 时在本机 exec 里不能再调用 agent-cli-x 访问其他节点
         "caller": ctx.caller,
         "caller_no_relay": ctx.no_relay,

@@ -431,6 +431,16 @@ pub fn emit(is_err: bool, s: &str) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn window_title_budget_uses_the_shared_unicode_clipper() {
+        let text = "窗口".repeat(300);
+        let (clipped, omitted) = clip_line(&text, crate::desktop::TITLE_CHARS);
+        assert_eq!(omitted, 600 - crate::desktop::TITLE_CHARS);
+        assert!(clipped.ends_with(LINE_CUT_MARK));
+        assert!(clipped.len() <= crate::desktop::TITLE_CHARS * 3 + LINE_CUT_MARK.len());
+        assert_eq!(clipped.lines().count(), 1);
+    }
+
     fn run(lim: Limits, text: &str) -> (String, usize) {
         clip_text(&[text], lim, None)
     }

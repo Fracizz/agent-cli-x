@@ -19,6 +19,8 @@ agent-cli-x 的主要使用者是 AI agent，它的每一行输出都会进入�
 | `find` | 200 条（`--max`），按修改时间倒序 | `src/server/fs.rs` |
   | `grep` | 200 条匹配或文件 / 60KB 条目 JSON（含上下文）、单行 300 字符（`--max` / `--offset`） | `src/server/fs.rs` |
 
+- `desktop windows` 默认 50 条 / 32KB 条目 JSON、标题 200 字符（`--max` / `--offset` / `--full`）；`desktop screenshot` 默认最长边 1600 像素 / 1MB PNG，`--full` 仍限制 64M 像素 / 32MB。
+
 - 截断逻辑统一复用 `client::output::HeadTail` / `clip_text`，不要再各自实现。
 
 ## 减少调用轮次

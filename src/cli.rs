@@ -112,6 +112,9 @@ enum Cmd {
     Peer(PeerCmd),
     /// Show peer info (name/ID, OS, shell, workspaces, deny list); A,B or @all shows an overview
     Info { peer: String },
+    /// Observe a Windows desktop (requires policy.desktop_capture = true on peer)
+    #[command(subcommand)]
+    Desktop(DesktopCmd),
     /// Run a command on a peer (options before the command); A,B or @all runs in parallel with grouped output
     Exec {
         peer: String,
@@ -323,6 +326,46 @@ enum Cmd {
 }
 
 #[derive(Subcommand)]
+enum DesktopCmd {
+    /// List visible top-level windows with physical rectangles and DPI
+    Windows {
+        peer: String,
+        #[arg(long, default_value_t = 50)]
+        max: usize,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        /// Case-insensitive title substring
+        #[arg(long, default_value = "")]
+        title: String,
+        /// Keep full titles and raise the page byte cap (--max still applies)
+        #[arg(long)]
+        full: bool,
+    },
+    /// Capture displayed pixels and save PNG on this machine (default: foreground window)
+    Screenshot {
+        peer: String,
+        /// foreground or a window ID from desktop windows; does not activate the window
+        #[arg(long, conflicts_with_all = ["screen", "region"])]
+        window: Option<String>,
+        /// Capture the entire virtual desktop
+        #[arg(long, conflicts_with = "region")]
+        screen: bool,
+        /// Physical desktop coordinates X,Y,W,H (negative X/Y allowed)
+        #[arg(long, allow_hyphen_values = true)]
+        region: Option<String>,
+        /// Preview's longest edge (1..8192); may shrink further to fit 1MB
+        #[arg(long, default_value_t = crate::desktop::PREVIEW_EDGE)]
+        max_edge: u32,
+        /// Original pixels (hard cap 64M pixels / 32MB PNG)
+        #[arg(long)]
+        full: bool,
+        /// Local PNG path; default ~/.agent-cli-x/screenshots/<unique>.png; never overwrites
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 enum PeerCmd {
     /// Register a peer. Without --fingerprint it only shows the fingerprint for verification
     Add {
@@ -406,6 +449,137 @@ enum JobCmd {
 }
 
 /// 在“禁止借道”的 exec 环境里，只放行不联网、不涉及凭据的本地命令。
+fn parse_desktop_region(text: &str) -> Result<crate::desktop::Rect> {
+    let values = text
+        .split(',')
+        .map(|s| s.trim().parse::<i64>())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|_| {
+            AppError::bad_request("--region must be physical desktop X,Y,W,H, e.g. -1920,0,800,600")
+        })?;
+    let bad =
+        || AppError::bad_request("--region needs X,Y,W,H with i32 X/Y and positive width/height");
+    if values.len() != 4 {
+        return Err(bad());
+    }
+    crate::desktop::Rect {
+        x: values[0].try_into().map_err(|_| bad())?,
+        y: values[1].try_into().map_err(|_| bad())?,
+        width: values[2].try_into().map_err(|_| bad())?,
+        height: values[3].try_into().map_err(|_| bad())?,
+    }
+    .validate()
+}
+
+fn desktop_command(command: DesktopCmd, json_output: bool) -> Result<i32> {
+    match command {
+        DesktopCmd::Windows {
+            peer,
+            max,
+            offset,
+            title,
+            full,
+        } => {
+            let req = crate::desktop::WindowsRequest {
+                max,
+                offset,
+                title,
+                full,
+            };
+            req.validate()?;
+            let body = serde_json::to_value(&req).map_err(|e| AppError::internal(e.to_string()))?;
+            let value = Client::load(&peer)?
+                .call("/v1/desktop/windows", &body, CALL_TIMEOUT)
+                .map_err(client::desktop::upgrade_hint)?;
+            if json_output {
+                println!("{value}");
+            } else {
+                for w in value["windows"].as_array().into_iter().flatten() {
+                    let id = w["id"].as_str().unwrap_or("?");
+                    let title = w["title"]
+                        .as_str()
+                        .unwrap_or("")
+                        .replace(['\r', '\n', '\t'], " ");
+                    let r = &w["rect"];
+                    println!(
+                        "{id} pid={} {}x{}{:+}{:+} dpi={}{}{} {title}",
+                        w["pid"],
+                        r["width"],
+                        r["height"],
+                        r["x"].as_i64().unwrap_or(0),
+                        r["y"].as_i64().unwrap_or(0),
+                        w["dpi"],
+                        if w["foreground"] == true {
+                            " foreground"
+                        } else {
+                            ""
+                        },
+                        if w["minimized"] == true {
+                            " minimized"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+                if let Some(next) = value["next_offset"].as_u64() {
+                    eprintln!("{} windows omitted; continue with --offset {next} --max {max} (keep the same --title filter)",value["omitted"]);
+                }
+                let clipped = value["windows"].as_array().map_or(0, |rows| {
+                    rows.iter()
+                        .map(|v| v["title_omitted_chars"].as_u64().unwrap_or(0))
+                        .sum::<u64>()
+                });
+                if clipped > 0 {
+                    eprintln!(
+                        "{clipped} title characters omitted; use --full for full window titles"
+                    );
+                }
+            }
+        }
+        DesktopCmd::Screenshot {
+            peer,
+            window,
+            screen,
+            region,
+            max_edge,
+            full,
+            out,
+        } => {
+            let region = region.as_deref().map(parse_desktop_region).transpose()?;
+            let req = crate::desktop::CaptureRequest {
+                window,
+                screen,
+                region,
+                max_edge,
+                full,
+            };
+            req.validate()?;
+            let body = serde_json::to_value(req).map_err(|e| AppError::internal(e.to_string()))?;
+            let value =
+                client::desktop::screenshot(&Client::load(&peer)?, &body, out.as_deref(), full)?;
+            if json_output {
+                println!("{value}");
+            } else {
+                println!(
+                    "{} ({}x{}, {} bytes; physical rect {},{},{},{})",
+                    value["path"].as_str().unwrap_or(""),
+                    value["width"],
+                    value["height"],
+                    value["bytes"],
+                    value["rect"]["x"],
+                    value["rect"]["y"],
+                    value["rect"]["width"],
+                    value["rect"]["height"]
+                );
+                if let Some(warning) = value["warning"].as_str() {
+                    eprintln!("{warning}");
+                }
+            }
+        }
+    }
+    Ok(0)
+}
+
 fn check_no_relay(cmd: &Cmd) -> Result<bool> {
     let Some(who) = std::env::var(config::NO_RELAY_ENV)
         .ok()
@@ -515,6 +689,7 @@ pub fn run() -> Result<i32> {
             }
             Ok(0)
         }
+        Cmd::Desktop(cmd) => desktop_command(cmd, json),
         Cmd::Exec {
             peer,
             cwd,
@@ -1814,6 +1989,16 @@ fn print_info(name: &str, v: &Value) {
     if let Some(e) = v["config_error"].as_str() {
         println!(
             "  Config error: config.toml is invalid, running with the last good config ({e}). After fixing run `agent-cli-x restart {name}`"
+        );
+    }
+    if v["desktop"]["supported"] == true {
+        println!(
+            "  desktop capture: {}",
+            if v["desktop"]["capture_allowed"] == true {
+                "enabled"
+            } else {
+                "disabled (policy.desktop_capture = true to enable)"
+            }
         );
     }
     if v["caller_no_relay"] == true {

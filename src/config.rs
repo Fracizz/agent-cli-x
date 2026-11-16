@@ -55,6 +55,9 @@ pub struct PathRule {
 #[derive(Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Policy {
+    /// Allow read-only desktop observation independently of filesystem/exec permissions.
+    #[serde(default)]
+    pub desktop_capture: bool,
     #[serde(default)]
     pub deny_paths: Vec<String>,
     /// 只读路径（兼容旧配置）：等价于 `[[policy.paths]]` 中 `allow = "r"` 的规则。
@@ -94,6 +97,7 @@ pub struct Policy {
 impl Default for Policy {
     fn default() -> Self {
         Self {
+            desktop_capture: false,
             deny_paths: Vec::new(),
             readonly_paths: Vec::new(),
             paths: Vec::new(),
@@ -369,6 +373,10 @@ job_timeout_secs = 86400
 # "back up to the data directory, then delete" (limited by max_transfer_mb). Set false to always use backup.
 # `rm --permanent` deletes for good: no trash, no backup, unrecoverable.
 rm_use_trash = true
+
+# Read-only Windows desktop/window capture, separate from filesystem and exec permissions.
+# Requires an unlocked interactive user session; screenshots are returned to the caller, not saved here.
+desktop_capture = false
 
 # Number of idle shells kept warm: only when the default shell is pwsh / powershell (sh / bash / cmd start fast anyway).
 # Each command still runs in a fresh process, isolated; this only saves PowerShell cold start (pwsh ~0.3s, 5.1 ~2s).

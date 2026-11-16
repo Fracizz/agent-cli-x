@@ -71,6 +71,8 @@ Then teach your agent the tool: copy [`skills/agent-cli-x/SKILL.md`](skills/agen
 | `token add\|list\|set\|remove\|rotate` | per-caller tokens for this machine (`rotate default` replaces the config token); `add <name> --no-relay` / `set <name> --no-relay\|--allow-relay` stops that caller from hopping to other machines through this one |
 | `peer add\|set\|list\|remove` | manage peers (`~/.agent-cli-x/peers.toml`); `list` shows the cached OS/arch and shell, refreshed by `peer add`, `info`, `upgrade` and `cp`; `set <name> --addr <ip:port>` / `--token <t>` changes a peer's address or token after checking it against the registered fingerprint; peers with no cached OS (registered by an older version) are looked up automatically (an unreachable one is retried at most once a day) |
 | `info <peer>` | OS, shell, the user `exec` runs as, workspaces, deny rules; `info @all` is a one-line-per-peer overview |
+| `desktop windows <peer> [--title text] [--max N] [--offset N]` | visible Windows top-level windows, IDs, physical rectangles and per-window DPI |
+| `desktop screenshot <peer> [--window foreground\|ID\|--screen\|--region X,Y,W,H] [--out local.png]` | native PNG capture, automatically downloaded to this machine; foreground window by default |
 | `exec <peer> [--cwd] [--shell] [--timeout] [--env K=V] <cmd>` | run a command, streamed; `A,B` or `@all` runs on several peers in parallel |
 | `exec <peer> --script <file>` | run the contents of a local script file (`-` = stdin) with the peer's shell: no nested quoting; CRLF and BOM are normalized |
 | `upgrade <peer> [--binary <file>] [--force]` | replace the peer's binary and restart its `serve` (`A,B` / `@all` allowed) |
@@ -102,11 +104,34 @@ The same data budgets apply to ordinary output and JSON. JSON escaping, metadata
 | `ls` | 500 entries; up to 60KB of serialized entries, reserving space for metadata within 64KB | `--offset N` / JSON `next_offset`; `--max` changes the entry count |
 | `find` | 200 paths, newest first; scan stops after 100000 matches (`total_capped`) | Narrow the pattern/dir or raise `--max` |
 | `grep` | 200 matches (files with `-l`/`-c`) / 300 characters per line; up to 60KB of serialized entries including `-C/-A/-B` context lines | Same pagination as `ls`; narrow with `--glob` |
+| `desktop windows` | 50 windows / 32KB of entries; titles clipped to 200 characters | `--offset` / `next_offset`, `--max`; `--full` preserves titles and raises the page byte cap to 8MB, while `--max` still applies |
+| `desktop screenshot` | PNG preview: longest edge <=1600 pixels and <=1MB; shrinks further if needed | `--max-edge N`, a smaller `--region`, or `--full` for original pixels (hard cap 64M pixels / 32MB PNG) |
 
 - JSON reports `truncated`, omitted line/byte/character counts, and a log path or continuation cursor. List/search pages stop after detecting another result, so the remaining count is a lower bound. Ordinary output gives the equivalent retrieval command on stderr. Page order is stable while the tree and file contents remain unchanged.
 - `ls` / `grep --full` removes byte and row clipping; `--max` still applies. Old peers without pagination reject a requested nonzero offset with an upgrade hint rather than silently repeating the first page.
 - An explicit `read --lines START:END` permits long lines but remains capped by `max_read_kb`; a single line exceeding that cap returns an error with a download command.
 - Explicit large-output representations remain memory-bounded: single-peer `--full --json` keeps at most 1MB total, and multi-peer `--full` keeps 8MB per peer. Any remainder is available in the full local log. Single-peer ordinary `--full` streams all output.
+
+### Native Windows desktop observation
+
+Available from 0.0.11. The caller can run on any supported OS; the peer must run Windows 10 (1703+) or Windows 11 in an unlocked, connected user session. The feature is off by default. The peer owner enables all authenticated callers' read-only desktop observation with `[policy] desktop_capture = true`, then restarts `serve`. This gates the desktop API separately from workspace paths and command rules; arbitrary `exec` commands still run with the serve user's rights. A Windows service in session 0 cannot capture the interactive user's desktop.
+
+```bash
+agent-cli-x desktop windows win --title Codex --max 10
+agent-cli-x desktop screenshot win --out ./foreground.png
+agent-cli-x desktop screenshot win --window 0x123ABC --out ./window.png --json
+agent-cli-x desktop screenshot win --region -1920,0,800,600 --out ./region.png
+```
+
+PNG bytes travel directly over the pinned TLS connection; no capture scripts, remote image files, or Base64 stdout are used. `--out` is a **local file**, is returned as an absolute `path`, and never overwrites an existing file (105). Without `--out`, a unique PNG is saved under the caller's `~/.agent-cli-x/screenshots/`. Failed downloads remove their partial local file. Successful screenshots remain until the caller removes them.
+
+Coordinates are physical virtual-desktop pixels, including negative monitor origins. JSON includes `rect`, image `width`/`height`, `scale_x`/`scale_y` (source pixels per image pixel), and UTC `captured_at`. For example, desktop X = `rect.x + image_x * scale_x`. Window captures also report `dpi`; screen/region captures report `null` because they may span monitors with different DPI settings.
+
+Capture reads **displayed pixels**, including layered/overlapping windows. Selecting a window crops its visible desktop bounds; it does not activate it or recover covered content. Background targets and partly off-screen windows receive a warning. Hidden, minimized or wholly off-screen targets are rejected. Window enumeration order can change with the desktop's Z-order; rerun the title filter when a window disappears. No keyboard, mouse, activation, or accessibility controls are included in this phase.
+
+`info` exposes native support and the permission state. Errors use 102 for disabled desktop permission, 103 for a vanished window, 105 for an unusable window/local file conflict, 112 for a locked/disconnected/non-interactive desktop, and 113 for an unsupported peer OS. Images are not stored on the peer; the audit log records metadata, not image bytes or window titles.
+
+Interactive validation on Windows: `cargo test --test e2e native_desktop_roundtrip -- --ignored --test-threads=1`. This uses isolated client/server profiles and only reads pixels; it does not activate windows or upgrade an existing service.
 
 ## Multiple machines
 
@@ -277,7 +302,7 @@ After a reboot, run `agent-cli-x doctor` on the machine. On Windows it flags a t
 
 ## Exit codes
 
-Remote exit codes pass through. agent-cli-x's own errors: 100 connect, 101 auth, 102 policy denied, 103 not found, 104 timeout, 105 conflict, 106 fingerprint, 107 local/remote I/O error, 108 other, 109 config (e.g. unknown peer, missing config), 110 bad arguments, 111 busy. `grep` and `find` exit 1 when nothing matches; `job logs` exits 137 for a killed job. `upgrade` / `restart` exit 104 when the restart was issued but the peer hasn't come back yet.
+Remote exit codes pass through. agent-cli-x's own errors: 100 connect, 101 auth, 102 policy denied, 103 not found, 104 timeout, 105 conflict, 106 fingerprint, 107 local/remote I/O error, 108 other, 109 config (e.g. unknown peer, missing config), 110 bad arguments, 111 busy, 112 desktop unavailable, 113 unsupported OS. `grep` and `find` exit 1 when nothing matches; `job logs` exits 137 for a killed job. `upgrade` / `restart` exit 104 when the restart was issued but the peer hasn't come back yet.
 
 ## License
 

@@ -1,6 +1,7 @@
 //! 客户端：短连接 HTTPS（证书指纹固定），一次调用一个请求。
 
 pub mod admin;
+pub mod desktop;
 pub mod multi;
 pub mod output;
 pub mod transfer;

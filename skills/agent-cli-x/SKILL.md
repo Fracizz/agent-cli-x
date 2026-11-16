@@ -1,6 +1,6 @@
 ---
 name: agent-cli-x
-description: Run commands, search, read/edit and transfer files on another registered machine (peer) through agent-cli-x. Use when a task needs to build, test, inspect logs, or change code on a remote Windows/Linux server instead of the local one.
+description: Run commands, search, read/edit, transfer files and capture Windows desktops on another registered machine (peer) through agent-cli-x. Use when a task needs to build, test, inspect logs, or change code on a remote Windows/Linux server instead of the local one.
 ---
 
 # agent-cli-x
@@ -23,6 +23,8 @@ agent-cli-x exec B --detach "cargo test"      # long jobs; then: job logs B <id>
 agent-cli-x exec B,C "git pull"               # or @all; parallel, grouped per peer, exit 0 only if all succeed
 agent-cli-x find B "*.rs" proj:src            # files by name, newest first; exit 1 = none
 agent-cli-x grep B "fn main" proj:src --glob "*.rs" -C 2  # -i -F; -l files only; -c counts; exit 1 = none
+agent-cli-x desktop windows B --title Codex --max 10  # Windows; policy.desktop_capture = true
+agent-cli-x desktop screenshot B --out ./shot.png      # saved on THIS machine; --window ID / --region X,Y,W,H
 agent-cli-x ls   B proj:src --depth 2
 agent-cli-x read B proj:src/main.rs --lines 100:200 -n
 agent-cli-x edit B proj:src/main.rs --old "a" --new "b"   # --all
@@ -43,6 +45,8 @@ agent-cli-x restart B ; agent-cli-x set-port B 48000   # never hand-edit a peer'
 - Locate with `find` / `grep -l` first, then `grep -C` or `read --lines` around the hit. Avoid reading whole large files or `ls --depth` on big trees.
 - `--json` for fields (`sha256`, `op_id`, job id); `--full` for essential trimmed text. Full JSON caps at 1MB (multi-peer full: 8MB/peer); remainder stays in the log.
 
+Desktop: physical-pixel coordinates; default 50 windows / 32KB, titles 200 chars; screenshot <=1600px longest edge / 1MB PNG. `--full` keeps original pixels (<=64M pixels / 32MB). Captures displayed pixels, including overlap; never activates windows. On desktop policy denial (102), stop; do not substitute exec capture scripts.
+
 ## Rules
 
 - Non-interactive (empty stdin, `CI=1`): pass `-y`/`--yes`/`--no-edit`, or it hangs until timeout.
@@ -57,4 +61,4 @@ agent-cli-x restart B ; agent-cli-x set-port B 48000   # never hand-edit a peer'
 
 ## Exit codes
 
-other = remote command's code · 100 cannot connect · 101 bad token · 102 denied by policy · 103 not found · 104 timeout (upgrade/restart: not back yet, check `info` later) · 105 conflict (edit match / sha / jobs running on upgrade) · 106 cert fingerprint mismatch: ask a human, never re-register · 107 I/O · 108 internal · 109 config (unknown peer) · 110 bad arguments · 111 busy · 137 job killed
+other = remote command's code · 100 cannot connect · 101 bad token · 102 denied by policy · 103 not found · 104 timeout (upgrade/restart: not back yet, check `info` later) · 105 conflict (edit match / sha / jobs running on upgrade) · 106 cert fingerprint mismatch: ask a human, never re-register · 107 I/O · 108 internal · 109 config (unknown peer) · 110 bad arguments · 111 busy · 112 desktop unavailable (unlock/connect user session) · 113 unsupported OS · 137 job killed

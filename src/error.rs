@@ -62,6 +62,8 @@ impl AppError {
             "config" => 109,
             "bad_request" => 110,
             "busy" => 111,
+            "desktop_unavailable" => 112,
+            "unsupported" => 113,
             _ => 108,
         }
     }
@@ -75,6 +77,7 @@ impl AppError {
             "timeout" => 408,
             "conflict" => 409,
             "busy" => 503,
+            "desktop_unavailable" | "unsupported" => 503,
             _ => 500,
         }
     }
