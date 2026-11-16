@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.0.10
+
+- Add local peer remarks with `peer add --remark` and `peer set --remark`; show remarks in `peer list` and `info`, including JSON output.
+- Allow editing remarks offline, preserve them when re-registering peers, and clear them with `--remark ""`. Remarks are limited to one line and 300 characters (1200 UTF-8 bytes).
+
 ## 0.0.8
 
 - Make `serve` default to detached, windowless startup with readiness confirmation, file logs and the original startup error codes. Use `serve --foreground` for debugging and service managers; update existing Task Scheduler/systemd actions to include it. `--background` remains an explicit alias for the default.
