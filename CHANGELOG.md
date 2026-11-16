@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.0.11
+
+- Add native Windows desktop observation with `desktop windows` and `desktop screenshot`, gated by `policy.desktop_capture` and reported by `info`.
+- Support title filters, window IDs and physical-pixel regions; transfer PNG captures directly to a local file without remote capture scripts or image files.
+- Bound window listings and screenshot sizes by default, with pagination and explicit `--full` support. Report locked or unavailable desktops with actionable errors.
+
 ## 0.0.10
 
 - Add local peer remarks with `peer add --remark` and `peer set --remark`; show remarks in `peer list` and `info`, including JSON output.
