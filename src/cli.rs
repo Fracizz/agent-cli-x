@@ -299,15 +299,21 @@ enum PeerCmd {
         /// Peer fingerprint (get via `agent-cli-x fingerprint` on the peer)
         #[arg(long)]
         fingerprint: Option<String>,
+        /// Local remark: one line, at most 300 characters; empty clears it
+        #[arg(long)]
+        remark: Option<String>,
     },
-    /// Change a registered peer's address or token (verified by the stored fingerprint; saved only once reachable)
+    /// Change address/token (verified before saving), or a local remark (works offline)
     Set {
         name: String,
         /// New address IP:port
-        #[arg(long, required_unless_present = "token")]
+        #[arg(long, required_unless_present_any = ["token", "remark"])]
         addr: Option<String>,
         #[arg(long)]
         token: Option<String>,
+        /// Local remark: one line, at most 300 characters; empty clears it
+        #[arg(long)]
+        remark: Option<String>,
     },
     /// List registered peers
     List,
@@ -465,7 +471,7 @@ pub fn run() -> Result<i32> {
             Ok(multi::info_many(&multi::resolve(&peer)?, json))
         }
         Cmd::Info { peer } => {
-            let v = Client::load(&peer)?.call("/v1/info", &json!({}), CALL_TIMEOUT)?;
+            let v = Client::load(&peer)?.info(CALL_TIMEOUT)?;
             let _ = config::remember_peer_infos(&config::home_dir(), &[(peer.as_str(), &v)]);
             if json {
                 println!("{v}");
@@ -1116,8 +1122,12 @@ fn peer(cmd: PeerCmd, json: bool) -> Result<i32> {
             addr,
             token,
             fingerprint,
+            remark,
         } => {
             config::validate_name(&name, "peer")?;
+            if let Some(r) = &remark {
+                config::validate_remark(r)?;
+            }
             let addr = config::normalize_addr(&addr);
             let seen = client::discover_fingerprint(&addr)?;
             let Some(want) = fingerprint else {
@@ -1130,16 +1140,19 @@ fn peer(cmd: PeerCmd, json: bool) -> Result<i32> {
                     "Fingerprint mismatch: expected {want}, got {seen}. Do not register; verify the peer's identity and retry"
                 )));
             }
+            let mut peers = config::load_peers(&home)?;
+            let remark = remark
+                .or_else(|| peers.peers.get(&name).and_then(|p| p.remark.clone()))
+                .filter(|r| !r.is_empty());
             let mut p = Peer {
                 addr: addr.clone(),
                 token,
                 fingerprint: seen,
+                remark,
                 ..Default::default()
             };
-            let info =
-                Client::from_peer(&name, p.clone()).call("/v1/info", &json!({}), CALL_TIMEOUT)?;
+            let info = Client::from_peer(&name, p.clone()).info(CALL_TIMEOUT)?;
             p.absorb_info(&info);
-            let mut peers = config::load_peers(&home)?;
             if let Some(id) = &p.node_id {
                 if let Some((other, _)) = peers
                     .peers
@@ -1161,22 +1174,39 @@ fn peer(cmd: PeerCmd, json: bool) -> Result<i32> {
             }
             Ok(0)
         }
-        PeerCmd::Set { name, addr, token } => {
+        PeerCmd::Set {
+            name,
+            addr,
+            token,
+            remark,
+        } => {
+            if let Some(r) = &remark {
+                config::validate_remark(r)?;
+            }
             let mut peers = config::load_peers(&home)?;
             let Some(old) = peers.peers.get(&name) else {
                 return Err(AppError::not_found(format!("Peer `{name}` not registered")));
             };
             let mut p = old.clone();
+            let verify = addr.is_some() || token.is_some();
             if let Some(a) = addr {
                 p.addr = config::normalize_addr(&a);
             }
             if let Some(t) = token {
                 p.token = t;
             }
+            if let Some(r) = remark {
+                p.remark = Some(r).filter(|r| !r.is_empty());
+            }
             // 指纹沿用登记时的：连得上且指纹一致才保存，防止误指到别的机器
-            let info =
-                Client::from_peer(&name, p.clone()).call("/v1/info", &json!({}), CALL_TIMEOUT)?;
-            p.absorb_info(&info);
+            if verify {
+                let info = Client::from_peer(&name, p.clone()).call(
+                    "/v1/info",
+                    &json!({}),
+                    CALL_TIMEOUT,
+                )?;
+                p.absorb_info(&info);
+            }
             let addr = p.addr.clone();
             peers.peers.insert(name.clone(), p);
             config::save_peers(&home, &peers)?;
@@ -1236,7 +1266,7 @@ fn peer(cmd: PeerCmd, json: bool) -> Result<i32> {
                     .peers
                     .iter()
                     .map(|(n, p)| {
-                        json!({
+                        let mut v = json!({
                             "name": n,
                             "addr": p.addr,
                             "node_name": p.node_name,
@@ -1245,7 +1275,11 @@ fn peer(cmd: PeerCmd, json: bool) -> Result<i32> {
                             "arch": p.arch,
                             "shell": p.shell,
                             "fingerprint": p.fingerprint,
-                        })
+                        });
+                        if let Some(remark) = &p.remark {
+                            v["remark"] = json!(remark);
+                        }
+                        v
                     })
                     .collect();
                 println!("{}", Value::Array(list));
@@ -1262,11 +1296,14 @@ fn peer(cmd: PeerCmd, json: bool) -> Result<i32> {
                         _ => "-".into(),
                     };
                     println!(
-                        "{n}\t{}\t{} ({})\t{platform}\t{}",
+                        "{n}\t{}\t{} ({})\t{platform}\t{}{}",
                         p.addr,
                         p.node_name.as_deref().unwrap_or("-"),
                         p.node_id.as_deref().unwrap_or("-"),
-                        p.shell.as_deref().unwrap_or("-")
+                        p.shell.as_deref().unwrap_or("-"),
+                        p.remark
+                            .as_ref()
+                            .map_or(String::new(), |r| format!("\t{r}"))
                     );
                 }
             }
@@ -1651,6 +1688,9 @@ fn print_info(name: &str, v: &Value) {
         v["node_name"].as_str().unwrap_or("?"),
         v["node_id"].as_str().unwrap_or("-")
     );
+    if let Some(remark) = v["remark"].as_str() {
+        println!("  remark: {remark}");
+    }
     let ver = v["version"].as_str().unwrap_or("?");
     println!(
         "  host {}  {}/{}  agent-cli-x {ver}{}  default shell: {}",

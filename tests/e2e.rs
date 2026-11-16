@@ -389,6 +389,98 @@ fn full_flow() {
 }
 
 #[test]
+fn peer_remarks() {
+    let mut env = setup();
+    let c = &env.client_home;
+    let peers_path = c.join("peers.toml");
+    let cached = || json_of(&run(c, &["peer", "list", "--json"]))[0].clone();
+    assert!(cached().get("remark").is_none());
+    let token = cfg_token(&env.server_home.join("config.toml"));
+    let add = |extra: &[&str]| {
+        let mut args = vec![
+            "peer",
+            "add",
+            "b",
+            &env.listen,
+            "--token",
+            &token,
+            "--fingerprint",
+            &env.fp,
+        ];
+        args.extend_from_slice(extra);
+        run(c, &args)
+    };
+    let remark = "生产环境 🚀";
+    let o = add(&["--remark", remark, "--json"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert_eq!(json_of(&o)["info"]["remark"], remark);
+    assert_eq!(cached()["remark"], remark);
+    assert!(text(&run(c, &["peer", "list"])).contains(remark));
+    assert!(text(&run(c, &["info", "b"])).contains(remark));
+    assert_eq!(json_of(&run(c, &["info", "b", "--json"]))["remark"], remark);
+    assert!(text(&run(c, &["info", "@all"])).contains(remark));
+    assert_eq!(
+        json_of(&run(c, &["info", "@all", "--json"]))[0]["info"]["remark"],
+        remark
+    );
+    // 重新登记、刷新 info、只更新连接信息均保留本地备注。
+    assert!(add(&[]).status.success());
+    assert!(run(c, &["peer", "set", "b", "--addr", &env.listen])
+        .status
+        .success());
+    assert_eq!(cached()["remark"], remark);
+    let o = run(c, &["peer", "set", "b", "--remark", "测试环境", "--json"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert_eq!(json_of(&o)["updated"], "b");
+    assert_eq!(cached()["remark"], "测试环境");
+    // 非法输入不能写盘；旧配置仍可读取。
+    let before = fs::read(&peers_path).unwrap();
+    for invalid in ["a\nb".to_string(), "a\tb".to_string(), "🚀".repeat(301)] {
+        for verb in ["set", "add"] {
+            let o = if verb == "set" {
+                run(c, &["peer", "set", "b", "--remark", &invalid])
+            } else {
+                add(&["--remark", &invalid])
+            };
+            assert_eq!(o.status.code(), Some(110), "{}", text(&o));
+            assert_eq!(fs::read(&peers_path).unwrap(), before);
+        }
+    }
+    assert!(!run(c, &["peer", "set", "b"]).status.success());
+    assert_eq!(
+        run(c, &["peer", "set", "missing", "--remark", "x"])
+            .status
+            .code(),
+        Some(103)
+    );
+    // 修改备注不依赖联网，混合修改仍先校验连接且失败时不保存。
+    env._server.child.kill().unwrap();
+    env._server.child.wait().unwrap();
+    let o = run(c, &["peer", "set", "b", "--remark", "离线服务器"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert_eq!(cached()["remark"], "离线服务器");
+    let before = fs::read(&peers_path).unwrap();
+    let o = run(
+        c,
+        &[
+            "peer",
+            "set",
+            "b",
+            "--addr",
+            &env.listen,
+            "--remark",
+            "不能保存",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(100), "{}", text(&o));
+    assert_eq!(fs::read(&peers_path).unwrap(), before);
+    let o = run(c, &["peer", "set", "b", "--remark", ""]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(cached().get("remark").is_none());
+    assert!(!fs::read_to_string(peers_path).unwrap().contains("remark ="));
+}
+
+#[test]
 fn identity_grep_transfer_jobs() {
     let env = setup();
     let c = &env.client_home;

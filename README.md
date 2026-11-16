@@ -88,6 +88,8 @@ Then teach your agent the tool: copy [`skills/agent-cli-x/SKILL.md`](skills/agen
 
 Paths use `workspace:relative/path`. See `agent-cli-x --help`.
 
+Peer remarks are local to the caller and appear in `peer list` and `info` (including JSON). Use `peer add <name> <addr> --token <token> --fingerprint <fingerprint> --remark "production"` when registering, or `peer set <name> --remark "production"` to edit offline; `--remark ""` clears it. Remarks accept one line, at most 300 characters (1200 UTF-8 bytes), without control characters. Re-registering without `--remark` preserves the existing remark.
+
 ### Output limits
 
 The same data budgets apply to ordinary output and JSON. JSON escaping, metadata and `read -n` line numbers add presentation overhead.

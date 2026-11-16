@@ -333,7 +333,7 @@ pub fn exec_many(
 /// 探测一个对端：返回 info 与往返耗时（毫秒）。
 pub fn probe(peer: &str) -> Result<(Value, u64)> {
     let started = Instant::now();
-    let v = Client::load(peer)?.call("/v1/info", &json!({}), Duration::from_secs(15))?;
+    let v = Client::load(peer)?.info(Duration::from_secs(15))?;
     Ok((v, started.elapsed().as_millis() as u64))
 }
 
@@ -372,7 +372,7 @@ pub fn info_many(peers: &[String], json: bool) -> i32 {
                     String::new()
                 };
                 println!(
-                    "{p}\tonline\t{} ({})\t{}/{}\tv{ver}{}\t{ms}ms{warn}",
+                    "{p}\tonline\t{} ({})\t{}/{}\tv{ver}{}\t{ms}ms{warn}{}",
                     v["node_name"].as_str().unwrap_or("?"),
                     v["node_id"].as_str().unwrap_or("-"),
                     v["os"].as_str().unwrap_or("?"),
@@ -381,7 +381,10 @@ pub fn info_many(peers: &[String], json: bool) -> i32 {
                         format!(" (local v{})", http::VERSION)
                     } else {
                         String::new()
-                    }
+                    },
+                    v["remark"]
+                        .as_str()
+                        .map_or(String::new(), |r| format!("\t{r}"))
                 );
             }
             Err(e) => println!("{p}\tunavailable\t{e}"),

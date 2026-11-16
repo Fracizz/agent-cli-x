@@ -11,7 +11,7 @@ use crate::error::{AppError, Result};
 use crate::{http, tls};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConnection, StreamOwned};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -164,6 +164,15 @@ impl Client {
 
     pub fn addr(&self) -> &str {
         &self.peer.addr
+    }
+
+    /// 展示对端信息时附上调用方维护的备注。
+    pub fn info(&self, timeout: Duration) -> Result<Value> {
+        let mut info = self.call("/v1/info", &json!({}), timeout)?;
+        if let Some(remark) = &self.peer.remark {
+            info["remark"] = json!(remark);
+        }
+        Ok(info)
     }
 
     /// 同一对端（同一 token 与证书指纹）换一个地址。

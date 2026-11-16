@@ -561,6 +561,9 @@ pub struct Peer {
     pub addr: String,
     pub token: String,
     pub fingerprint: String,
+    /// 调用方维护的本地备注，不随对端 info 刷新。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remark: Option<String>,
     /// 登记时对端报告的机器名与 ID（仅用于展示与核对）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_name: Option<String>,
@@ -607,11 +610,38 @@ pub fn peers_path(home: &Path) -> PathBuf {
     home.join("peers.toml")
 }
 
+pub fn validate_remark(remark: &str) -> Result<()> {
+    if remark.chars().count() > 300
+        || remark
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+    {
+        return Err(AppError::bad_request(
+            "Remark must be one line, at most 300 characters (1200 UTF-8 bytes); retry with --remark \"short text\"",
+        ));
+    }
+    Ok(())
+}
+
 pub fn load_peers(home: &Path) -> Result<Peers> {
     let p = peers_path(home);
     match fs::read_to_string(&p) {
-        Ok(t) => toml::from_str(&t)
-            .map_err(|e| AppError::config(format!("failed to parse {}: {e}", p.display()))),
+        Ok(t) => {
+            let peers: Peers = toml::from_str(&t)
+                .map_err(|e| AppError::config(format!("failed to parse {}: {e}", p.display())))?;
+            for (name, peer) in &peers.peers {
+                if let Some(remark) = &peer.remark {
+                    validate_remark(remark).map_err(|e| {
+                        AppError::config(format!(
+                            "Peer `{name}`: {}. Edit remark in {}",
+                            e.message,
+                            p.display()
+                        ))
+                    })?;
+                }
+            }
+            Ok(peers)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Peers::default()),
         Err(e) => Err(e.into()),
     }
@@ -638,7 +668,7 @@ pub fn save_peers(home: &Path, peers: &Peers) -> Result<()> {
     let p = peers_path(home);
     let body = toml::to_string(peers).map_err(|e| AppError::internal(e.to_string()))?;
     let text =
-        format!("# Maintained by `agent-cli-x peer add/remove`. Contains peer tokens; do not share.\n\n{body}");
+        format!("# Maintained by `agent-cli-x peer add/set/remove`. Contains peer tokens; do not share.\n\n{body}");
     crate::util::atomic_write(&p, text.as_bytes())?;
     crate::util::restrict_permissions(&p);
     Ok(())
@@ -781,6 +811,31 @@ pub fn normalize_addr(addr: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn peer_remark_is_optional_and_bounded() {
+        let old = "addr = '127.0.0.1:47821'\ntoken = 'test'\nfingerprint = 'sha256:00'\n";
+        let mut peer: super::Peer = toml::from_str(old).unwrap();
+        assert!(peer.remark.is_none());
+        assert!(!toml::to_string(&peer).unwrap().contains("remark"));
+        peer.remark = Some("生产环境 🚀".into());
+        peer.absorb_info(&serde_json::json!({"os": "linux", "remark": "remote"}));
+        let saved = toml::to_string(&peer).unwrap();
+        let loaded: super::Peer = toml::from_str(&saved).unwrap();
+        assert_eq!(loaded.remark.as_deref(), Some("生产环境 🚀"));
+        assert!(super::validate_remark(&"🚀".repeat(300)).is_ok());
+        assert!(super::validate_remark(&"a".repeat(301)).is_err());
+        for invalid in [
+            "a\nb",
+            "a\rb",
+            "a\tb",
+            "\x1b[31m",
+            "a\u{2028}b",
+            "a\u{2029}b",
+        ] {
+            assert!(super::validate_remark(invalid).is_err());
+        }
+    }
+
     #[test]
     fn prewarm_auto_and_cap() {
         use super::resolve_prewarm as r;
