@@ -417,6 +417,7 @@ fn dispatch(
         "/v1/fs/edit" => fs::edit(&ctx, body),
         "/v1/fs/rm" => fs::rm(&ctx, body),
         "/v1/fs/grep" => fs::grep(&ctx, body),
+        "/v1/fs/find" => fs::find(&ctx, body),
         "/v1/fs/get" => {
             transfer::get(&ctx, body, w);
             return;
