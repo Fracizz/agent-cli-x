@@ -654,6 +654,7 @@ fn identity_grep_transfer_jobs() {
     let o = run(c, &["grep", "b", "-F", "(\"hi\")", "--glob", "*.rs"]);
     assert!(o.status.success(), "{}", text(&o));
     find_grep_modes_batch_edit(&env);
+    agent_friendly_fs(&env);
 
     // put 目录（含排除）→ 远端；get 回本地
     let local = env.server_home.parent().unwrap().join("upload/site");
@@ -1038,6 +1039,128 @@ fn find_grep_modes_batch_edit(env: &Env) {
     assert!(fs::read_to_string(env.ws.join("lib/a.rs"))
         .unwrap()
         .ends_with("done\n"));
+}
+
+/// 减少 AI 往返的文件能力：write 自动建父目录、edit 容错匹配、多文件 read、图片 read、同文件并发 edit 串行。
+fn agent_friendly_fs(env: &Env) {
+    let c = &env.client_home;
+    let stdout = |o: &Output| String::from_utf8_lossy(&o.stdout).replace("\r\n", "\n");
+
+    // write：父目录不存在时直接创建，不再需要 --mkdir
+    let o = run(c, &["write", "b", "proj:af/deep/new.txt", "--content", "x"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert_eq!(
+        fs::read_to_string(env.ws.join("af/deep/new.txt")).unwrap(),
+        "x"
+    );
+
+    // edit：精确匹配失败时忽略行尾空白 / 弯引号差异，只替换命中段
+    fs::write(
+        env.ws.join("af/q.rs"),
+        "let s = \u{201C}a\u{201D};   \nnext\n",
+    )
+    .unwrap();
+    let o = run(
+        c,
+        &[
+            "edit",
+            "b",
+            "proj:af/q.rs",
+            "--old",
+            "s = \"a\";",
+            "--new",
+            "s = 1;",
+        ],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains("matched after ignoring"), "{}", text(&o));
+    assert_eq!(
+        fs::read_to_string(env.ws.join("af/q.rs")).unwrap(),
+        "let s = 1;   \nnext\n"
+    );
+    let v = json_of(&run(
+        c,
+        &[
+            "edit",
+            "b",
+            "proj:af/q.rs",
+            "--old",
+            "next",
+            "--new",
+            "n",
+            "--json",
+        ],
+    ));
+    assert!(v.get("fuzzy").is_none(), "{v}");
+
+    // read 多个文件：逐个加标题，path#范围，缺失文件不影响其余文件但退出码非 0
+    fs::write(env.ws.join("af/r1.txt"), "one\n").unwrap();
+    fs::write(env.ws.join("af/r2.txt"), "l1\nl2\nl3").unwrap();
+    let o = run(
+        c,
+        &[
+            "read",
+            "b",
+            "proj:af/r1.txt",
+            "proj:af/r2.txt#2:3",
+            "proj:af/none.txt",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(103), "{}", text(&o));
+    assert_eq!(
+        stdout(&o),
+        "==> proj:af/r1.txt <==\none\n==> proj:af/r2.txt <==\nl2\nl3\n"
+    );
+    let v = json_of(&run(
+        c,
+        &["read", "b", "proj:af/r1.txt", "proj:af/r2.txt", "--json"],
+    ));
+    assert_eq!(v["files"].as_array().unwrap().len(), 2, "{v}");
+    assert_eq!(v["files"][1]["content"], "l1\nl2\nl3");
+
+    // read 图片：下载到本地临时目录并给出路径
+    let png = [0x89u8, b'P', b'N', b'G', 0, 1, 2, 3];
+    fs::write(env.ws.join("af/pic.png"), png).unwrap();
+    let v = json_of(&run(c, &["read", "b", "proj:af/pic.png", "--json"]));
+    let local = v["image"].as_str().unwrap_or_else(|| panic!("{v}"));
+    assert_eq!(fs::read(local).unwrap(), png);
+    // 其它二进制文件：报错里给出 get 命令
+    fs::write(env.ws.join("af/blob.bin"), [0u8, 1, 2]).unwrap();
+    let o = run(c, &["read", "b", "proj:af/blob.bin"]);
+    assert!(text(&o).contains("agent-cli-x get"), "{}", text(&o));
+
+    // 同一文件并发 edit：全部成功且互不覆盖
+    let body: String = (0..8).map(|i| format!("line{i}\n")).collect();
+    fs::write(env.ws.join("af/race.txt"), &body).unwrap();
+    let handles: Vec<_> = (0..8)
+        .map(|i| {
+            let c = c.clone();
+            std::thread::spawn(move || {
+                let (old, new) = (format!("line{i}\n"), format!("LINE{i}\n"));
+                run(
+                    &c,
+                    &[
+                        "edit",
+                        "b",
+                        "proj:af/race.txt",
+                        "--old",
+                        &old,
+                        "--new",
+                        &new,
+                    ],
+                )
+            })
+        })
+        .collect();
+    for h in handles {
+        let o = h.join().unwrap();
+        assert!(o.status.success(), "{}", text(&o));
+    }
+    let want: String = (0..8).map(|i| format!("LINE{i}\n")).collect();
+    assert_eq!(
+        fs::read_to_string(env.ws.join("af/race.txt")).unwrap(),
+        want
+    );
 }
 
 fn json_of(o: &Output) -> serde_json::Value {

@@ -10,7 +10,7 @@ Machine B: Codex       ──> agent-cli-x ──TLS──> Machine A: agent-cli
 - **One binary, both roles.** Every machine runs `agent-cli-x serve`, and every machine can call its peers.
 - **Lightweight.** Synchronous std + rustls, no async runtime, no OpenSSL. Short-lived HTTPS request per call.
 - **Machine identity.** Every node has a configurable `node_name` and a random short `node_id` (6 hex chars), so agents know exactly which machine they are talking to.
-- **Built for agents.** Exit codes pass through, long output is trimmed to head/tail (also with `--json`) with the full log saved locally, `read` and `ls` return bounded windows by default, exact-match `edit`, `rollback`.
+- **Built for agents.** Exit codes pass through, long output is trimmed to head/tail (also with `--json`) with the full log saved locally, `read` and `ls` return bounded windows by default (several files per `read`), `edit` with exact match first and a whitespace/quote-tolerant fallback, `rollback`.
 - **Many machines.** Run one command on several peers at once (`exec A,B,C` / `@all`), issue a separate revocable token per caller, push upgrades remotely, and check everything with `doctor`.
 - **Guard rails.** Token auth, self-signed TLS with fingerprint pinning, workspace allow-list, path deny-list, command deny-list, automatic backups, audit log.
 
@@ -79,7 +79,7 @@ Then teach your agent the tool: copy [`skills/agent-cli-x/SKILL.md`](skills/agen
 | `restart <peer> [--force]` | restart the peer's `serve` without replacing the binary (`A,B` / `@all` allowed) |
 | `set-port <peer> <port>` | move the peer to another listen port without restarting it; also updates this machine's `peers.toml` |
 | `exec <peer> --detach <cmd>`, `job list\|logs\|kill` | background jobs (`job logs --follow` exits with the job's code); they keep running across `restart` / `upgrade` of the peer |
-| `ls` / `find` / `grep` / `read` / `write` / `edit` | file operations inside workspaces. `find <peer> '<glob>' [dir]` lists files by name, newest first (a pattern without `/` matches at any depth). `grep` takes `-C/-A/-B N` context, `-l` (files only) and `-c` (count per file). `edit --edits <file\|->` applies a JSON array `[{"old","new","all"?}]` in order, all or nothing |
+| `ls` / `find` / `grep` / `read` / `write` / `edit` | file operations inside workspaces. `find <peer> '<glob>' [dir]` lists files by name, newest first (a pattern without `/` matches at any depth). `grep` takes `-C/-A/-B N` context, `-l` (files only) and `-c` (count per file). `edit --edits <file\|->` applies a JSON array `[{"old","new","all"?}]` in order, all or nothing. When `old` has no exact match, `edit` retries ignoring trailing whitespace and smart-quote / dash / special-space differences, replaces only the matched span and reports `fuzzy`. `read <peer> a b#100:200` reads several files in one call (per-file range after `#`); an image path (png/jpg/gif/webp/bmp) is downloaded to the local temp dir and its path printed. `write` creates missing parent dirs. Writes to the same file (`write`/`edit`/`rm`) are serialized on the peer |
 | Output limits | Bounded head/tail logs, file windows and list/search pages; see [Output limits](#output-limits) for budgets and continuation flags |
 | `rm <peer> <path> [-r] [--permanent]` | delete a file or directory: moved to the peer's recycle bin by default (undo with `rollback`); `--permanent` deletes for good |
 | `purge <peer> <op_id>` | permanently remove what an operation left behind (its recycle-bin entries and backups) to free space; it can no longer be rolled back |
@@ -100,7 +100,7 @@ The same data budgets apply to ordinary output and JSON. JSON escaping, metadata
 |---|---|---|
 | `exec`, `job logs` | stdout/stderr share first + last 100 lines / 16KB each; 2000 characters per line | Full local `log` retained after any cut; `--full` removes normal trimming |
 | Multi-peer `exec` | Each peer shares first + last 50 lines / 8KB each | Each peer has its own full local log |
-| `read` without an end line | 2000 lines / 64KB; 2000 characters per line | `--lines N:` / JSON `next_start` continues; clipped lines give a `get` command for full text |
+| `read` without an end line | 2000 lines / 64KB; 2000 characters per line. Several paths share this one window; files that no longer fit are listed as `skipped` | `--lines N:` (or `path#N:` with several paths) / JSON `next_start` continues; clipped lines give a `get` command for full text |
 | `ls` | 500 entries; up to 60KB of serialized entries, reserving space for metadata within 64KB | `--offset N` / JSON `next_offset`; `--max` changes the entry count |
 | `find` | 200 paths, newest first; scan stops after 100000 matches (`total_capped`) | Narrow the pattern/dir or raise `--max` |
 | `grep` | 200 matches (files with `-l`/`-c`) / 300 characters per line; up to 60KB of serialized entries including `-C/-A/-B` context lines | Same pagination as `ls`; narrow with `--glob` |

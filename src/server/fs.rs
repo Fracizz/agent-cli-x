@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 fn parse<T: for<'de> Deserialize<'de>>(body: Value) -> Result<T> {
     serde_json::from_value(body).map_err(|e| AppError::bad_request(format!("bad params: {e}")))
@@ -17,6 +17,23 @@ fn parse<T: for<'de> Deserialize<'de>>(body: Value) -> Result<T> {
 
 // Leave room for response metadata inside a 64KB page.
 const PAGE_BYTES: usize = 60 * 1024;
+
+/// 同一文件的写操作串行化：并发的 edit / write / rm 不会在「读-改-写」之间互相覆盖。
+/// 按路径哈希分片，不同文件偶尔共用一把锁也只是多等一下，无需清理。
+static PATH_LOCKS: [Mutex<()>; 64] = [const { Mutex::new(()) }; 64];
+
+fn lock_path(abs: &std::path::Path) -> MutexGuard<'static, ()> {
+    use std::hash::{Hash, Hasher};
+    let mut key = abs.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) {
+        key = key.to_lowercase();
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut h);
+    PATH_LOCKS[(h.finish() % PATH_LOCKS.len() as u64) as usize]
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
 
 // ---------------- ls ----------------
 
@@ -643,7 +660,8 @@ pub fn read(ctx: &Ctx, body: Value) -> Result<Value> {
     file.read_exact(&mut head)?;
     if head.contains(&0) {
         return Err(AppError::bad_request(format!(
-            "{} looks binary; read supports text only",
+            "{} looks binary; read supports text only; download with `agent-cli-x get <peer> {} <local>`",
+            r.display(),
             r.display()
         )));
     }
@@ -758,8 +776,6 @@ struct WriteReq {
     path: String,
     content: String,
     #[serde(default)]
-    mkdir: bool,
-    #[serde(default)]
     expect_sha: Option<String>,
 }
 
@@ -797,13 +813,9 @@ pub fn write(ctx: &Ctx, body: Value) -> Result<Value> {
         .abs
         .parent()
         .ok_or_else(|| AppError::bad_request("invalid path"))?;
+    // 父目录不存在时直接创建（仍受工作区边界和 c 权限约束），省一轮报错重试
+    let _guard = lock_path(&r.abs);
     let need_mkdir = !parent.is_dir();
-    if need_mkdir && !req.mkdir {
-        return Err(AppError::not_found(format!(
-            "parent dir not found: {} (add --mkdir to create)",
-            r.display()
-        )));
-    }
     check_expect_sha(&r.abs, &req.expect_sha)?;
     let mut op = backup::Op::new(&ctx.st.home)?;
     if need_mkdir {
@@ -860,6 +872,8 @@ pub struct EditOutcome {
     pub text: String,
     pub replacements: usize,
     pub first_line: usize,
+    /// 精确匹配失败，按容错规则（行尾空白 / 弯引号 / 破折号 / 特殊空格）匹配成功
+    pub fuzzy: bool,
 }
 
 /// 纯函数：按文件换行风格归一 old/new 后精确替换。
@@ -879,9 +893,7 @@ pub fn apply_edit(original: &str, old: &str, new: &str, replace_all: bool) -> Re
     let (old, new) = (fix(old), fix(new));
     let count = original.matches(&old).count();
     if count == 0 {
-        return Err(AppError::conflict(
-            "old text not found (must match exactly incl. indentation/whitespace); read first to confirm current content",
-        ));
+        return fuzzy_edit(original, &old, &new, replace_all);
     }
     if count > 1 && !replace_all {
         return Err(AppError::conflict(format!(
@@ -899,6 +911,85 @@ pub fn apply_edit(original: &str, old: &str, new: &str, replace_all: bool) -> Re
         text,
         replacements: if replace_all { count } else { 1 },
         first_line,
+        fuzzy: false,
+    })
+}
+
+/// 容错匹配用的单行归一：弯引号 / 各种破折号 / 特殊空格换成 ASCII，去掉行尾空白（含 `\r`）。
+/// 字符一一映射、只截掉行尾，所以归一后第 N 个字符就是原行第 N 个字符。
+fn fuzzy_norm_line(line: &str) -> String {
+    let mapped: String = line
+        .chars()
+        .map(|c| match c {
+            '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
+            '\u{201C}'..='\u{201F}' => '"',
+            '\u{2010}'..='\u{2015}' | '\u{2212}' => '-',
+            '\u{00A0}' | '\u{2002}'..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}' => ' ',
+            c => c,
+        })
+        .collect();
+    mapped.trim_end().to_string()
+}
+
+/// 每行起始的字节偏移
+fn line_starts(text: &str) -> Vec<usize> {
+    std::iter::once(0)
+        .chain(text.match_indices('\n').map(|(i, _)| i + 1))
+        .collect()
+}
+
+/// 精确匹配失败后的容错匹配。只替换命中的那一段，命中范围以外的字节（包括同一行的其余部分）原样保留。
+/// `new` 已按文件换行风格处理过。
+fn fuzzy_edit(original: &str, old: &str, new: &str, replace_all: bool) -> Result<EditOutcome> {
+    let not_found = || {
+        AppError::conflict(
+            "old text not found (must match exactly incl. indentation/whitespace); read first to confirm current content",
+        )
+    };
+    let orig_lines: Vec<&str> = original.split('\n').collect();
+    let norm = orig_lines
+        .iter()
+        .map(|l| fuzzy_norm_line(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let old_n = old
+        .split('\n')
+        .map(fuzzy_norm_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if old_n.trim().is_empty() {
+        return Err(not_found());
+    }
+    let mut hits: Vec<usize> = norm.match_indices(&old_n).map(|(i, _)| i).collect();
+    if hits.is_empty() {
+        return Err(not_found());
+    }
+    if hits.len() > 1 && !replace_all {
+        return Err(AppError::conflict(format!(
+            "old text matches {} places (ignoring trailing whitespace/quote/dash differences); add context to make it unique, or use --all",
+            hits.len()
+        )));
+    }
+    let norm_starts = line_starts(&norm);
+    let orig_starts = line_starts(original);
+    // 归一文本中的字节偏移 → 原文字节偏移（经由 行号 + 行内字符序号）
+    let to_orig = |off: usize| {
+        let line = norm_starts.partition_point(|&s| s <= off) - 1;
+        let col = norm[norm_starts[line]..off].chars().count();
+        let src = orig_lines[line];
+        orig_starts[line] + src.char_indices().nth(col).map_or(src.len(), |(i, _)| i)
+    };
+    let first_line = norm_starts.partition_point(|&s| s <= hits[0]);
+    hits.truncate(if replace_all { hits.len() } else { 1 });
+    let mut text = original.to_string();
+    for &h in hits.iter().rev() {
+        text.replace_range(to_orig(h)..to_orig(h + old_n.len()), new);
+    }
+    Ok(EditOutcome {
+        text,
+        replacements: hits.len(),
+        first_line,
+        fuzzy: true,
     })
 }
 
@@ -909,7 +1000,7 @@ pub fn apply_edits(original: &str, edits: &[EditItem]) -> Result<EditOutcome> {
         return Err(AppError::bad_request("edits must not be empty"));
     }
     let mut text = original.to_string();
-    let (mut replacements, mut first_line) = (0, 0);
+    let (mut replacements, mut first_line, mut fuzzy) = (0, 0, false);
     for (i, e) in edits.iter().enumerate() {
         let out = apply_edit(&text, &e.old, &e.new, e.all).map_err(|err| {
             if edits.len() == 1 {
@@ -930,12 +1021,14 @@ pub fn apply_edits(original: &str, edits: &[EditItem]) -> Result<EditOutcome> {
             first_line = out.first_line;
         }
         replacements += out.replacements;
+        fuzzy |= out.fuzzy;
         text = out.text;
     }
     Ok(EditOutcome {
         text,
         replacements,
         first_line,
+        fuzzy,
     })
 }
 
@@ -962,6 +1055,7 @@ pub fn edit(ctx: &Ctx, body: Value) -> Result<Value> {
             r.display()
         )));
     }
+    let _guard = lock_path(&r.abs);
     let bytes = fs::read(&r.abs)?;
     let (bom, body_bytes) = match bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
         Some(rest) => (true, rest),
@@ -999,13 +1093,17 @@ pub fn edit(ctx: &Ctx, body: Value) -> Result<Value> {
         true,
         json!({"path": r.display(), "op_id": op_id, "replacements": out.replacements}),
     );
-    Ok(json!({
+    let mut v = json!({
         "path": r.display(),
         "op_id": op_id,
         "sha256": sha,
         "replacements": out.replacements,
         "line": out.first_line,
-    }))
+    });
+    if out.fuzzy {
+        v["fuzzy"] = json!(true);
+    }
+    Ok(v)
 }
 
 // ---------------- rm ----------------
@@ -1043,6 +1141,7 @@ pub fn rm(ctx: &Ctx, body: Value) -> Result<Value> {
     if r.rel.is_empty() {
         return Err(AppError::bad_request("cannot delete workspace root"));
     }
+    let _guard = lock_path(&r.abs);
     if !r.exists {
         return Err(AppError::not_found(format!(
             "path not found: {}",
@@ -1311,6 +1410,44 @@ mod tests {
                 .unwrap();
         assert!(v[0].all);
         assert!(serde_json::from_str::<Vec<EditItem>>(r#"[{"old":"a","neww":"b"}]"#).is_err());
+    }
+
+    #[test]
+    fn edit_fuzzy_keeps_bytes_outside_match() {
+        // 行尾空白、弯引号、破折号、全角空格不同也能命中；命中范围外的原字节保留
+        let src = "say(\u{201C}hi\u{201D});   \nx \u{2014} y\u{3000}\nkeep \u{201C}q\u{201D}\n";
+        let o = apply_edit(src, "say(\"hi\");\nx - y", "say(1);\nz", false).unwrap();
+        assert!(o.fuzzy);
+        assert_eq!(o.first_line, 1);
+        assert_eq!(o.text, "say(1);\nz\u{3000}\nkeep \u{201C}q\u{201D}\n");
+        // 同一行内只替换命中的部分
+        let o = apply_edit("a \u{2018}b\u{2019} c\n", "'b'", "B", false).unwrap();
+        assert_eq!(o.text, "a B c\n");
+        // CRLF 文件：old 跨行且带行尾空格
+        let o = apply_edit("a  \r\nb\r\nc\r\n", "a\nb\n", "X\n", false).unwrap();
+        assert_eq!(o.text, "X\r\nc\r\n");
+        // old 多带的行尾空格被忽略，原文行尾空格保留
+        assert_eq!(
+            apply_edit("a  \n", "a   ", "b", false).unwrap().text,
+            "b  \n"
+        );
+        // 精确匹配优先，不标 fuzzy
+        assert!(!apply_edit("a\n", "a", "b", false).unwrap().fuzzy);
+        // 容错后多处命中仍要求唯一；--all 全部替换
+        let e = apply_edit("x\u{2014}\nx-\n", "x\u{2013}", "y", false)
+            .err()
+            .unwrap();
+        assert!(e.message.contains("2 places"), "{}", e.message);
+        let o = apply_edit("x\u{2014}\nx-\n", "x\u{2013}", "y", true).unwrap();
+        assert_eq!((o.text.as_str(), o.replacements), ("y\ny\n", 2));
+        // 只有空白的 old 不做容错
+        assert_eq!(
+            apply_edit("a\n", " \u{3000}", "b", false)
+                .err()
+                .unwrap()
+                .code,
+            "conflict"
+        );
     }
 
     fn scan(acc: &mut GrepAcc, data: &str) -> Vec<String> {

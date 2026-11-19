@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.0.13
+
+- `edit` falls back to a tolerant match (trailing whitespace, smart quotes, dashes, special spaces) when the exact text is not found; only the matched span is replaced and the result carries `fuzzy: true`.
+- `write`, `edit` and `rm` on the same file are serialized on the peer, so concurrent edits no longer overwrite each other.
+- `write` always creates missing parent directories; `--mkdir` is kept as a hidden no-op.
+- `read` accepts several paths (per-file range as `path#START:END`) sharing one 2000-line / 64KB window; `--json` returns `{files, skipped}`.
+- `read` on an image downloads it to the local temp directory and prints the path; other binary files get a `get` command in the error.
+
 ## 0.0.12
 
 - Add native Windows desktop observation with `desktop windows` and `desktop screenshot`, gated by `policy.desktop_capture` and reported by `info`.

@@ -220,11 +220,13 @@ enum Cmd {
         #[arg(long)]
         full: bool,
     },
-    /// Read a text file
+    /// Read text files (several share one 2000-line / 64KB window); images are downloaded to a local temp path
     Read {
         peer: String,
-        path: String,
-        /// Line range, e.g. 100:200, 100:, :50. Without an end line, reads at most 2000 lines / 64KB
+        /// One or more paths; per-file range as `path#START:END` (e.g. proj:a.rs#100:200)
+        #[arg(required = true)]
+        paths: Vec<String>,
+        /// Line range for every path, e.g. 100:200, 100:, :50. Without an end line, reads at most 2000 lines / 64KB
         #[arg(long)]
         lines: Option<String>,
         /// Prefix line numbers
@@ -240,14 +242,14 @@ enum Cmd {
         /// Read content from a local file
         #[arg(long)]
         from: Option<PathBuf>,
-        /// Create parent dirs if missing
-        #[arg(long)]
+        /// No-op: parent dirs are always created now (kept for compatibility)
+        #[arg(long, hide = true)]
         mkdir: bool,
         /// Write only if the remote file's current sha256 equals this (optimistic lock)
         #[arg(long)]
         expect_sha: Option<String>,
     },
-    /// Exact text replace in a file (old must match uniquely)
+    /// Exact text replace in a file (old must match uniquely; falls back to ignoring trailing whitespace / smart quotes / dashes)
     #[command(
         after_help = "Several edits in one call (applied in order, all or nothing):\n  agent-cli-x edit B proj:a.rs --edits - <<'EOF'\n  [{\"old\": \"fn a()\", \"new\": \"fn b()\"}, {\"old\": \"x\", \"new\": \"y\", \"all\": true}]\n  EOF"
     )]
@@ -845,16 +847,16 @@ pub fn run() -> Result<i32> {
         }
         Cmd::Read {
             peer,
-            path,
+            paths,
             lines,
             number,
-        } => read(&peer, &path, lines, number, json),
+        } => read(&peer, &paths, lines, number, json),
         Cmd::Write {
             peer,
             path,
             content,
             from,
-            mkdir,
+            mkdir: _,
             expect_sha,
         } => {
             let content = match (content, from) {
@@ -864,7 +866,8 @@ pub fn run() -> Result<i32> {
             };
             let v = Client::load(&peer)?.call(
                 "/v1/fs/write",
-                &json!({"path": path, "content": content, "mkdir": mkdir, "expect_sha": expect_sha}),
+                // 新版服务端总是创建父目录；旧版服务端需要显式 mkdir
+                &json!({"path": path, "content": content, "mkdir": true, "expect_sha": expect_sha}),
                 CALL_TIMEOUT,
             )?;
             print_write_result(&v, json, "wrote");
@@ -904,6 +907,9 @@ pub fn run() -> Result<i32> {
                     e
                 })?;
             print_write_result(&v, json, "edited");
+            if !json && v["fuzzy"] == true {
+                eprintln!("[agent-cli-x: matched after ignoring trailing whitespace / smart quote / dash differences]");
+            }
             Ok(0)
         }
         Cmd::Put {
@@ -1881,43 +1887,179 @@ fn print_page_hint(v: &Value, max: usize, kind: &str) {
     }
 }
 
-fn read(peer: &str, path: &str, lines: Option<String>, number: bool, json: bool) -> Result<i32> {
-    let (start, end) = match lines.as_deref() {
-        None => (None, None),
-        Some(spec) => {
-            let (a, b) = spec.split_once(':').unwrap_or((spec, spec));
-            let p = |s: &str| -> Result<Option<usize>> {
-                if s.trim().is_empty() {
-                    Ok(None)
-                } else {
-                    s.trim().parse::<usize>().map(Some).map_err(|_| {
-                        AppError::bad_request(format!("--lines `{spec}` must be START:END"))
-                    })
-                }
-            };
-            (p(a)?, p(b)?)
+type LineRange = (Option<usize>, Option<usize>);
+
+fn parse_line_range(spec: &str) -> Result<LineRange> {
+    let (a, b) = spec.split_once(':').unwrap_or((spec, spec));
+    let p = |s: &str| -> Result<Option<usize>> {
+        if s.trim().is_empty() {
+            Ok(None)
+        } else {
+            s.trim().parse::<usize>().map(Some).map_err(|_| {
+                AppError::bad_request(format!("line range `{spec}` must be START:END"))
+            })
         }
     };
+    Ok((p(a)?, p(b)?))
+}
+
+/// `path#START:END` → (path, 范围)。`#` 后面不像行号范围时整体当作路径。
+fn split_path_range(raw: &str) -> (&str, Option<LineRange>) {
+    match raw.rsplit_once('#') {
+        Some((p, spec))
+            if !p.is_empty()
+                && !spec.is_empty()
+                && spec.chars().all(|c| c.is_ascii_digit() || c == ':') =>
+        {
+            match parse_line_range(spec) {
+                Ok(r) => (p, Some(r)),
+                Err(_) => (raw, None),
+            }
+        }
+        _ => (raw, None),
+    }
+}
+
+/// read 遇到图片时直接下载到本地临时目录，让调用方用自己的读图能力查看。
+const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];
+
+fn is_image_path(path: &str) -> bool {
+    path.rsplit_once('.')
+        .is_some_and(|(_, ext)| IMAGE_EXTS.iter().any(|e| ext.eq_ignore_ascii_case(e)))
+}
+
+fn fetch_image(client: &Client, peer: &str, path: &str) -> Result<Value> {
+    let name = path.rsplit(['/', ':', '\\']).next().unwrap_or(path);
+    let dir = std::env::temp_dir().join("agent-cli-x").join(peer);
+    std::fs::create_dir_all(&dir)?;
+    let v = client::transfer::get(client, path, &dir.join(name), &[])?;
+    Ok(json!({"path": path, "image": v["dest"], "bytes": v["bytes"]}))
+}
+
+fn print_image(v: &Value, json: bool) {
+    if json {
+        println!("{v}");
+    } else {
+        println!(
+            "image {} downloaded to {} ({}); open that local file to view it",
+            v["path"].as_str().unwrap_or_default(),
+            v["image"].as_str().unwrap_or_default(),
+            human_size(v["bytes"].as_u64().unwrap_or(0))
+        );
+    }
+}
+
+/// 读一个文本文件。`window` = 本次窗口还剩的 (行数, KB)；给了结束行时不受窗口限制。
+fn read_call(client: &Client, path: &str, range: LineRange, window: (usize, u64)) -> Result<Value> {
+    let (start, end) = range;
     // 没给结束行时只读一个窗口（行数 + 字节双上限），避免一次把大文件整个读进上下文
     let windowed = end.is_none();
     let (end, max_kb) = if windowed {
         let s = start.unwrap_or(1).max(1);
-        (
-            Some(s.saturating_add(READ_WINDOW_LINES - 1)),
-            Some(READ_WINDOW_KB),
-        )
+        (Some(s.saturating_add(window.0 - 1)), Some(window.1))
     } else {
         (end, None)
     };
-    let v = Client::load(peer)?.call(
+    client.call(
         "/v1/fs/read",
         &json!({"path": path, "start": start, "end": end, "max_kb": max_kb, "windowed": windowed}),
         CALL_TIMEOUT,
-    )?;
+    )
+}
+
+fn read(
+    peer: &str,
+    paths: &[String],
+    lines: Option<String>,
+    number: bool,
+    json: bool,
+) -> Result<i32> {
+    let default_range = match lines.as_deref() {
+        Some(spec) => parse_line_range(spec)?,
+        None => (None, None),
+    };
+    let client = Client::load(peer)?;
+    if let [raw] = paths {
+        let (path, range) = split_path_range(raw);
+        if is_image_path(path) {
+            print_image(&fetch_image(&client, peer, path)?, json);
+            return Ok(0);
+        }
+        let range = range.unwrap_or(default_range);
+        let v = read_call(&client, path, range, (READ_WINDOW_LINES, READ_WINDOW_KB))?;
+        print_read(&v, peer, path, number, json, false);
+        return Ok(0);
+    }
+    // 多个文件：共用一个窗口预算，读不下的列出来让调用方另起一次
+    let (mut left_lines, mut left_bytes) = (READ_WINDOW_LINES, READ_WINDOW_KB * 1024);
+    let (mut code, mut files, mut skipped) = (0, Vec::new(), Vec::new());
+    for raw in paths {
+        let (path, range) = split_path_range(raw);
+        let range = range.unwrap_or(default_range);
+        let res = if is_image_path(path) {
+            fetch_image(&client, peer, path)
+        } else if range.1.is_none() && (left_lines == 0 || left_bytes < 1024) {
+            skipped.push(raw.as_str());
+            continue;
+        } else {
+            read_call(&client, path, range, (left_lines, left_bytes / 1024))
+        };
+        let v = match res {
+            Ok(v) => v,
+            Err(e) => {
+                if code == 0 {
+                    code = e.exit_code();
+                }
+                if json {
+                    files.push(json!({"path": path, "error": e.code, "message": e.message}));
+                } else {
+                    eprintln!("{path}: {e}");
+                }
+                continue;
+            }
+        };
+        if v.get("image").is_some() {
+            if json {
+                files.push(v);
+            } else {
+                print_image(&v, false);
+            }
+            continue;
+        }
+        if range.1.is_none() {
+            let (first, last) = (
+                v["start"].as_u64().unwrap_or(1),
+                v["end"].as_u64().unwrap_or(0),
+            );
+            let used = last.saturating_add(1).saturating_sub(first) as usize;
+            left_lines = left_lines.saturating_sub(used);
+            left_bytes =
+                left_bytes.saturating_sub(v["content"].as_str().map_or(0, str::len) as u64);
+        }
+        if json {
+            files.push(v);
+        } else {
+            println!("==> {path} <==");
+            print_read(&v, peer, path, number, false, true);
+        }
+    }
+    if json {
+        println!("{}", json!({"files": files, "skipped": skipped}));
+    } else if !skipped.is_empty() {
+        eprintln!(
+            "[agent-cli-x: shared read window ({READ_WINDOW_LINES} lines / {READ_WINDOW_KB}KB) used up; not read: {}; read them in another call]",
+            skipped.join(" ")
+        );
+    }
+    Ok(code)
+}
+
+/// 打印一次 read 的结果和续读提示。`multi` 时续读提示用 `path#N:` 形式。
+fn print_read(v: &Value, peer: &str, path: &str, number: bool, json: bool, multi: bool) {
     if json {
         println!("{v}");
         if v.get("next_start").is_some() {
-            return Ok(0);
+            return;
         }
     }
     let content = v["content"].as_str().unwrap_or_default();
@@ -1931,13 +2073,22 @@ fn read(peer: &str, path: &str, lines: Option<String>, number: bool, json: bool)
         }
     } else if !json {
         print!("{content}");
+        if multi && !content.is_empty() && !content.ends_with('\n') {
+            println!();
+        }
     }
     let total = v["total_lines"].as_u64();
     let last = v["end"].as_u64().unwrap_or(0);
-    let next_start = next_read_start(&v);
+    let next_start = next_read_start(v);
     if let Some(next) = next_start {
+        let cont = if multi {
+            format!("agent-cli-x read {peer} {path}#{next}:")
+        } else {
+            format!("--lines {next}:")
+        };
         eprintln!(
-            "\n[agent-cli-x: showing lines {first}-{last} of {} ({} lines omitted); continue with --lines {next}:]",
+            "\n[agent-cli-x: {}showing lines {first}-{last} of {} ({} lines omitted); continue with {cont}]",
+            if multi { format!("{path}: ") } else { String::new() },
             total.map(|t| t.to_string()).unwrap_or_else(|| "?".into()),
             v["omitted_lines"].as_u64().map(|n| n.to_string()).unwrap_or_else(|| "at least 1".into()),
         );
@@ -1951,7 +2102,6 @@ fn read(peer: &str, path: &str, lines: Option<String>, number: bool, json: bool)
     {
         eprintln!("[agent-cli-x: old peer cannot return this long line; full text: agent-cli-x get {peer} {path} <local>]");
     }
-    Ok(0)
 }
 
 fn print_info(name: &str, v: &Value) {

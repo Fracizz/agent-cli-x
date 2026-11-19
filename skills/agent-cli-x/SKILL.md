@@ -27,6 +27,7 @@ agent-cli-x desktop windows B --title Codex --max 10  # Windows; policy.desktop_
 agent-cli-x desktop screenshot B --out ./shot.png      # saved on THIS machine; --window ID / --region X,Y,W,H
 agent-cli-x ls   B proj:src --depth 2
 agent-cli-x read B proj:src/main.rs --lines 100:200 -n
+agent-cli-x read B proj:a.rs proj:b.rs#10:80   # several files, one shared window; image paths download locally
 agent-cli-x edit B proj:src/main.rs --old "a" --new "b"   # --all
 agent-cli-x edit B proj:src/main.rs --edits - <<'EOF'  # or --edits f.json; multi-line/several, in order, all or nothing
 [{"old": "fn a()", "new": "fn b()"}, {"old": "x", "new": "y", "all": true}]
@@ -52,7 +53,7 @@ Desktop: physical-pixel coordinates; default 50 windows / 32KB, titles 200 chars
 - Non-interactive (empty stdin, `CI=1`): pass `-y`/`--yes`/`--no-edit`, or it hangs until timeout.
 - Fresh shell per `exec`: use `--cwd`/`--env` or chain steps. Default: Windows `pwsh`, Linux `sh` (`--shell cmd|bash|...`).
 - Prefer file commands: they respect .gitignore, deny rules, permissions and support rollback.
-- `read` before `edit`; `--old` must match exactly once. For concurrent safety pass `--expect-sha` from `read --json`.
+- `read` before `edit`; `--old` must match once (trailing spaces / smart quotes / dashes are tolerated). `write` creates parent dirs. For concurrent safety pass `--expect-sha` from `read --json`.
 - `rm --permanent` only when the user asks; to free space after `rm`, use `purge <peer> <op_id>`.
 - Timeout kills the process tree (exit 104); raise `--timeout` or use `--detach` for anything over a few minutes.
 - `exec` runs with the full rights of the `serve` user. Do not use it to change read-only/denied paths unless the user asked for exactly that, and say so.
