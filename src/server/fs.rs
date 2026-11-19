@@ -517,7 +517,7 @@ pub fn grep(ctx: &Ctx, body: Value) -> Result<Value> {
         let Ok(data) = fs::read(item.path()) else {
             continue;
         };
-        if data[..data.len().min(8192)].contains(&0) {
+        if looks_binary(&data) {
             continue;
         }
         files_scanned += 1;
@@ -549,6 +549,24 @@ pub fn grep(ctx: &Ctx, body: Value) -> Result<Value> {
 }
 
 // ---------------- read ----------------
+
+/// 按文件开头（最多 8KB）判断是否二进制：含 NUL，或异常控制字符占比超过 5%。
+/// 文本（UTF-8 / GBK / Latin-1 / 带 ANSI 颜色的日志）几乎不含 `\t \n \r \f \v ESC BS` 以外的控制字符，
+/// 随机或压缩数据约 10% 是控制字符；只看 NUL 会把小的无 NUL 二进制文件当成文本输出乱码。
+fn looks_binary(data: &[u8]) -> bool {
+    let head = &data[..data.len().min(8192)];
+    if head.contains(&0) {
+        return true;
+    }
+    let ctrl = head
+        .iter()
+        .filter(|&&b| {
+            (b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r' | 0x0B | 0x0C | 0x1B | 0x08))
+                || b == 0x7F
+        })
+        .count();
+    ctrl * 20 > head.len()
+}
 
 #[derive(Deserialize)]
 struct ReadReq {
@@ -658,7 +676,7 @@ pub fn read(ctx: &Ctx, body: Value) -> Result<Value> {
     let mut file = fs::File::open(&r.abs)?;
     let mut head = vec![0u8; 8192.min(size as usize)];
     file.read_exact(&mut head)?;
-    if head.contains(&0) {
+    if looks_binary(&head) {
         return Err(AppError::bad_request(format!(
             "{} looks binary; read supports text only; download with `agent-cli-x get <peer> {} <local>`",
             r.display(),
@@ -1359,6 +1377,25 @@ mod tests {
         let o = apply_edit("a\nb\nc\n", "b\n", "B\n", false).unwrap();
         assert_eq!(o.text, "a\nB\nc\n");
         assert_eq!(o.first_line, 2);
+    }
+
+    #[test]
+    fn binary_detection() {
+        assert!(!looks_binary(b""));
+        assert!(!looks_binary(
+            "中文 text\twith tabs\r\n\x1b[31mred\x1b[0m\n".as_bytes()
+        ));
+        // GBK 编码的中文不是 UTF-8，但仍是文本
+        assert!(!looks_binary(&[
+            0xD6, 0xD0, 0xCE, 0xC4, b'\n', 0xB2, 0xE2, 0xCA, 0xD4
+        ]));
+        assert!(looks_binary(b"abc\0def"));
+        // 无 NUL 的二进制：控制字符占比高
+        let bin: Vec<u8> = (1u8..=255).collect();
+        assert!(looks_binary(&bin));
+        assert!(looks_binary(&[
+            0x89, b'P', b'N', b'G', 0x01, 0x02, 0x03, 0x1A, 0x05
+        ]));
     }
 
     #[test]

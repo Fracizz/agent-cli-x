@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.0.14
+
+- Detect binary files that contain no NUL bytes (more than 5% unexpected control characters in the first 8KB), so `read` returns the `get` hint instead of garbage and `grep` skips them. Non-UTF-8 text such as GBK is still read as text.
+
 ## 0.0.13
 
 - `edit` falls back to a tolerant match (trailing whitespace, smart quotes, dashes, special spaces) when the exact text is not found; only the matched span is replaced and the result carries `fuzzy: true`.

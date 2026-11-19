@@ -1128,6 +1128,12 @@ fn agent_friendly_fs(env: &Env) {
     fs::write(env.ws.join("af/blob.bin"), [0u8, 1, 2]).unwrap();
     let o = run(c, &["read", "b", "proj:af/blob.bin"]);
     assert!(text(&o).contains("agent-cli-x get"), "{}", text(&o));
+    // 不含 NUL 的小二进制文件同样识别为二进制，不输出乱码
+    let nonul: Vec<u8> = (1u8..=255).cycle().take(100).collect();
+    fs::write(env.ws.join("af/nonul.bin"), nonul).unwrap();
+    let o = run(c, &["read", "b", "proj:af/nonul.bin"]);
+    assert_eq!(o.status.code(), Some(110), "{}", text(&o));
+    assert!(o.stdout.is_empty());
 
     // 同一文件并发 edit：全部成功且互不覆盖
     let body: String = (0..8).map(|i| format!("line{i}\n")).collect();
