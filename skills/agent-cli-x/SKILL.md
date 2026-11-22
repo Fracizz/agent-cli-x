@@ -8,7 +8,7 @@ description: Run commands, search, read/edit, transfer files and capture Windows
 Remote commands/files over pinned TLS. Put `agent-cli-x` on `PATH`.
 
 ```bash
-agent-cli-x peer list          # cached name/id, OS/arch, shell
+agent-cli-x peer list [query]  # cached name/id, OS/arch, shell; filter by name/IP/OS/remark, exit 1 = none
 agent-cli-x info <peer>        # live permissions, workspaces, jobs; @all = online peers
 ```
 

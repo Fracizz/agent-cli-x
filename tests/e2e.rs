@@ -619,6 +619,30 @@ fn identity_grep_transfer_jobs() {
             .unwrap()
     };
     let b = cached(c);
+
+    // peer list 模糊过滤：名称/IP/OS 不区分大小写子串，多词需同时命中，无匹配退出 1
+    let os = info["os"].as_str().unwrap().to_uppercase();
+    for q in [
+        vec!["B"],
+        vec!["127.0.0"],
+        vec![os.as_str()],
+        vec!["b", os.as_str()],
+    ] {
+        let mut args = vec!["peer", "list", "--json"];
+        args.extend(q.iter().copied());
+        let out = run(c, &args);
+        assert!(out.status.success(), "{q:?}: {}", text(&out));
+        let list = json_of(&out);
+        assert!(
+            list.as_array().unwrap().iter().any(|p| p["name"] == "b"),
+            "{q:?}: {list}"
+        );
+    }
+    let none = run(c, &["peer", "list", "no-such-peer-xyz"]);
+    assert_eq!(none.status.code(), Some(1), "{}", text(&none));
+    assert!(none.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&none.stderr).contains("No peer matches"));
+
     assert_eq!(b["os"], info["os"]);
     assert_eq!(b["arch"], info["arch"]);
     assert_eq!(b["shell"], info["shell"]);

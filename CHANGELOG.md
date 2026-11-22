@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.0.15
+
+- `peer list [query...]` filters peers by case-insensitive substring of name, node name, IP:port, OS or remark (several terms must all match); exits 1 when nothing matches. Also applies to `--json`.
+
 ## 0.0.14
 
 - Detect binary files that contain no NUL bytes (more than 5% unexpected control characters in the first 8KB), so `read` returns the `get` hint instead of garbage and `grep` skips them. Non-UTF-8 text such as GBK is still read as text.

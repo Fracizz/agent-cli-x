@@ -395,8 +395,12 @@ enum PeerCmd {
         #[arg(long)]
         remark: Option<String>,
     },
-    /// List registered peers
-    List,
+    /// List registered peers; optional fuzzy filter (case-insensitive substring of
+    /// name / node name / IP:port / OS / remark; several terms must all match). Exit 1 = none
+    List {
+        /// e.g. `prod`, `10.0.0`, `windows`, `linux 192.168`
+        query: Vec<String>,
+    },
     /// Remove a peer
     Remove { name: String },
 }
@@ -1392,6 +1396,24 @@ fn set_port(peer: &str, port: u16, json: bool) -> Result<i32> {
     Ok(0)
 }
 
+/// `peer list` 的模糊匹配：每个（已小写的）词都要命中名称、节点名、地址、OS 或备注之一。
+fn peer_matches(name: &str, p: &config::Peer, terms: &[String]) -> bool {
+    let fields: Vec<String> = [
+        Some(name),
+        p.node_name.as_deref(),
+        Some(p.addr.as_str()),
+        p.os.as_deref(),
+        p.remark.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::to_lowercase)
+    .collect();
+    terms
+        .iter()
+        .all(|t| fields.iter().any(|f| f.contains(t.as_str())))
+}
+
 fn peer(cmd: PeerCmd, json: bool) -> Result<i32> {
     let home = config::home_dir();
     match cmd {
@@ -1495,7 +1517,7 @@ fn peer(cmd: PeerCmd, json: bool) -> Result<i32> {
             }
             Ok(0)
         }
-        PeerCmd::List => {
+        PeerCmd::List { query } => {
             let mut peers = config::load_peers(&home)?;
             // 缓存缺系统信息的对端（旧版本登记的）：联网补全。补不全（离线或对端太旧）的
             // 记下尝试时间，24 小时内不再重试，避免每次 peer list 都卡在连接超时上
@@ -1537,6 +1559,23 @@ fn peer(cmd: PeerCmd, json: bool) -> Result<i32> {
                         "[agent-cli-x: fetched system info for {}]",
                         names.join(", ")
                     );
+                }
+            }
+            // 模糊过滤：在补全系统信息之后做，这样旧对端也能按 OS 命中
+            let terms: Vec<String> = query
+                .iter()
+                .flat_map(|q| q.split_whitespace())
+                .map(str::to_lowercase)
+                .collect();
+            if !terms.is_empty() {
+                let total = peers.peers.len();
+                peers.peers.retain(|n, p| peer_matches(n, p, &terms));
+                if peers.peers.is_empty() {
+                    eprintln!(
+                        "No peer matches `{}` ({total} registered; matched against name/node name/IP/OS/remark). Run `agent-cli-x peer list` to see all",
+                        terms.join(" ")
+                    );
+                    return Ok(1);
                 }
             }
             if json {
