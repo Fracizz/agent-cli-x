@@ -1,18 +1,10 @@
 # agent-cli-x
 
-A small, single-binary CLI that lets AI agents on different machines (Windows or Linux) run commands and edit files on each other.
+**English** · [简体中文](README.zh-CN.md)
 
-```
-Machine A: Claude Code ──> agent-cli-x ──TLS──> Machine B: agent-cli-x serve ──> exec / read / edit
-Machine B: Codex       ──> agent-cli-x ──TLS──> Machine A: agent-cli-x serve ──> exec / read / edit
-```
+Run a build or test on another machine, inspect its logs, or edit files in a registered project from your current terminal. `agent-cli-x` is a single binary for the caller and the remote host, with output limits designed for AI coding agents.
 
-- **One binary, both roles.** Every machine runs `agent-cli-x serve`, and every machine can call its peers.
-- **Lightweight.** Synchronous std + rustls, no async runtime, no OpenSSL. Short-lived HTTPS request per call.
-- **Machine identity.** Every node has a configurable `node_name` and a random short `node_id` (6 hex chars), so agents know exactly which machine they are talking to.
-- **Built for agents.** Exit codes pass through, long output is trimmed to head/tail (also with `--json`) with the full log saved locally, `read` and `ls` return bounded windows by default (several files per `read`), `edit` with exact match first and a whitespace/quote-tolerant fallback, `rollback`.
-- **Many machines.** Run one command on several peers at once (`exec A,B,C` / `@all`), issue a separate revocable token per caller, push upgrades remotely, and check everything with `doctor`.
-- **Guard rails.** Token auth, self-signed TLS with fingerprint pinning, workspace allow-list, path deny-list, command deny-list, automatic backups, audit log.
+[Download for Windows or Linux](https://github.com/Fracizz/agent-cli-x/releases/latest) · [Quick start](#quick-start) · [Agent Skill](skills/agent-cli-x/SKILL.md) · [Security model](#security-model)
 
 ## Install
 
@@ -33,34 +25,41 @@ Having it on `PATH` lets agents call `agent-cli-x` from any working directory.
 
 ## Quick start
 
-On **each** machine:
+Install the binary on both machines. On the host where the project lives, run these commands as the user who should run builds. Replace the workspace path with your project directory and make the listener reachable on your trusted network.
 
 ```bash
-agent-cli-x init --name build-01 --workspace proj=/home/me/proj   # prints node id, token, fingerprint
-agent-cli-x serve                                   # background by default; set up start at boot (see below)
+agent-cli-x init --name build-01 --workspace proj=/home/me/proj
+agent-cli-x serve
+agent-cli-x token add dev-workstation
 ```
 
-`serve` runs in the background by default, without a console window on Windows, and survives closing the launching terminal. It prints the PID only after the listener is ready (`--json`: `{"pid":1234}`); startup failures return the original error code. Logs stay in `~/.agent-cli-x/serve-logs/`. Use `serve --foreground` for troubleshooting and service managers; `--background` remains an explicit alias for the default.
-
-`init` prints a ready-to-paste `peer add` command. To give each caller its own token instead, run on B:
+Verify the fingerprint on the build host with `agent-cli-x fingerprint`. On the calling machine, run the pairing command printed by `token add`, using the verified fingerprint and a reachable address. Then check the connection and run a test in the registered workspace.
 
 ```bash
-agent-cli-x token add A          # prints the exact `peer add` command for machine A
+agent-cli-x info build-01
+agent-cli-x exec build-01 --cwd proj: cargo test
 ```
 
-Then on the machine that wants to call B (A here):
+`build-01` is the peer name in the pairing command. Use the name you registered if it differs. A managed host can print its original pairing command again with `agent-cli-x whoami --pair`.
 
-```bash
-agent-cli-x peer add B 10.0.0.5:47821 --token <token> --fingerprint <B's fingerprint>
-agent-cli-x info B
-agent-cli-x exec B cargo test
+`serve` starts in the background by default and survives closing the terminal. It prints the PID after the listener is ready (`--json`: `{"pid":1234}`). Use `serve --foreground` for troubleshooting or service managers. Logs live in `~/.agent-cli-x/serve-logs/`. To keep the host reachable after a reboot, [set up start at boot](#start-at-boot-recommended) and run `agent-cli-x doctor`.
+
+To give an agent the command reference, install [the Skill](skills/agent-cli-x/SKILL.md) in its skills folder or print it with `agent-cli-x skill`.
+
+## How it works
+
+```text
+Caller (Codex, Claude Code, or shell) → agent-cli-x → pinned TLS → agent-cli-x serve → project
 ```
 
-Without `--fingerprint`, `peer add` only prints the fingerprint it sees. Compare it with `agent-cli-x fingerprint` on B before registering. `agent-cli-x whoami --pair` prints the command again later.
+Each host can run the same binary as a client and server. Pairing authorises a caller in one direction. See [Multiple machines](#multiple-machines) to set up access in both directions.
 
-Set up [start at boot](#start-at-boot-recommended) on every machine, then run `agent-cli-x doctor` to verify.
-
-Then teach your agent the tool: copy [`skills/agent-cli-x/SKILL.md`](skills/agent-cli-x/SKILL.md) into its skills folder (e.g. `~/.claude/skills/agent-cli-x/`), or run `agent-cli-x skill` to print it.
+- **One binary, both roles.** Every machine runs `agent-cli-x serve`, and every machine can call its peers.
+- **Lightweight.** Synchronous std + rustls, no async runtime, no OpenSSL. Short-lived HTTPS request per call.
+- **Machine identity.** Every node has a configurable `node_name` and a random short `node_id` (6 hex chars), so agents know exactly which machine they are talking to.
+- **Built for agents.** Exit codes pass through, long output is trimmed to head/tail (also with `--json`) with the full log saved locally, `read` and `ls` return bounded windows by default (several files per `read`), `edit` with exact match first and a whitespace/quote-tolerant fallback, `rollback`.
+- **Many machines.** Run one command on several peers at once (`exec A,B,C` / `@all`), issue a separate revocable token per caller, push upgrades remotely, and check everything with `doctor`.
+- **Guard rails.** Token auth, self-signed TLS with fingerprint pinning, workspace allow-list, path deny-list, command deny-list, automatic backups, audit log.
 
 ## Commands
 
@@ -308,4 +307,4 @@ Remote exit codes pass through. agent-cli-x's own errors: 100 connect, 101 auth,
 
 ## License
 
-MIT
+[MIT](LICENSE)
