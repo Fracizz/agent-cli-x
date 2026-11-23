@@ -1148,7 +1148,9 @@ fn init(
     println!("  1. Edit the config: register accessible dirs under [workspaces]; adjust deny_paths / [[policy.paths]] / deny_commands as needed");
     println!("  2. Run `agent-cli-x serve`");
     println!("  3. On the machine that will access this one (per-caller token: `agent-cli-x token add <name>`):");
-    println!("     {}", pair_command(&node_name, listen, &token, &fp));
+    let (cmd, others) = pair_command(&node_name, listen, &token, &fp);
+    println!("     {cmd}");
+    print_other_ips(&others);
     println!("  4. Set up autostart (see README 'Start at boot'), then run `agent-cli-x doctor`");
     if cfg!(windows) {
         println!("  Firewall (run once in admin PowerShell; allows the program, so port changes need no update):");
@@ -1159,15 +1161,32 @@ fn init(
     Ok(0)
 }
 
-/// 其他机器登记本机所需的 `peer add` 命令。监听全部网卡时用本机主 IP。
-fn pair_command(node_name: &str, listen: &str, token: &str, fp: &str) -> String {
+/// 其他机器登记本机所需的 `peer add` 命令。监听全部网卡时挑选最可能被访问到的网卡地址
+/// （避开 VPN/代理 TUN 等虚拟网卡），其余候选地址在第二项返回，供调用方访问不通时替换。
+fn pair_command(node_name: &str, listen: &str, token: &str, fp: &str) -> (String, Vec<String>) {
     let port = listen.rsplit(':').next().unwrap_or_default();
     let host = listen[..listen.len() - port.len()].trim_end_matches(':');
-    let ip = match host {
-        "" | "0.0.0.0" | "[::]" => util::local_ip().unwrap_or_else(|| "<local-IP>".into()),
-        h => h.to_string(),
+    let (ip, others) = match host {
+        "" | "0.0.0.0" | "[::]" => {
+            let (best, others) = crate::netif::pair_ips();
+            (best.unwrap_or_else(|| "<local-IP>".into()), others)
+        }
+        h => (h.to_string(), Vec::new()),
     };
-    format!("agent-cli-x peer add {node_name} {ip}:{port} --token {token} --fingerprint {fp}")
+    (
+        format!("agent-cli-x peer add {node_name} {ip}:{port} --token {token} --fingerprint {fp}"),
+        others,
+    )
+}
+
+/// 普通输出：其他候选地址走 stderr，一行。
+fn print_other_ips(others: &[String]) {
+    if !others.is_empty() {
+        eprintln!(
+            "Other local IPs (replace the address if unreachable): {}",
+            others.join(", ")
+        );
+    }
 }
 
 fn whoami(pair: bool, json: bool) -> Result<i32> {
@@ -1175,6 +1194,7 @@ fn whoami(pair: bool, json: bool) -> Result<i32> {
     config::ensure_node_id(&home)?;
     let cfg = config::load_config(&home)?;
     let fp = tls::local_fingerprint(&home).unwrap_or_default();
+    let pc = pair.then(|| pair_command(&cfg.node_name(), &cfg.listen, &cfg.token, &fp));
     let v = json!({
         "node_name": cfg.node_name(),
         "node_id": cfg.node_id,
@@ -1184,7 +1204,8 @@ fn whoami(pair: bool, json: bool) -> Result<i32> {
         "fingerprint": fp,
         "workspaces": cfg.workspaces,
         "version": http::VERSION,
-        "pair_command": pair.then(|| pair_command(&cfg.node_name(), &cfg.listen, &cfg.token, &fp)),
+        "pair_command": pc.as_ref().map(|p| &p.0),
+        "other_ips": pc.as_ref().map(|p| &p.1).filter(|o| !o.is_empty()),
     });
     if json {
         println!("{v}");
@@ -1201,12 +1222,10 @@ fn whoami(pair: bool, json: bool) -> Result<i32> {
         for (n, p) in &cfg.workspaces {
             println!("  Workspace {n} = {p}");
         }
-        if pair {
+        if let Some((cmd, others)) = &pc {
             println!("  On the machine that will access this one:");
-            println!(
-                "    {}",
-                pair_command(&cfg.node_name(), &cfg.listen, &cfg.token, &fp)
-            );
+            println!("    {cmd}");
+            print_other_ips(others);
         }
     }
     Ok(0)
@@ -1227,10 +1246,13 @@ fn token(cmd: TokenCmd, json: bool) -> Result<i32> {
     let fp = tls::local_fingerprint(&home)?;
     let mut tokens = config::load_tokens(&home)?;
     let issued = |name: &str, tok: &str, verb: &str, expires: Option<u64>| {
-        let cmd = pair_command(&cfg.node_name(), &cfg.listen, tok, &fp);
+        let (cmd, others) = pair_command(&cfg.node_name(), &cfg.listen, tok, &fp);
         let exp = expires.map(util::unix_iso);
         if json {
             let mut v = json!({"name": name, "token": tok, "pair_command": cmd});
+            if !others.is_empty() {
+                v["other_ips"] = json!(others);
+            }
             if let Some(e) = &exp {
                 v["expires"] = json!(e);
             }
@@ -1244,6 +1266,7 @@ fn token(cmd: TokenCmd, json: bool) -> Result<i32> {
             }
             println!("Run on the caller (token shown only once):");
             println!("  {cmd}");
+            print_other_ips(&others);
         }
     };
     let code_expiry =

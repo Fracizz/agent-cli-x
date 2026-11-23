@@ -8,6 +8,7 @@ mod error;
 mod firewall;
 mod frame;
 mod http;
+mod netif;
 mod platform;
 mod server;
 mod tls;

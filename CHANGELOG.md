@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.0.17
+
+- Pairing commands (`init`, `whoami --pair`, `token add/rotate`) no longer pick a VPN/proxy TUN address (sing-box, Clash, WireGuard, etc.) when the system route goes through it: local interfaces are ranked by gateway, adapter type and name. Other candidate IPs are printed on stderr (JSON: `other_ips`).
+
 ## 0.0.16
 
 - Authorization codes: `token add <name> --code [--ttl 4h|8h]` issues a temporary full-access token (default 4h, optional 8h). Expired codes are rejected with exit code 101 and a renewal hint; `token rotate <name> [--ttl ...]` renews one. `token list` shows the expiry.
