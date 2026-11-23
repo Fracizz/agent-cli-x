@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `workspace add` keeps the previous sole workspace as the default (writes `default_workspace`) when a second one is added without `--default`.
+
 ## 0.0.18
 
 - Workspaces work out of the box: with none configured, the user's home directory (`%USERPROFILE%` / `$HOME`) is served as workspace `home` (read/write), so a freshly initialized, authorized machine can be used immediately.

@@ -49,10 +49,20 @@ pub fn add_to(
         .or_insert_with(|| Item::Table(Table::new()))
         .as_table_like_mut()
         .ok_or_else(|| AppError::config("`workspaces` in config.toml is not a table"))?;
+    // 原来只有一个工作区、靠“唯一即默认”生效时，加入第二个会让默认工作区消失；
+    // 把原来那个显式写成 default_workspace，不带前缀的路径和不带 --cwd 的 exec 照常可用
+    let implicit_default = match ws.iter().map(|(k, _)| k.to_string()).collect::<Vec<_>>() {
+        only if only.len() == 1 && only[0] != name => Some(only[0].clone()),
+        _ => None,
+    };
     ws.insert(name, value(path));
+    // 根表的键总是渲染在第一个 [表] 之前，不会落进别的表
     if default {
-        // 根表的键总是渲染在第一个 [表] 之前，不会落进别的表
         doc["default_workspace"] = value(name);
+    } else if let Some(prev) = implicit_default {
+        if doc.get("default_workspace").is_none() {
+            doc["default_workspace"] = value(prev);
+        }
     }
     if let Some(allow) = allow {
         let policy = doc
@@ -268,6 +278,24 @@ mod tests {
         assert_eq!(c.workspaces["proj"], "/srv/p");
         assert_eq!(c.default_workspace.as_deref(), Some("proj"));
         assert_eq!(c.policy.max_jobs, 4);
+    }
+
+    #[test]
+    fn second_workspace_keeps_the_implicit_default() {
+        let p = Path::new("config.toml");
+        let t = add_to(BASE, p, "aa", "/a", false, None).unwrap();
+        assert_eq!(cfg(&t).default_workspace, None, "唯一的工作区本来就是默认");
+        let t = add_to(&t, p, "bb", "/b", false, None).unwrap();
+        assert_eq!(cfg(&t).default_workspace.as_deref(), Some("aa"));
+        // 已有显式默认、或要求新工作区作默认时不改动
+        let t = add_to(&t, p, "cc", "/c", false, None).unwrap();
+        assert_eq!(cfg(&t).default_workspace.as_deref(), Some("aa"));
+        let t = add_to(&t, p, "dd", "/d", true, None).unwrap();
+        assert_eq!(cfg(&t).default_workspace.as_deref(), Some("dd"));
+        // 更新唯一工作区的路径不算加入第二个
+        let t = add_to(BASE, p, "aa", "/a", false, None).unwrap();
+        let t = add_to(&t, p, "aa", "/a2", false, None).unwrap();
+        assert_eq!(cfg(&t).default_workspace, None);
     }
 
     #[test]
