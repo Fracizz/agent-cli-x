@@ -1281,6 +1281,72 @@ fn tokens_multi_peer_doctor() {
         text(&o)
     );
 
+    // 授权码：默认 4h、可选 8h，其他时长拒绝；到期后返回 101 并给出续期命令
+    assert!(!run(s, &["token", "add", "tmp", "--code", "--ttl", "2h"])
+        .status
+        .success());
+    assert!(!run(s, &["token", "add", "tmp", "--ttl", "8h"])
+        .status
+        .success());
+    let o = run(
+        s,
+        &["token", "add", "tmp", "--code", "--ttl", "8h", "--json"],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    let v = json_of(&o);
+    assert!(v["expires"].as_str().unwrap().ends_with('Z'), "{v}");
+    let code = v["token"].as_str().unwrap().to_string();
+    let o = run(
+        c,
+        &[
+            "peer",
+            "add",
+            "b3",
+            &env.listen,
+            "--token",
+            &code,
+            "--fingerprint",
+            &env.fp,
+        ],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(run(c, &["exec", "b3", "echo via-code"]).status.success());
+    let list = json_of(&run(s, &["token", "list", "--json"]));
+    let item = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["name"] == "tmp")
+        .cloned()
+        .unwrap();
+    assert_eq!(item["expired"], false, "{list}");
+    // 改写到期时间模拟过期（serve 热加载 tokens.toml）
+    let tp = s.join("tokens.toml");
+    let t = fs::read_to_string(&tp).unwrap();
+    let t: String = t
+        .lines()
+        .map(|l| {
+            if l.starts_with("expires") {
+                "expires = 1".to_string()
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&tp, t).unwrap();
+    let o = wait_code(c, &["info", "b3"], 101);
+    assert_eq!(o.status.code(), Some(101), "{}", text(&o));
+    assert!(text(&o).contains("token rotate tmp"), "{}", text(&o));
+    let o = run(s, &["token", "rotate", "tmp", "--json"]);
+    assert!(json_of(&o)["expires"].is_string(), "{}", text(&o));
+    assert_eq!(
+        run(s, &["token", "rotate", "caller1", "--ttl", "4h"])
+            .status
+            .code(),
+        Some(110)
+    );
+
     // 吊销后几秒内失效，另一个 token 不受影响
     assert!(run(s, &["token", "remove", "caller1"]).status.success());
     let o = wait_code(c, &["info", "b2"], 101);

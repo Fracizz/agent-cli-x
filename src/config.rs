@@ -703,7 +703,20 @@ pub struct TokenEntry {
     /// 或管理本机凭据（防 AI 误操作，不是安全边界）。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_relay: bool,
+    /// 授权码模式：到期时间（Unix 秒）。为空表示长期有效。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires: Option<u64>,
 }
+
+impl TokenEntry {
+    /// 授权码已到期（长期 token 永不到期）。
+    pub fn expired(&self, now: u64) -> bool {
+        self.expires.is_some_and(|e| now >= e)
+    }
+}
+
+/// 授权码允许的有效期（小时）：默认 4，可选 8。
+pub const CODE_TTL_HOURS: [u64; 2] = [4, 8];
 
 /// exec 子进程中的标记环境变量：值为被禁止借道的调用方名称。
 /// 客户端检测到它时只允许不联网、不涉及凭据的命令。

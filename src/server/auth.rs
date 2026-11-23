@@ -16,8 +16,16 @@ struct Inner {
     cfg_mtime: Option<SystemTime>,
     tok_mtime: Option<SystemTime>,
     default: String,
-    /// (名称, token 的 sha256, 是否禁止借道)
-    named: Vec<(String, String, bool)>,
+    /// (名称, token 的 sha256, 是否禁止借道, 授权码到期时间)
+    named: Vec<(String, String, bool, Option<u64>)>,
+}
+
+/// 鉴权结果。
+pub enum Check {
+    Ok(Caller),
+    /// 授权码已过期（携带名称，便于给出续期命令）
+    Expired(String),
+    Invalid,
 }
 
 /// 通过鉴权的调用方。
@@ -66,7 +74,7 @@ impl Auth {
                     .tokens
                     .into_iter()
                     .filter(|(n, _)| n != DEFAULT_TOKEN_NAME)
-                    .map(|(n, e)| (n, e.sha256.to_ascii_lowercase(), e.no_relay))
+                    .map(|(n, e)| (n, e.sha256.to_ascii_lowercase(), e.no_relay, e.expires))
                     .collect();
             }
             // 解析失败时保留旧列表，避免一次误编辑让所有调用方掉线
@@ -93,10 +101,10 @@ impl Auth {
         }
     }
 
-    /// 校验 token，成功时返回调用方。
-    pub fn check(&self, got: &str) -> Option<Caller> {
+    /// 校验 token，成功时返回调用方；授权码到期返回 `Expired(名称)`。
+    pub fn check(&self, got: &str) -> Check {
         if got.is_empty() {
-            return None;
+            return Check::Invalid;
         }
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         self.maybe_reload(&mut g);
@@ -108,14 +116,24 @@ impl Auth {
             });
         }
         let h = util::sha256_hex(got.as_bytes());
-        for (name, sha, no_relay) in &g.named {
-            if util::ct_eq(h.as_bytes(), sha.as_bytes()) && who.is_none() {
-                who = Some(Caller {
-                    name: name.clone(),
-                    no_relay: *no_relay,
-                });
+        let now = util::unix_now();
+        let mut expired = None;
+        for (name, sha, no_relay, expires) in &g.named {
+            if util::ct_eq(h.as_bytes(), sha.as_bytes()) && who.is_none() && expired.is_none() {
+                if expires.is_some_and(|e| now >= e) {
+                    expired = Some(name.clone());
+                } else {
+                    who = Some(Caller {
+                        name: name.clone(),
+                        no_relay: *no_relay,
+                    });
+                }
             }
         }
-        who
+        match (who, expired) {
+            (Some(c), _) => Check::Ok(c),
+            (None, Some(n)) => Check::Expired(n),
+            (None, None) => Check::Invalid,
+        }
     }
 }

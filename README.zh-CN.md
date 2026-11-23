@@ -35,6 +35,8 @@ agent-cli-x info build-01
 agent-cli-x exec build-01 --cwd proj: cargo test
 ```
 
+临时授权可改用授权码：`agent-cli-x token add guest --code` 签发全权限临时令牌，默认 4 小时有效，`--ttl 8h` 延长到 8 小时；到期后调用返回 101，用 `token rotate guest` 续期。
+
 如果配对时用了其他名字，把 `build-01` 换成登记的名字。需要再次查看默认令牌的配对命令时，在项目主机运行 `agent-cli-x whoami --pair`。
 
 `serve` 默认在后台运行，监听就绪后返回 PID，关掉终端仍可继续运行。日志在 `~/.agent-cli-x/serve-logs/`。排查问题或交给服务管理器时用 `serve --foreground`。配置重启后自动启动，可参考 [Linux systemd 与 Windows 任务计划程序示例](README.md#start-at-boot-recommended)，再运行 `agent-cli-x doctor` 验证。

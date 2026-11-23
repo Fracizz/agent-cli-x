@@ -62,4 +62,4 @@ Desktop: physical-pixel coordinates; default 50 windows / 32KB, titles 200 chars
 
 ## Exit codes
 
-other = remote command's code · 100 cannot connect · 101 bad token · 102 denied by policy · 103 not found · 104 timeout (upgrade/restart: not back yet, check `info` later) · 105 conflict (edit match / sha / jobs running on upgrade) · 106 cert fingerprint mismatch: ask a human, never re-register · 107 I/O · 108 internal · 109 config (unknown peer) · 110 bad arguments · 111 busy · 112 desktop unavailable (unlock/connect user session) · 113 unsupported OS · 137 job killed
+other = remote command's code · 100 cannot connect · 101 bad/expired token (authorization code: ask a human to renew) · 102 denied by policy · 103 not found · 104 timeout (upgrade/restart: not back yet, check `info` later) · 105 conflict (edit match / sha / jobs running on upgrade) · 106 cert fingerprint mismatch: ask a human, never re-register · 107 I/O · 108 internal · 109 config (unknown peer) · 110 bad arguments · 111 busy · 112 desktop unavailable (unlock/connect user session) · 113 unsupported OS · 137 job killed

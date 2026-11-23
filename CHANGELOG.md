@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.0.16
+
+- Authorization codes: `token add <name> --code [--ttl 4h|8h]` issues a temporary full-access token (default 4h, optional 8h). Expired codes are rejected with exit code 101 and a renewal hint; `token rotate <name> [--ttl ...]` renews one. `token list` shows the expiry.
+
 ## 0.0.15
 
 - `peer list [query...]` filters peers by case-insensitive substring of name, node name, IP:port, OS or remark (several terms must all match); exits 1 when nothing matches. Also applies to `--json`.

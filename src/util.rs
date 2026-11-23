@@ -92,8 +92,25 @@ pub fn utc_parts(t: SystemTime) -> (i64, u32, u32, u32, u32, u32) {
 }
 
 pub fn now_iso() -> String {
-    let (y, mo, d, h, mi, s) = utc_parts(SystemTime::now());
+    iso(SystemTime::now())
+}
+
+pub fn iso(t: SystemTime) -> String {
+    let (y, mo, d, h, mi, s) = utc_parts(t);
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
+/// 当前 Unix 秒。
+pub fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Unix 秒转 ISO 时间（UTC）。
+pub fn unix_iso(secs: u64) -> String {
+    iso(UNIX_EPOCH + std::time::Duration::from_secs(secs))
 }
 
 pub fn today() -> String {

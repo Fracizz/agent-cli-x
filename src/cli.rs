@@ -413,6 +413,12 @@ enum TokenCmd {
         /// No relay: this caller's exec on this machine can't use agent-cli-x to reach other nodes or manage credentials
         #[arg(long)]
         no_relay: bool,
+        /// Authorization code: temporary full-access token that expires after --ttl (default 4h)
+        #[arg(long)]
+        code: bool,
+        /// Authorization code lifetime: 4h (default) or 8h
+        #[arg(long, requires = "code", value_parser = parse_code_ttl)]
+        ttl: Option<u64>,
     },
     /// Change restrictions of an issued token (token unchanged)
     Set {
@@ -428,8 +434,13 @@ enum TokenCmd {
     List,
     /// Revoke a caller's token (takes effect within seconds on a running serve)
     Remove { name: String },
-    /// Rotate a token (name `default` rotates the default token in config.toml)
-    Rotate { name: String },
+    /// Rotate a token (name `default` rotates the default token in config.toml); an authorization code is renewed for --ttl
+    Rotate {
+        name: String,
+        /// Authorization code lifetime after renewal: 4h (default) or 8h
+        #[arg(long, value_parser = parse_code_ttl)]
+        ttl: Option<u64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1201,26 +1212,49 @@ fn whoami(pair: bool, json: bool) -> Result<i32> {
     Ok(0)
 }
 
+/// 授权码有效期：只接受 4h / 8h（也接受不带单位的 4 / 8），返回小时数。
+fn parse_code_ttl(s: &str) -> std::result::Result<u64, String> {
+    let n = s.trim().trim_end_matches(['h', 'H']);
+    match n.parse::<u64>() {
+        Ok(h) if config::CODE_TTL_HOURS.contains(&h) => Ok(h),
+        _ => Err("must be 4h or 8h".into()),
+    }
+}
+
 fn token(cmd: TokenCmd, json: bool) -> Result<i32> {
     let home = config::home_dir();
     let cfg = config::load_config(&home)?;
     let fp = tls::local_fingerprint(&home)?;
     let mut tokens = config::load_tokens(&home)?;
-    let issued = |name: &str, tok: &str, verb: &str| {
+    let issued = |name: &str, tok: &str, verb: &str, expires: Option<u64>| {
         let cmd = pair_command(&cfg.node_name(), &cfg.listen, tok, &fp);
+        let exp = expires.map(util::unix_iso);
         if json {
-            println!(
-                "{}",
-                json!({"name": name, "token": tok, "pair_command": cmd})
-            );
+            let mut v = json!({"name": name, "token": tok, "pair_command": cmd});
+            if let Some(e) = &exp {
+                v["expires"] = json!(e);
+            }
+            println!("{v}");
         } else {
-            println!("{verb} token `{name}`: {tok}");
+            match &exp {
+                Some(e) => {
+                    println!("{verb} authorization code `{name}` (full access, expires {e}): {tok}")
+                }
+                None => println!("{verb} token `{name}`: {tok}"),
+            }
             println!("Run on the caller (token shown only once):");
             println!("  {cmd}");
         }
     };
+    let code_expiry =
+        |hours: Option<u64>| util::unix_now() + hours.unwrap_or(config::CODE_TTL_HOURS[0]) * 3600;
     match cmd {
-        TokenCmd::Add { name, no_relay } => {
+        TokenCmd::Add {
+            name,
+            no_relay,
+            code,
+            ttl,
+        } => {
             config::validate_name(&name, "token")?;
             if name == DEFAULT_TOKEN_NAME || tokens.tokens.contains_key(&name) {
                 return Err(AppError::conflict(format!(
@@ -1234,10 +1268,11 @@ fn token(cmd: TokenCmd, json: bool) -> Result<i32> {
                     sha256: util::sha256_hex(tok.as_bytes()),
                     created: util::now_iso(),
                     no_relay,
+                    expires: code.then(|| code_expiry(ttl)),
                 },
             );
             config::save_tokens(&home, &tokens)?;
-            issued(&name, &tok, "Issued");
+            issued(&name, &tok, "Issued", tokens.tokens[&name].expires);
             if no_relay && !json {
                 println!("This caller is barred from relaying: its exec on this machine can't use agent-cli-x to reach other nodes");
             }
@@ -1265,19 +1300,34 @@ fn token(cmd: TokenCmd, json: bool) -> Result<i32> {
                 println!("token `{name}` relay re-enabled (takes effect within seconds on a running serve)");
             }
         }
-        TokenCmd::Rotate { name } => {
+        TokenCmd::Rotate { name, ttl } => {
             let tok = util::random_hex(24);
+            let mut expires = None;
             if name == DEFAULT_TOKEN_NAME {
+                if ttl.is_some() {
+                    return Err(AppError::bad_request(
+                        "--ttl only applies to authorization codes (`token add <name> --code`)",
+                    ));
+                }
                 config::replace_config_token(&home, &tok)?;
             } else {
                 let Some(e) = tokens.tokens.get_mut(&name) else {
                     return Err(AppError::not_found(format!("No token named `{name}`")));
                 };
+                if e.expires.is_none() && ttl.is_some() {
+                    return Err(AppError::bad_request(format!(
+                        "`{name}` is a permanent token; --ttl only applies to authorization codes"
+                    )));
+                }
                 e.sha256 = util::sha256_hex(tok.as_bytes());
                 e.created = util::now_iso();
+                if e.expires.is_some() {
+                    e.expires = Some(code_expiry(ttl));
+                }
+                expires = e.expires;
                 config::save_tokens(&home, &tokens)?;
             }
-            issued(&name, &tok, "Rotated");
+            issued(&name, &tok, "Rotated", expires);
             if !json {
                 println!("Old token invalidated (effective within seconds on a running serve); callers registered with it must re-run peer add");
             }
@@ -1299,21 +1349,33 @@ fn token(cmd: TokenCmd, json: bool) -> Result<i32> {
             }
         }
         TokenCmd::List => {
+            let now = util::unix_now();
             if json {
-                let list: Vec<Value> =
-                    std::iter::once(
-                        json!({"name": DEFAULT_TOKEN_NAME, "created": null, "no_relay": false}),
-                    )
-                    .chain(tokens.tokens.iter().map(
-                        |(n, e)| json!({"name": n, "created": e.created, "no_relay": e.no_relay}),
-                    ))
-                    .collect();
+                let list: Vec<Value> = std::iter::once(
+                    json!({"name": DEFAULT_TOKEN_NAME, "created": null, "no_relay": false}),
+                )
+                .chain(tokens.tokens.iter().map(|(n, e)| {
+                    let mut v = json!({"name": n, "created": e.created, "no_relay": e.no_relay});
+                    if let Some(x) = e.expires {
+                        v["expires"] = json!(util::unix_iso(x));
+                        v["expired"] = json!(e.expired(now));
+                    }
+                    v
+                }))
+                .collect();
                 println!("{}", Value::Array(list));
             } else {
                 println!("{DEFAULT_TOKEN_NAME}\t(config.toml)");
                 for (n, e) in &tokens.tokens {
                     let flag = if e.no_relay { "\tno-relay" } else { "" };
-                    println!("{n}\t{}{flag}", e.created);
+                    let exp = match e.expires {
+                        Some(x) if e.expired(now) => {
+                            format!("\tcode expired {}", util::unix_iso(x))
+                        }
+                        Some(x) => format!("\tcode until {}", util::unix_iso(x)),
+                        None => String::new(),
+                    };
+                    println!("{n}\t{}{flag}{exp}", e.created);
                 }
             }
         }

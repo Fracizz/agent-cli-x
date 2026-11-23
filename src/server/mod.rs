@@ -311,12 +311,20 @@ fn handle_conn(st: Arc<State>, tcp: TcpStream) {
     // 在读取或分配请求体之前鉴权；上传接口仍由处理函数流式读取。
     let req = (|| {
         let mut req = http::read_request_head(&mut conn)?;
-        let caller = authorize(&st, &req).ok_or_else(|| {
-            st.audit
-                .log(&ip, "", "auth_fail", false, json!({"path": req.path}));
-            thread::sleep(Duration::from_millis(300));
-            AppError::auth("invalid token")
-        })?;
+        let caller = match authorize(&st, &req) {
+            auth::Check::Ok(c) => c,
+            other => {
+                st.audit
+                    .log(&ip, "", "auth_fail", false, json!({"path": req.path}));
+                thread::sleep(Duration::from_millis(300));
+                return Err(match other {
+                    auth::Check::Expired(n) => AppError::auth(format!(
+                        "authorization code `{n}` expired; ask the owner of this machine to run `agent-cli-x token rotate {n}` (or `token add <name> --code`) and re-run peer add"
+                    )),
+                    _ => AppError::auth("invalid token"),
+                });
+            }
+        };
         if !is_streaming_upload(&req.path) {
             req.body = http::read_body(&mut conn, req.content_length, max_body)?;
         }
@@ -365,8 +373,8 @@ fn is_streaming_upload(path: &str) -> bool {
     matches!(path, "/v1/fs/put" | "/v1/upgrade")
 }
 
-/// 鉴权通过时返回调用方。
-fn authorize(st: &State, req: &http::Request) -> Option<auth::Caller> {
+/// 鉴权：返回调用方或失败原因。
+fn authorize(st: &State, req: &http::Request) -> auth::Check {
     let got = req
         .header("authorization")
         .and_then(|v| v.strip_prefix("Bearer "))
