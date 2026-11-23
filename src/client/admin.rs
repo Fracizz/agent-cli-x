@@ -1,10 +1,12 @@
-//! `agent-cli-x restart` 与 `agent-cli-x set-port`。
+//! `agent-cli-x restart`、`agent-cli-x set-port` 与本机的 `agent-cli-x stop`。
 
 use super::upgrade::wait_back;
 use super::Client;
-use crate::config;
+use crate::config::{self, Config, Peer};
 use crate::error::{AppError, Result};
+use crate::tls;
 use serde_json::{json, Value};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 const CALL: Duration = Duration::from_secs(30);
@@ -22,6 +24,20 @@ pub fn restart(client: &Client, force: bool) -> Result<Value> {
         "kept_jobs": resp["kept_jobs"],
         "ms": started.elapsed().as_millis() as u64,
     }))
+}
+
+/// 远程登记 / 删除对端工作区：对端校验并改写自己的 config.toml 后重启，本机等它重新上线。
+pub fn workspace(client: &Client, body: &Value) -> Result<Value> {
+    let before = client.call("/v1/info", &json!({}), CALL)?;
+    let mut resp = client.call("/v1/workspace", body, CALL)?;
+    wait_back(
+        client,
+        &before,
+        &format!("{} workspace change saved, restart issued", client.name),
+    )?;
+    resp["peer"] = json!(client.name);
+    resp["serve"] = json!("restarted");
+    Ok(resp)
 }
 
 /// 更换对端监听端口：对端先在新端口上监听，本机经由新端口确认后才切换；
@@ -72,4 +88,97 @@ pub fn set_port(client: &Client, port: u16) -> Result<Value> {
         "updated_peers": updated,
         "firewall": open["firewall"],
     }))
+}
+
+/// 把监听地址换成本机可连接的地址（0.0.0.0 → 127.0.0.1）。
+pub fn local_connect_addr(listen: &str) -> String {
+    let port = listen.rsplit(':').next().unwrap_or_default();
+    let host = listen[..listen.len() - port.len()].trim_end_matches(':');
+    match host {
+        "0.0.0.0" | "" => format!("127.0.0.1:{port}"),
+        "[::]" => format!("[::1]:{port}"),
+        h => format!("{h}:{port}"),
+    }
+}
+
+/// 用本机的默认 token 与证书指纹连接本机 serve。
+pub fn local_client(cfg: &Config, fingerprint: String) -> Client {
+    Client::from_peer(
+        "local",
+        Peer {
+            addr: local_connect_addr(&cfg.listen),
+            token: cfg.token.clone(),
+            fingerprint,
+            ..Default::default()
+        },
+    )
+}
+
+/// 停止本机 serve：经本机连接请求它退出，再确认端口已关闭。没有在运行时不算错误。
+pub fn stop(force: bool) -> Result<Value> {
+    super::disable_version_warning();
+    let home = config::home_dir();
+    // config.toml 改坏时 serve 以 last-good 运行，token 也从那里取
+    let cfg = config::load_config(&home)
+        .or_else(|e| config::load_config_file(&config::last_good_path(&home)).map_err(|_| e))?;
+    let me = local_client(&cfg, tls::local_fingerprint(&home)?);
+    let addr = me.addr().to_string();
+    let resp = match me.call("/v1/stop", &json!({"force": force}), CALL) {
+        Ok(v) => v,
+        Err(e) if e.code == "connect" => return Ok(json!({"addr": addr, "running": false})),
+        Err(e) if e.code == "not_found" => {
+            // 正在运行的是不认识 stop 的旧版本
+            let info = me.info(CALL)?;
+            let pid = &info["pid"];
+            let kill = if cfg!(windows) {
+                format!("Stop-Process -Id {pid}")
+            } else {
+                format!("kill {pid}")
+            };
+            return Err(AppError::not_found(format!(
+                "running serve v{} (pid {pid}) predates `stop`; end it with `{kill}`",
+                info["version"].as_str().unwrap_or("?")
+            )));
+        }
+        Err(e) => return Err(e),
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while accepts(&addr) {
+        if Instant::now() > deadline {
+            return Err(AppError::new(
+                "timeout",
+                format!(
+                    "serve (pid {}) accepted stop but {addr} is still open after 10s; check with `agent-cli-x doctor`",
+                    resp["pid"]
+                ),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Ok(json!({
+        "addr": addr,
+        "running": false,
+        "pid": resp["pid"],
+        "interrupted_jobs": resp["interrupted_jobs"],
+        "kept_jobs": resp["kept_jobs"],
+    }))
+}
+
+fn accepts(addr: &str) -> bool {
+    addr.to_socket_addrs()
+        .ok()
+        .and_then(|mut a| a.next())
+        .is_some_and(|a| TcpStream::connect_timeout(&a, Duration::from_secs(1)).is_ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connect_addr() {
+        assert_eq!(local_connect_addr("0.0.0.0:47821"), "127.0.0.1:47821");
+        assert_eq!(local_connect_addr("[::]:9000"), "[::1]:9000");
+        assert_eq!(local_connect_addr("10.0.0.5:9000"), "10.0.0.5:9000");
+    }
 }

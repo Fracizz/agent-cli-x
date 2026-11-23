@@ -12,7 +12,7 @@ agent-cli-x peer list [query]  # cached name/id, OS/arch, shell; filter by name/
 agent-cli-x info <peer>        # live permissions, workspaces, jobs; @all = online peers
 ```
 
-Paths: `workspace:relative/path` (`proj:src/main.rs`, root `proj:`); omit the prefix for a default workspace. Absolute paths, `..`, denied paths and missing CRUD rights (`info`: `path=rcud`) fail with 102. Never bypass with `exec`.
+Paths: `workspace:relative/path` (`proj:src/main.rs`, root `proj:`); omit the prefix for a default workspace. Absolute paths, `..`, denied paths and missing CRUD rights (`info`: `path=rcud`) fail with 102. Never bypass with `exec`. Need another dir: `agent-cli-x workspace add B <name> <dir> [--default] [--allow rcud]` (B restarts serve; a peer with none configured serves its home dir as `home`). Never hand-edit a peer's config.
 
 ## Commands
 
@@ -58,7 +58,7 @@ Desktop: physical-pixel coordinates; default 50 windows / 32KB, titles 200 chars
 - Timeout kills the process tree (exit 104); raise `--timeout` or use `--detach` for anything over a few minutes.
 - `exec` runs with the full rights of the `serve` user. Do not use it to change read-only/denied paths unless the user asked for exactly that, and say so.
 - No relaying: don't run `agent-cli-x` inside a peer's `exec` unless asked, never read a peer's `~/.agent-cli-x`. On `not allowed to relay` stop and tell the user.
-- Unreachable peer (100): run `doctor`. `serve` defaults to background (windowless, returns once ready); use `serve --foreground` for service managers/debugging. Autostart and legacy trash recovery: see README.
+- Unreachable peer (100): run `doctor`. `serve` defaults to background (windowless, returns once ready); use `serve --foreground` for service managers/debugging; `stop` ends the local serve (local only). Autostart and legacy trash recovery: see README.
 
 ## Exit codes
 

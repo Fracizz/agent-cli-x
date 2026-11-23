@@ -130,6 +130,11 @@ pub(super) fn prepare(
         )));
     }
     let spec = req.cwd.unwrap_or_default();
+    if ctx.st.ws.is_empty() {
+        return Err(super::workspace::Workspaces::none_configured(
+            ctx.st.config_error.as_deref(),
+        ));
+    }
     if spec.is_empty() && ctx.st.ws.default_name().is_none() {
         return Err(AppError::bad_request(
             "no --cwd given and server has no default workspace",

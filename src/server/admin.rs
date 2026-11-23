@@ -1,4 +1,4 @@
-//! 运维接口：重启服务（/v1/restart）、不停机更换监听端口（/v1/port）与重启前的配置预检。
+//! 运维接口：重启服务（/v1/restart）、停止本机服务（/v1/stop）、不停机更换监听端口（/v1/port）与重启前的配置预检。
 //!
 //! 换端口分两步，先通后切：
 //! 1. `open`：在新端口上额外开一个监听器（旧端口照常服务），120 秒内未确认自动关闭；
@@ -150,6 +150,104 @@ pub fn restart<W: Write>(ctx: &Ctx, body: Value, w: &mut W) {
     match res {
         Ok(v) => {
             crate::slog!("restart requested by {}@{}", ctx.caller, ctx.ip);
+            let _ = http::write_json(w, 200, &v);
+            let _ = w.flush();
+            upgrade::schedule_restart();
+        }
+        Err(e) => {
+            let _ = http::write_error(w, &e);
+        }
+    }
+}
+
+/// `/v1/stop`：仅接受本机请求（停止后无法远程再启动）→ 返回响应 → 退出进程（退出码 0，
+/// systemd `Restart=on-failure` 与计划任务都不会再拉起）。
+pub fn stop<W: Write>(ctx: &Ctx, body: Value, w: &mut W) {
+    let force = body["force"].as_bool().unwrap_or(false);
+    let res = if ctx.same_host {
+        upgrade::jobs_on_restart(ctx, force, "stop").map(|(interrupted, kept)| {
+            json!({
+                "pid": std::process::id(),
+                "interrupted_jobs": interrupted,
+                "kept_jobs": kept,
+            })
+        })
+    } else {
+        Err(AppError::denied(
+            "stop is only accepted from the machine itself (nobody could start serve again remotely); run `agent-cli-x stop` there, or use `agent-cli-x restart <peer>`",
+        ))
+    };
+    ctx.st.audit.log(
+        &ctx.ip,
+        &ctx.caller,
+        "stop",
+        res.is_ok(),
+        res.as_ref()
+            .map_or_else(|e| json!({"error": e.message}), |v| v.clone()),
+    );
+    match res {
+        Ok(v) => {
+            crate::slog!("stop requested by {}@{}", ctx.caller, ctx.ip);
+            let _ = http::write_json(w, 200, &v);
+            let _ = w.flush();
+            // 留出时间让响应发送完、连接正常关闭
+            thread::spawn(|| {
+                thread::sleep(Duration::from_millis(500));
+                crate::slog!("stopped");
+                std::process::exit(0);
+            });
+        }
+        Err(e) => {
+            let _ = http::write_error(w, &e);
+        }
+    }
+}
+
+/// `/v1/workspace`：`{"action": "add"|"remove", "name", "path"?, "default"?, "allow"?, "force"?}`。
+/// 已授权的调用方即可登记目录（exec 本就以 serve 用户全权限运行，工作区是防误操作的护栏，
+/// 不是安全边界）；校验通过才写入 config.toml，然后与 /v1/restart 一样重启自身生效。
+pub fn workspace<W: Write>(ctx: &Ctx, body: Value, w: &mut W) {
+    let home = &ctx.st.home;
+    let res = (|| {
+        let name = body["name"].as_str().unwrap_or_default();
+        let (text, mut v) = match body["action"].as_str() {
+            Some("add") => crate::wsconfig::plan_add(
+                home,
+                name,
+                body["path"].as_str().unwrap_or_default(),
+                body["default"].as_bool().unwrap_or(false),
+                body["allow"].as_str(),
+            )?,
+            Some("remove") => crate::wsconfig::plan_remove(home, name)?,
+            _ => return Err(AppError::bad_request("action must be add or remove")),
+        };
+        let force = body["force"].as_bool().unwrap_or(false);
+        let (interrupted, kept) = upgrade::jobs_on_restart(ctx, force, "workspace change")?;
+        crate::wsconfig::save(home, &text)?;
+        v["restart"] = json!(upgrade::restart_mode());
+        v["interrupted_jobs"] = json!(interrupted);
+        v["kept_jobs"] = json!(kept);
+        Ok(v)
+    })();
+    ctx.st.audit.log(
+        &ctx.ip,
+        &ctx.caller,
+        "workspace",
+        res.is_ok(),
+        res.as_ref().map_or_else(
+            |e| json!({"request": body, "error": e.message}),
+            |v| v.clone(),
+        ),
+    );
+    match res {
+        Ok(v) => {
+            crate::slog!(
+                "workspace {} {} by {}@{}",
+                body["action"].as_str().unwrap_or_default(),
+                v["workspace"].as_str().unwrap_or_default(),
+                ctx.caller,
+                ctx.ip
+            );
             let _ = http::write_json(w, 200, &v);
             let _ = w.flush();
             upgrade::schedule_restart();

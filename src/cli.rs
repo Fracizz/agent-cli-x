@@ -3,7 +3,7 @@
 use crate::client::{self, multi, output::ExecOutput, Client};
 use crate::config::{self, Peer, TokenEntry, DEFAULT_TOKEN_NAME};
 use crate::error::{AppError, Result};
-use crate::{doctor, http, server, tls, util};
+use crate::{doctor, http, server, tls, util, wsconfig};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -81,6 +81,9 @@ enum Cmd {
     /// Manage tokens for access to this machine (issued per caller, individually revocable)
     #[command(subcommand)]
     Token(TokenCmd),
+    /// Manage this machine's workspaces: edits config.toml safely and restarts the local serve
+    #[command(subcommand)]
+    Workspace(WorkspaceCmd),
     /// Upgrade peers remotely: upload new binary and restart (peer may be A,B or @all)
     Upgrade {
         peer: String,
@@ -95,6 +98,12 @@ enum Cmd {
     Restart {
         peer: String,
         /// Restart even if peer has running background jobs (jobs are interrupted)
+        #[arg(long)]
+        force: bool,
+    },
+    /// Stop this machine's serve (local only; background jobs keep running; autostart starts it again at boot)
+    Stop {
+        /// Stop even if systemd would kill running background jobs with it
         #[arg(long)]
         force: bool,
     },
@@ -406,6 +415,34 @@ enum PeerCmd {
 }
 
 #[derive(Subcommand)]
+enum WorkspaceCmd {
+    /// Add or update a workspace: `workspace add B data D:/ --default` on peer B, or omit the peer for this machine
+    Add {
+        /// [PEER] NAME DIR (DIR is a path on that machine)
+        #[arg(num_args = 2..=3, required = true, value_name = "ARG")]
+        args: Vec<String>,
+        /// Also make it the default workspace (used for paths without `<workspace>:`)
+        #[arg(long)]
+        default: bool,
+        /// Also write a [[policy.paths]] rule `<name>:` with these permissions, e.g. rcud (overrides read-only presets such as C:/)
+        #[arg(long)]
+        allow: Option<String>,
+        /// Restart even if systemd would kill running background jobs with serve
+        #[arg(long)]
+        force: bool,
+    },
+    /// Remove a workspace with its default setting and `<name>:` rules: `workspace remove [PEER] NAME`
+    Remove {
+        /// [PEER] NAME
+        #[arg(num_args = 1..=2, required = true, value_name = "ARG")]
+        args: Vec<String>,
+        /// Restart even if systemd would kill running background jobs with serve
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum TokenCmd {
     /// Issue a token for a caller and print the `peer add` command it needs
     Add {
@@ -665,6 +702,7 @@ pub fn run() -> Result<i32> {
         // 禁止借道时不探测对端
         Cmd::Doctor { no_peers } => doctor::run(json, !no_peers && !no_relay),
         Cmd::Token(t) => token(t, json),
+        Cmd::Workspace(w) => workspace(w, json),
         Cmd::Upgrade {
             peer,
             binary,
@@ -677,6 +715,22 @@ pub fn run() -> Result<i32> {
         }
         Cmd::Restart { peer, force } => {
             each_peer(&peer, json, "restart", |c| client::admin::restart(c, force))
+        }
+        Cmd::Stop { force } => {
+            let v = client::admin::stop(force)?;
+            if json {
+                println!("{v}");
+            } else if v["pid"].is_null() {
+                eprintln!("serve not running ({})", v["addr"].as_str().unwrap_or("?"));
+            } else {
+                let jobs = match (v["kept_jobs"].as_u64(), v["interrupted_jobs"].as_u64()) {
+                    (Some(n), _) if n > 0 => format!("; {n} background jobs still running"),
+                    (_, Some(n)) if n > 0 => format!("; {n} background jobs interrupted"),
+                    _ => String::new(),
+                };
+                eprintln!("Stopped serve (pid {}){jobs}", v["pid"]);
+            }
+            Ok(0)
         }
         Cmd::SetPort { peer, port } => set_port(&peer, port, json),
         Cmd::Fingerprint => {
@@ -1145,7 +1199,11 @@ fn init(
     println!("  Fingerprint: {fp}");
     println!();
     println!("Next steps:");
-    println!("  1. Edit the config: register accessible dirs under [workspaces]; adjust deny_paths / [[policy.paths]] / deny_commands as needed");
+    if ws.is_empty() {
+        println!("  1. Workspace: none given, so peers get your home dir as workspace `home`. More dirs: agent-cli-x workspace add <name> <dir> (callers can also run `workspace add <this-peer> ...`)");
+    } else {
+        println!("  1. Review the rules in the config (deny_paths / [[policy.paths]] / deny_commands); more dirs: agent-cli-x workspace add <name> <dir>");
+    }
     println!("  2. Run `agent-cli-x serve`");
     println!("  3. On the machine that will access this one (per-caller token: `agent-cli-x token add <name>`):");
     let (cmd, others) = pair_command(&node_name, listen, &token, &fp);
@@ -1187,6 +1245,91 @@ fn print_other_ips(others: &[String]) {
             others.join(", ")
         );
     }
+}
+
+fn workspace(cmd: WorkspaceCmd, json: bool) -> Result<i32> {
+    // 参数比必需的多一个时，第一个是对端名：由对端校验、改写自己的配置并重启
+    let (peer, body) = match &cmd {
+        WorkspaceCmd::Add {
+            args,
+            default,
+            allow,
+            force,
+        } => {
+            let (peer, name, dir) = match args.as_slice() {
+                [p, n, d] => (Some(p), n, d),
+                [n, d] => (None, n, d),
+                _ => unreachable!("clap 限制 2..=3 个参数"),
+            };
+            let body = json!({"action": "add", "name": name, "path": dir,
+                "default": default, "allow": allow, "force": force});
+            (peer, body)
+        }
+        WorkspaceCmd::Remove { args, force } => {
+            let (peer, name) = match args.as_slice() {
+                [p, n] => (Some(p), n),
+                [n] => (None, n),
+                _ => unreachable!("clap 限制 1..=2 个参数"),
+            };
+            (
+                peer,
+                json!({"action": "remove", "name": name, "force": force}),
+            )
+        }
+    };
+    let s = |k: &str| body[k].as_str().unwrap_or_default();
+    let v = match peer {
+        Some(p) => client::admin::workspace(&Client::load(p)?, &body)?,
+        None => {
+            let home = config::home_dir();
+            let planned = if s("action") == "add" {
+                wsconfig::plan_add(
+                    &home,
+                    s("name"),
+                    s("path"),
+                    body["default"] == true,
+                    body["allow"].as_str(),
+                )?
+            } else {
+                wsconfig::plan_remove(&home, s("name"))?
+            };
+            wsconfig::apply_local(planned, body["force"] == true)?
+        }
+    };
+    if json {
+        println!("{v}");
+        return Ok(0);
+    }
+    let who = peer.map_or(String::new(), |p| format!("{p}: "));
+    let serve = if v["serve"] == "restarted" {
+        "serve restarted"
+    } else {
+        "serve not running, start it with `agent-cli-x serve`"
+    };
+    let name = v["workspace"].as_str().unwrap_or_default();
+    if s("action") == "add" {
+        let path = v["path"].as_str().unwrap_or_default();
+        eprintln!(
+            "{who}workspace {name} = {path}{}; {serve}",
+            if v["default"] == true {
+                " (default)"
+            } else {
+                ""
+            }
+        );
+        if let Some(m) = v["missing"].as_str().filter(|m| !m.is_empty()) {
+            let target = peer.map_or(String::new(), |p| format!("{p} "));
+            eprintln!(
+                "note: preset path rules deny `{m}` in this workspace; to allow: agent-cli-x workspace add {target}{name} {path} --allow rcud"
+            );
+        }
+    } else {
+        eprintln!(
+            "{who}removed workspace {name} ({} rules); {serve}",
+            v["removed_rules"]
+        );
+    }
+    Ok(0)
 }
 
 fn whoami(pair: bool, json: bool) -> Result<i32> {
@@ -2282,6 +2425,11 @@ fn print_info(name: &str, v: &Value) {
         );
     }
     let def = v["default_workspace"].as_str();
+    if v["auto_workspace"] == true {
+        println!("  workspace home is automatic (none configured). Add dirs: agent-cli-x workspace add {name} <ws-name> <dir> [--default]");
+    } else if v["workspaces"].as_array().is_some_and(|w| w.is_empty()) {
+        println!("  no workspace: exec and file commands are refused. Add one: agent-cli-x workspace add {name} <ws-name> <dir> --default");
+    }
     for w in v["workspaces"].as_array().into_iter().flatten() {
         let n = w["name"].as_str().unwrap_or_default();
         println!(

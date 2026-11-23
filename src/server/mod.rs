@@ -38,11 +38,13 @@ const REJECT_DRAIN: Duration = Duration::from_secs(2);
 /// - put_stream：put 接受长度未知的帧流（cp 在两个对端之间直接中转）
 /// - purge：按 op_id 彻底清除回收站条目与备份
 /// - restart / set_port：`/v1/restart` 与 `/v1/port`
+/// - workspace：`/v1/workspace` 远程登记 / 删除工作区
 pub const FEATURES: &[&str] = &[
     "put_stream",
     "purge",
     "restart",
     "set_port",
+    "workspace",
     #[cfg(windows)]
     "desktop_capture",
 ];
@@ -75,6 +77,8 @@ pub struct Ctx {
     pub no_relay: bool,
     /// 本次连接到达的本机端口（换端口时确认请求必须来自新端口）。
     pub local_port: u16,
+    /// 连接来自本机（回环地址，或源地址与本机监听地址相同）；stop 只接受本机请求。
+    pub same_host: bool,
 }
 
 /// 启动服务端。`wait_port_secs > 0` 时端口被占用会重试这么久（升级后新进程等待旧进程退出）。
@@ -207,10 +211,14 @@ fn serve_inner(home: &Path, wait_port_secs: u64, background_child: bool) -> Resu
     if shell == platform::Shell::PowerShell {
         crate::slog!("  note: pwsh not found, using Windows PowerShell 5.1 (cold start ~2 s); installing PowerShell 7 speeds up exec noticeably");
     }
-    if ws.is_empty() {
+    if ws.is_auto() {
         crate::slog!(
-            "  warning: no workspace configured, peers cannot access files or run commands (edit {})",
-            config::config_path(home).display()
+            "  note: no workspace configured; using the user's home dir as workspace `{}`. Add others: agent-cli-x workspace add <name> <dir> (or remotely: workspace add <peer> <name> <dir>)",
+            workspace::AUTO_WORKSPACE
+        );
+    } else if ws.is_empty() {
+        crate::slog!(
+            "  warning: no workspace configured, peers cannot access files or run commands. Add one: agent-cli-x workspace add <name> <dir> --default"
         );
     }
     for (n, p) in ws.list() {
@@ -299,6 +307,10 @@ fn handle_conn(st: Arc<State>, tcp: TcpStream) {
         .map(|a| a.ip().to_string())
         .unwrap_or_default();
     let local_port = tcp.local_addr().map(|a| a.port()).unwrap_or_default();
+    let same_host = match (tcp.peer_addr(), tcp.local_addr()) {
+        (Ok(p), Ok(l)) => p.ip().is_loopback() || p.ip() == l.ip(),
+        _ => false,
+    };
     let _ = tcp.set_read_timeout(Some(Duration::from_secs(30)));
     let _ = tcp.set_write_timeout(Some(Duration::from_secs(120)));
     let _ = tcp.set_nodelay(true);
@@ -344,7 +356,7 @@ fn handle_conn(st: Arc<State>, tcp: TcpStream) {
                 return;
             }
         }
-        Ok((req, caller)) => dispatch(&st, ip, local_port, req, caller, &mut conn),
+        Ok((req, caller)) => dispatch(&st, ip, local_port, same_host, req, caller, &mut conn),
     }
     let s = conn.get_mut();
     s.conn.send_close_notify();
@@ -386,6 +398,7 @@ fn dispatch(
     st: &Arc<State>,
     ip: String,
     local_port: u16,
+    same_host: bool,
     req: http::Request,
     caller: auth::Caller,
     conn: &mut Conn,
@@ -396,6 +409,7 @@ fn dispatch(
         caller: caller.name,
         no_relay: caller.no_relay,
         local_port,
+        same_host,
     };
     match req.path.as_str() {
         "/v1/fs/put" => {
@@ -454,6 +468,14 @@ fn dispatch(
             admin::restart(&ctx, body, w);
             return;
         }
+        "/v1/workspace" => {
+            admin::workspace(&ctx, body, w);
+            return;
+        }
+        "/v1/stop" => {
+            admin::stop(&ctx, body, w);
+            return;
+        }
         "/v1/port" => admin::port(&ctx, body),
         "/v1/rollback" => backup::rollback(&ctx, body),
         "/v1/purge" => backup::purge(&ctx, body),
@@ -473,6 +495,12 @@ fn dispatch(
             );
         }
     }
+    let result = result.map_err(|e| match &ctx.st.config_error {
+        Some(ce) if ctx.st.ws.is_empty() && e.code == "policy_denied" => {
+            workspace::Workspaces::none_configured(Some(ce))
+        }
+        _ => e,
+    });
     let _ = match result {
         Ok(v) => http::write_json(w, 200, &v),
         Err(e) => http::write_error(w, &e),
@@ -484,6 +512,9 @@ fn info(ctx: &Ctx) -> Value {
     // 只在异常时出现，正常情况下不占 token
     if let Some(e) = &ctx.st.config_error {
         v["config_error"] = json!(e);
+    }
+    if ctx.st.ws.is_auto() {
+        v["auto_workspace"] = json!(true);
     }
     v
 }

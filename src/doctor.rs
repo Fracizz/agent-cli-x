@@ -1,7 +1,7 @@
 //! `agent-cli-x doctor`：检查本机配置、服务、开机自启、防火墙与各对端连通性。
 
-use crate::client::{self, multi, Client};
-use crate::config::{self, Peer};
+use crate::client::{self, multi};
+use crate::config;
 use crate::error::Result;
 use crate::platform::run_cmd;
 use crate::{firewall, http, server, tls};
@@ -48,17 +48,6 @@ impl Report {
 
 fn listen_port(listen: &str) -> String {
     listen.rsplit(':').next().unwrap_or_default().to_string()
-}
-
-/// 把监听地址换成本机可连接的地址（0.0.0.0 → 127.0.0.1）。
-fn local_connect_addr(listen: &str) -> String {
-    let port = listen_port(listen);
-    let host = &listen[..listen.len() - port.len()].trim_end_matches(':');
-    match *host {
-        "0.0.0.0" | "" => format!("127.0.0.1:{port}"),
-        "[::]" => format!("[::1]:{port}"),
-        h => format!("{h}:{port}"),
-    }
 }
 
 fn xml_tag<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
@@ -279,8 +268,11 @@ pub fn run(json: bool, check_peers: bool) -> Result<i32> {
             if cfg.workspaces.is_empty() {
                 r.add(
                     "workspace",
-                    Level::Warn,
-                    "no workspaces configured; peers cannot access files or run commands",
+                    Level::Ok,
+                    format!(
+                        "none configured; serve uses the home dir as workspace `{}`. Add others: agent-cli-x workspace add <name> <dir>",
+                        server::workspace::AUTO_WORKSPACE
+                    ),
                 );
             }
             for (n, p) in &cfg.workspaces {
@@ -313,16 +305,8 @@ pub fn run(json: bool, check_peers: bool) -> Result<i32> {
                 Err(e) => r.add("token", Level::Fail, e.message),
             }
             if let Some(fp) = fp {
-                let addr = local_connect_addr(&cfg.listen);
-                let me = Client::from_peer(
-                    "local",
-                    Peer {
-                        addr: addr.clone(),
-                        token: cfg.token.clone(),
-                        fingerprint: fp,
-                        ..Default::default()
-                    },
-                );
+                let me = client::admin::local_client(&cfg, fp);
+                let addr = me.addr().to_string();
                 match me.call("/v1/info", &json!({}), Duration::from_secs(10)) {
                     Ok(v) => {
                         let ver = v["version"].as_str().unwrap_or("?");
@@ -423,13 +407,6 @@ pub fn run(json: bool, check_peers: bool) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn connect_addr() {
-        assert_eq!(local_connect_addr("0.0.0.0:47821"), "127.0.0.1:47821");
-        assert_eq!(local_connect_addr("[::]:9000"), "[::1]:9000");
-        assert_eq!(local_connect_addr("10.0.0.5:9000"), "10.0.0.5:9000");
-    }
 
     #[test]
     fn xml() {

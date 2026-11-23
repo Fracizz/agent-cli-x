@@ -95,13 +95,31 @@ impl Shell {
     }
 }
 
+/// Windows PowerShell 5.1 的程序路径。它随系统安装在固定位置，但 PATH 里可能缺了
+/// `WindowsPowerShell\v1.0`（用户改过 PATH），按名字启动会报 program not found。
+fn windows_powershell() -> PathBuf {
+    static CACHE: OnceLock<PathBuf> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            which("powershell.exe")
+                .or_else(|| {
+                    let root = std::env::var_os("SystemRoot")?;
+                    let p =
+                        PathBuf::from(root).join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+                    p.is_file().then_some(p)
+                })
+                .unwrap_or_else(|| PathBuf::from("powershell"))
+        })
+        .clone()
+}
+
 /// PowerShell 进程：程序名与公共参数。
 fn ps_command(shell: Shell) -> Command {
-    let mut c = Command::new(if shell == Shell::Pwsh {
-        "pwsh"
+    let mut c = if shell == Shell::Pwsh {
+        Command::new("pwsh")
     } else {
-        "powershell"
-    });
+        Command::new(windows_powershell())
+    };
     c.args(["-NoLogo", "-NoProfile", "-NonInteractive"]);
     if cfg!(windows) {
         c.args(["-ExecutionPolicy", "Bypass"]);

@@ -9,6 +9,14 @@ use std::path::{Path, PathBuf};
 pub const DEFAULT_PORT: u16 = 47821;
 
 /// 数据目录：优先 `AGENT_CLI_X_HOME`，否则 `~/.agent-cli-x`。
+/// 当前用户主目录（Windows `USERPROFILE`，其余 `HOME`）。
+pub fn user_home() -> Option<PathBuf> {
+    let key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    std::env::var_os(key)
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+}
+
 pub fn home_dir() -> PathBuf {
     if let Some(p) = std::env::var_os("AGENT_CLI_X_HOME") {
         return PathBuf::from(p);
@@ -200,7 +208,12 @@ pub fn load_config_file(p: &Path) -> Result<Config> {
             p.display()
         ))
     })?;
-    let cfg: Config = toml::from_str(&text)
+    parse_config(&text, p)
+}
+
+/// 解析并校验配置文本（`p` 只用于错误信息）。
+pub fn parse_config(text: &str, p: &Path) -> Result<Config> {
+    let cfg: Config = toml::from_str(text)
         .map_err(|e| AppError::config(format!("failed to parse {}: {e}", p.display())))?;
     if std::net::ToSocketAddrs::to_socket_addrs(&cfg.listen.as_str()).is_err() {
         return Err(AppError::config(format!(
@@ -292,6 +305,9 @@ pub fn template(
 ) -> String {
     let mut ws = String::new();
     if workspaces.is_empty() {
+        ws.push_str(
+            "# None configured: the user's home directory is used as workspace `home` (read/write).\n",
+        );
         ws.push_str("# proj = \"D:/code/proj\"\n");
     }
     for (n, p) in workspaces {

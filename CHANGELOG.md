@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.0.18
+
+- Workspaces work out of the box: with none configured, the user's home directory (`%USERPROFILE%` / `$HOME`) is served as workspace `home` (read/write), so a freshly initialized, authorized machine can be used immediately.
+- `workspace add [peer] <name> <dir> [--default] [--allow rcud]` / `workspace remove [peer] <name>`: register or remove a workspace locally or, from any authorized caller, on a peer. `config.toml` is edited with comments kept, validated like `serve` does, and `serve` restarts to apply.
+- `stop [--force]`: stop this machine's `serve` (local only); waits until the port is closed, exits 0 if it was not running, background jobs keep running.
+- Windows PowerShell 5.1 is started from `%SystemRoot%\System32\WindowsPowerShell\v1.0` when it is missing from `PATH` (previously `exec` failed with `program not found`).
+- Clearer errors when a machine has no workspace (exit 102 with the `workspace add` command, plus the config error when serve runs on the last good config).
+
 ## 0.0.17
 
 - Pairing commands (`init`, `whoami --pair`, `token add/rotate`) no longer pick a VPN/proxy TUN address (sing-box, Clash, WireGuard, etc.) when the system route goes through it: local interfaces are ranked by gateway, adapter type and name. Other candidate IPs are printed on stderr (JSON: `other_ips`).

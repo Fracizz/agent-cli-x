@@ -33,6 +33,8 @@ agent-cli-x serve
 agent-cli-x token add dev-workstation
 ```
 
+Without `--workspace`, the host's home directory is served as workspace `home` (read/write), so an authorized caller can work right away. To register more directories, run `agent-cli-x workspace add proj /home/me/proj --default` on the host, or `agent-cli-x workspace add build-01 proj /home/me/proj --default` from an authorized caller. Either way, `config.toml` is edited with its comments kept, validated the way `serve` does it, and `serve` is restarted. No hand-editing is needed. Workspace names need at least 2 characters. Once any workspace is configured, the automatic `home` workspace goes away.
+
 Verify the fingerprint on the build host with `agent-cli-x fingerprint`. On the calling machine, run the pairing command printed by `token add`, using the verified fingerprint and a reachable address. Then check the connection and run a test in the registered workspace.
 
 ```bash
@@ -66,6 +68,8 @@ Each host can run the same binary as a client and server. Pairing authorises a c
 | Command | Purpose |
 |---|---|
 | `init` / `serve [--foreground]` / `whoami [--pair]` / `fingerprint` | set up, run in background by default and identify this machine; `serve --check` only validates `config.toml` and the certificate (run it after editing the config by hand) |
+| `stop [--force]` | stop this machine's `serve` (local only: a peer can't be stopped remotely because nothing could start it again; use `restart`). Waits until the port is closed; exits 0 if it wasn't running. Background jobs keep running; `--force` is only needed under systemd without `KillMode=process`, where stopping would kill them |
+| `workspace add [peer] <name> <dir> [--default] [--allow rcud]` / `workspace remove [peer] <name>` | register or remove a directory callers may access, on this machine or (with a peer name) on that peer. Any authorized caller may do this remotely. Edits `config.toml` keeping comments, validates it, then restarts `serve` (`--force` as for `restart`). With no workspace configured, the user's home directory is served as `home`. `--allow` writes a `[[policy.paths]]` rule `<name>:`, needed for workspaces under a read-only preset such as `C:/`. `remove` also drops the default setting and the `<name>:` rules |
 | `doctor [--no-peers]` | check config, local service, start at boot, firewall, peers and their versions |
 | `token add\|list\|set\|remove\|rotate` | per-caller tokens for this machine (`rotate default` replaces the config token); `add <name> --no-relay` / `set <name> --no-relay\|--allow-relay` stops that caller from hopping to other machines through this one; `add <name> --code [--ttl 8h]` issues an authorization code: a full-access temporary token valid 4h by default (or 8h), rejected with 101 once expired; `rotate <name> [--ttl 8h]` renews it |
 | `peer add\|set\|list\|remove` | manage peers (`~/.agent-cli-x/peers.toml`); `list` shows the cached OS/arch and shell, refreshed by `peer add`, `info`, `upgrade` and `cp`; `set <name> --addr <ip:port>` / `--token <t>` changes a peer's address or token after checking it against the registered fingerprint; peers with no cached OS (registered by an older version) are looked up automatically (an unreachable one is retried at most once a day) |
@@ -243,6 +247,7 @@ Intended for machines you own on a trusted network.
   - Linux: `/bin`, `/sbin`, `/lib*`, `/usr`, `/etc`, `/boot`, `/var/lib`, `/proc`, `/sys`, `/dev` read-only; `/etc/shadow`, `/etc/gshadow`, `/etc/sudoers*`, `/root/.ssh` denied; `rm -rf /etc` (and other system dirs), `--no-preserve-root`, `mkfs`, `reboot` etc. blocked.
   - macOS: `/System`, `/Library`, `/usr`, `/bin`, `/sbin`, `/private/etc`, `/private/var/db`, `/Applications` read-only.
 - `deny_commands` is a guard rail against accidents, not a security boundary. So is `token add --no-relay` (see [One-way access](#one-way-access)).
+- Workspaces and path rules are guard rails too: any authorized caller can already change files through `exec`, so `workspace add <peer> …` is open to every token, and each change is recorded in the audit log (`"op": "workspace"`). Without configured workspaces the user's home directory is served as `home`; the agent-cli-x data dir inside it is always denied.
 - `grep`, `find`, `get` and `ls` skip unreadable paths; `put` refuses to write where it lacks `c`/`u`.
 - Background jobs run as the same user; their output lives in `~/.agent-cli-x/jobs/` (7 days). They survive a normal `serve` restart; a job is marked `lost` when its supervisor is gone.
 - Every write/edit/put is backed up to `~/.agent-cli-x/backup/` (7 days). All requests are logged to `~/.agent-cli-x/audit/YYYY-MM-DD.jsonl` with the client IP and token name.
@@ -297,7 +302,7 @@ netsh advfirewall firewall add rule name="agent-cli-x" dir=in action=allow progr
 
 Why these settings: Task Scheduler's defaults stop a task after 3 days and skip or stop it on battery power. `S4U` runs it at boot without anyone logged in, with no console window and no stored password. The trade-off is that the task has no network credentials, so mapped drives and Credential Manager logins are unavailable to `exec`. If you need them, use `-AtLogOn` with `-LogonType Interactive` instead. That variant only starts after you log in and shows a console window, and closing the window stops `serve`.
 
-For a manual windowless start, run `agent-cli-x serve`. For windowless autostart, use the `S4U` task above. Use `serve --foreground` in Task Scheduler/systemd actions so the manager tracks the actual server and can restart it on failure; default background mode exits the launching process after startup. Update existing task actions/unit files to add `--foreground` when upgrading.
+For a manual windowless start, run `agent-cli-x serve`; `agent-cli-x stop` ends it. `stop` exits with code 0, so `Restart=on-failure` and the Task Scheduler restart setting leave it stopped, but autostart starts it again at the next boot: disable it with `systemctl --user disable agent-cli-x` or `Disable-ScheduledTask -TaskName agent-cli-x`. For windowless autostart, use the `S4U` task above. Use `serve --foreground` in Task Scheduler/systemd actions so the manager tracks the actual server and can restart it on failure; default background mode exits the launching process after startup. Update existing task actions/unit files to add `--foreground` when upgrading.
 
 After a reboot, run `agent-cli-x doctor` on the machine. On Windows it flags a task that will stop after 72 hours, a task that stops or won't start on battery, a task that launches a different binary path, and a missing firewall rule. On Linux it flags a unit that isn't enabled and linger that is off. Also run `agent-cli-x info <peer>` from another machine to confirm the peer can be reached.
 

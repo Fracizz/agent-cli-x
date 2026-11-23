@@ -2088,6 +2088,115 @@ public static class BackgroundConsoleProbe {
 }
 
 #[test]
+fn stop_local_serve() {
+    let mut env = setup();
+    let s = &env.server_home;
+    let c = &env.client_home;
+    let slow = if cfg!(windows) {
+        "echo before-stop; Start-Sleep -Seconds 60"
+    } else {
+        "echo before-stop; sleep 60"
+    };
+    let o = run(c, &["exec", "b", "--detach", "--json", slow]);
+    let id = json_of(&o)["job_id"].as_str().unwrap().to_string();
+
+    // 本机 stop：服务以退出码 0 结束、端口关闭，后台任务继续运行
+    let o = run(s, &["stop", "--json"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let v = json_of(&o);
+    assert_eq!(
+        v["pid"].as_u64(),
+        Some(u64::from(env._server.child.id())),
+        "{v}"
+    );
+    assert_eq!(v["kept_jobs"], 1, "{v}");
+    assert_eq!(v["running"], false, "{v}");
+    assert!(env._server.child.wait().unwrap().success());
+    assert!(TcpStream::connect(&env.listen).is_err());
+
+    // 已停止时再次 stop 不算错误
+    let o = run(s, &["stop"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains("serve not running"), "{}", text(&o));
+
+    // 重新启动后仍能看到并终止 stop 前的任务
+    let o = run(s, &["serve", "--json"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let _guard = PidGuard(std::cell::Cell::new(json_of(&o)["pid"].as_u64().unwrap()));
+    let o = run(c, &["job", "logs", "b", &id]);
+    assert!(text(&o).contains("before-stop"), "{}", text(&o));
+    assert!(run(c, &["job", "kill", "b", &id]).status.success());
+}
+
+#[test]
+fn workspace_add_remove_restarts_serve() {
+    let env = setup();
+    let s = &env.server_home;
+    let c = &env.client_home;
+    let guard = PidGuard(std::cell::Cell::new(0));
+    let extra = env.ws.parent().unwrap().join("extra");
+    fs::create_dir_all(&extra).unwrap();
+    let extra_s = extra.to_string_lossy().to_string();
+
+    // 名称不合法：直接拒绝，不改配置
+    let cfg_path = s.join("config.toml");
+    let before = fs::read_to_string(&cfg_path).unwrap();
+    let o = run(s, &["workspace", "add", "x", &extra_s]);
+    assert_eq!(o.status.code(), Some(109), "{}", text(&o));
+    assert_eq!(fs::read_to_string(&cfg_path).unwrap(), before);
+
+    // 已授权的调用方远程登记：对端改写配置（保留注释）并重启，随即可用
+    let o = run(
+        c,
+        &[
+            "workspace",
+            "add",
+            "b",
+            "extra",
+            &extra_s,
+            "--default",
+            "--allow",
+            "rcud",
+            "--json",
+        ],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    let v = json_of(&o);
+    assert_eq!(v["serve"], "restarted", "{v}");
+    assert_eq!(v["default"], true, "{v}");
+    guard.0.set(server_pid(c));
+    assert!(fs::read_to_string(&cfg_path)
+        .unwrap()
+        .contains("# agent-cli-x server config"));
+    let o = run(c, &["write", "b", "note.txt", "--content", "hi"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert_eq!(fs::read_to_string(extra.join("note.txt")).unwrap(), "hi");
+    let o = run(c, &["workspace", "remove", "b", "nope"]);
+    assert_eq!(o.status.code(), Some(103), "{}", text(&o));
+
+    // 本机删除一个、远程删除另一个
+    let o = run(s, &["workspace", "remove", "extra"]);
+    assert!(text(&o).contains("serve restarted"), "{}", text(&o));
+    guard.0.set(server_pid(c));
+    let o = run(c, &["workspace", "remove", "b", "proj"]);
+    assert!(
+        text(&o).contains("b: removed workspace proj"),
+        "{}",
+        text(&o)
+    );
+    guard.0.set(server_pid(c));
+
+    // 一个工作区都没有：自动使用用户主目录作为工作区 home，exec 直接可用
+    let v = json_of(&run(c, &["info", "b", "--json"]));
+    assert_eq!(v["auto_workspace"], true, "{v}");
+    assert_eq!(v["workspaces"][0]["name"], "home", "{v}");
+    assert!(text(&run(c, &["info", "b"])).contains("automatic"));
+    let o = run(c, &["exec", "b", "echo auto-home"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains("auto-home"), "{}", text(&o));
+}
+
+#[test]
 fn restart_set_port_config_fallback() {
     let env = setup();
     let c = &env.client_home;

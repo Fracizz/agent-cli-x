@@ -28,6 +28,8 @@ agent-cli-x serve
 agent-cli-x token add dev-workstation
 ```
 
+不加 `--workspace` 时，主机的用户主目录会作为工作区 `home`（可读写）提供，授权后即可直接操作。要加目录，在主机上执行 `agent-cli-x workspace add proj /home/me/proj --default`，或由已授权的调用端执行 `agent-cli-x workspace add build-01 proj /home/me/proj --default`。它会保留注释地修改 `config.toml`，按 `serve` 的规则校验并重启 `serve`，不用手改配置；配置了任意工作区后，自动的 `home` 工作区不再提供。工作区名至少 2 个字符；工作区在 Windows 的 `C:` 盘上时加 `--allow rcud` 放开写权限。
+
 在项目主机上运行 `agent-cli-x fingerprint`，核对配对命令里的指纹。在调用端执行 `token add` 打印的配对命令，填写可达地址并使用已核对的指纹。然后检查连接，在登记的工作区运行测试。
 
 ```bash
@@ -39,7 +41,7 @@ agent-cli-x exec build-01 --cwd proj: cargo test
 
 如果配对时用了其他名字，把 `build-01` 换成登记的名字。需要再次查看默认令牌的配对命令时，在项目主机运行 `agent-cli-x whoami --pair`。
 
-`serve` 默认在后台运行，监听就绪后返回 PID，关掉终端仍可继续运行。日志在 `~/.agent-cli-x/serve-logs/`。排查问题或交给服务管理器时用 `serve --foreground`。配置重启后自动启动，可参考 [Linux systemd 与 Windows 任务计划程序示例](README.md#start-at-boot-recommended)，再运行 `agent-cli-x doctor` 验证。
+`serve` 默认在后台运行，监听就绪后返回 PID，关掉终端仍可继续运行。日志在 `~/.agent-cli-x/serve-logs/`。排查问题或交给服务管理器时用 `serve --foreground`。在本机执行 `agent-cli-x stop` 可停止服务（只能在本机执行，后台任务继续运行；配置了开机自启时下次开机仍会启动）。配置重启后自动启动，可参考 [Linux systemd 与 Windows 任务计划程序示例](README.md#start-at-boot-recommended)，再运行 `agent-cli-x doctor` 验证。
 
 给 Codex、Claude Code 等助手使用时，可安装 [Agent Skill](skills/agent-cli-x/SKILL.md)，或运行 `agent-cli-x skill` 查看。
 

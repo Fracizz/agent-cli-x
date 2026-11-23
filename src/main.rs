@@ -13,6 +13,7 @@ mod platform;
 mod server;
 mod tls;
 mod util;
+mod wsconfig;
 
 fn main() {
     let code = match cli::run() {

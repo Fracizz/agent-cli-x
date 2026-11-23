@@ -131,6 +131,8 @@ pub struct Workspaces {
     perms: Vec<PathRule>,
     /// agent-cli-x 数据目录（含 token / 私钥），始终禁止访问。
     home: PathBuf,
+    /// 未配置工作区，roots 里只有自动工作区 `home`。
+    auto: bool,
 }
 
 fn is_abs_pattern(s: &str) -> bool {
@@ -186,10 +188,27 @@ fn parse_rel(raw: &str) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// 一个工作区都没配置时自动使用的工作区名：指向当前用户主目录，可读写。
+/// 刚 init、已授权的机器因此无需再改配置即可使用。
+pub const AUTO_WORKSPACE: &str = "home";
+
 impl Workspaces {
     pub fn new(cfg: &Config, home: &Path) -> Result<Self> {
         let mut roots = BTreeMap::new();
-        for (name, p) in &cfg.workspaces {
+        let auto_home = cfg
+            .workspaces
+            .is_empty()
+            .then(crate::config::user_home)
+            .flatten()
+            .map(|h| h.to_string_lossy().into_owned());
+        let auto = auto_home.is_some();
+        let configured: Vec<(&String, &String)> = cfg.workspaces.iter().collect();
+        let auto_name = AUTO_WORKSPACE.to_string();
+        let entries = match &auto_home {
+            Some(h) => vec![(&auto_name, h)],
+            None => configured,
+        };
+        for (name, p) in entries {
             let c = dunce::canonicalize(p).map_err(|e| {
                 AppError::config(format!("workspace {name} path `{p}` invalid: {e}"))
             })?;
@@ -220,6 +239,11 @@ impl Workspaces {
         for raw in &p.readonly_paths {
             perms.push(compile_rule(raw, &roots, "readonly_paths", Perm(1))?);
         }
+        if auto {
+            // 主目录可能落在只读预设下（如 Windows 的 C:/），自动工作区整体放开读写
+            let raw = format!("{AUTO_WORKSPACE}:");
+            perms.push(compile_rule(&raw, &roots, "auto workspace", Perm::ALL)?);
+        }
         for rule in &p.paths {
             let allow = Perm::parse(&rule.allow).ok_or_else(|| {
                 AppError::config(format!(
@@ -236,7 +260,13 @@ impl Workspaces {
             deny,
             perms,
             home,
+            auto,
         })
+    }
+
+    /// 是否在用自动工作区（未配置任何工作区时的用户主目录）。
+    pub fn is_auto(&self) -> bool {
+        self.auto
     }
 
     pub fn list(&self) -> impl Iterator<Item = (&String, &PathBuf)> {
@@ -324,8 +354,25 @@ impl Workspaces {
         })
     }
 
+    /// 本机一个工作区都没有时的错误：直接给出在本机登记的命令；
+    /// 配置有误、正以 last-good 运行时一并说明（常见于手改的工作区名不合法）。
+    pub fn none_configured(config_error: Option<&str>) -> AppError {
+        let mut m = String::from(
+            "this machine has no workspace, so exec and file commands are refused. Add one: `agent-cli-x workspace add <peer> <name> <dir> --default` (the peer restarts serve)",
+        );
+        if let Some(e) = config_error {
+            m.push_str(&format!(
+                ". Note: its config.toml is invalid and serve runs on the last good config: {e}"
+            ));
+        }
+        AppError::denied(m)
+    }
+
     /// 拆出 `工作区:相对路径`；没写工作区时用默认工作区。
     fn split_spec<'a>(&self, spec: &'a str) -> Result<(String, &'a str)> {
+        if self.roots.is_empty() {
+            return Err(Self::none_configured(None));
+        }
         match spec.split_once(':') {
             Some((w, r)) if self.roots.contains_key(w) => Ok((w.to_string(), r)),
             Some((w, _)) if w.len() > 1 => {
