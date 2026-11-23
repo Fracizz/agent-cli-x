@@ -48,12 +48,31 @@ fn text(o: &Output) -> String {
     )
 }
 
+/// serve 自己写的日志（全部文件拼接）。
+fn serve_log(home: &Path) -> String {
+    fs::read_dir(home.join("serve-logs"))
+        .into_iter()
+        .flatten()
+        .filter_map(|e| fs::read_to_string(e.ok()?.path()).ok())
+        .collect()
+}
+
+/// 给测试分配端口。不用系统临时端口（bind 0）：restart / stop 后 serve 会短暂释放端口再重新绑定，
+/// 系统可能把它分给并行的其他测试，两个测试的 serve 就会串号。改为在临时端口范围之外，
+/// 按进程号划出一段，本进程内按计数器依次取，跳过已被占用的端口。
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    use std::sync::atomic::{AtomicU16, Ordering};
+    const PER_PROCESS: u16 = 100;
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    let base = 20000 + (std::process::id() % 100) as u16 * PER_PROCESS;
+    loop {
+        let n = NEXT.fetch_add(1, Ordering::SeqCst);
+        assert!(n < PER_PROCESS, "测试端口用完");
+        let port = base + n;
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
 }
 
 fn setup() -> Env {
@@ -128,24 +147,53 @@ fn setup_options(copy_bin: bool, desktop_capture: bool) -> Env {
     } else {
         PathBuf::from(BIN)
     };
-    let child = Command::new(&server_bin)
-        .args(["serve", "--foreground"])
-        .env("AGENT_CLI_X_HOME", &server_home)
-        // CI 运行器本身可能在 systemd 下（带 INVOCATION_ID），强制用“自行拉起新进程”的重启方式
-        .env("AGENT_CLI_X_RESTART", "spawn")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    // free_port 释放端口后到 serve 绑定前，并行的其他测试可能占用同一端口；这时连接检查会连到别人的
+    // serve。以本进程写入日志的 `serving (pid N)` 作为就绪信号，绑定失败（进程退出）就换端口重试。
+    let mut listen = listen;
+    let mut attempts = 0;
+    let child = loop {
+        let mut child = Command::new(&server_bin)
+            .args(["serve", "--foreground"])
+            .env("AGENT_CLI_X_HOME", &server_home)
+            // CI 运行器本身可能在 systemd 下（带 INVOCATION_ID），强制用“自行拉起新进程”的重启方式
+            .env("AGENT_CLI_X_RESTART", "spawn")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let ready = format!("serving (pid {})", child.id());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let started = loop {
+            if serve_log(&server_home).contains(&ready) {
+                break true;
+            }
+            if child.try_wait().unwrap().is_some() {
+                break false;
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("serve 未在 10 秒内启动: {}", serve_log(&server_home));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        if started {
+            break child;
+        }
+        attempts += 1;
+        assert!(attempts < 5, "serve 启动失败: {}", serve_log(&server_home));
+        let new_listen = format!("127.0.0.1:{}", free_port());
+        let cfg = fs::read_to_string(&cfg_path).unwrap().replacen(
+            &format!("listen = \"{listen}\""),
+            &format!("listen = \"{new_listen}\""),
+            1,
+        );
+        fs::write(&cfg_path, cfg).unwrap();
+        listen = new_listen;
+    };
     let server = ServerGuard {
         child,
         base: base.clone(),
     };
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while TcpStream::connect(&listen).is_err() {
-        assert!(Instant::now() < deadline, "serve 未在 10 秒内启动");
-        std::thread::sleep(Duration::from_millis(100));
-    }
 
     let token = cfg_token(&cfg_path);
     let fp = String::from_utf8(run(&server_home, &["fingerprint"]).stdout)
