@@ -33,6 +33,8 @@ use workspace::Workspaces;
 const MAX_CONNECTIONS: usize = 64;
 /// 拒绝请求后仅清空在途 TCP 数据；总时限固定，不能被持续发送拖长。
 const REJECT_DRAIN: Duration = Duration::from_secs(2);
+/// 检查授权码是否全部到期的间隔（只比较文件修改时间，开销可忽略）。
+const CODE_WATCH: Duration = Duration::from_secs(5);
 
 /// 本版本服务端支持的可选能力，客户端据此决定是否使用新接口（info 返回）。
 /// - put_stream：put 接受长度未知的帧流（cp 在两个对端之间直接中转）
@@ -278,6 +280,10 @@ fn serve_inner(home: &Path, wait_port_secs: u64, background_child: bool) -> Resu
         active: Arc::new(AtomicUsize::new(0)),
     });
     warm.refill();
+    {
+        let st = Arc::clone(&st);
+        thread::spawn(move || watch_code_expiry(&st));
+    }
     // 监听器在独立线程上运行（换端口时会被替换），主线程只需保持进程存活
     let h = admin::spawn_accept(&st, listener, &listen)?;
     st.net.set_active(h);
@@ -294,6 +300,36 @@ fn serve_inner(home: &Path, wait_port_secs: u64, background_child: bool) -> Resu
     loop {
         thread::park();
     }
+}
+
+/// 临时授权到期自动停止：本进程运行期间出现过有效授权码，之后全部到期，且 tokens.toml 中没有长期 token
+/// （默认 token 不计）时，serve 以退出码 0 退出，不再对外开放，服务管理器也不会再拉起。
+/// 到期前续期（`token rotate`）或签发长期 token 即不停止。
+fn watch_code_expiry(st: &State) {
+    let mut seen_valid = false;
+    loop {
+        thread::sleep(CODE_WATCH);
+        let c = st.auth.codes(util::unix_now());
+        seen_valid |= c.valid > 0;
+        if should_stop_on_expiry(seen_valid, &c) {
+            crate::slog!(
+                "authorization code(s) {} expired and no permanent caller token exists; stopping. To grant access again: agent-cli-x token rotate <name> (or token add <name> --code), then agent-cli-x serve",
+                c.expired.join(", ")
+            );
+            st.audit.log(
+                "",
+                "",
+                "code_expired_stop",
+                true,
+                json!({"codes": c.expired}),
+            );
+            std::process::exit(0);
+        }
+    }
+}
+
+fn should_stop_on_expiry(seen_valid: bool, c: &auth::Codes) -> bool {
+    seen_valid && c.valid == 0 && !c.expired.is_empty() && c.permanent == 0
 }
 
 /// 许可在创建连接线程前获取，包含握手、鉴权及请求处理的整个生命周期。
@@ -602,6 +638,22 @@ fn info_base(ctx: &Ctx) -> Value {
 #[cfg(test)]
 mod connection_tests {
     use super::*;
+
+    #[test]
+    fn code_expiry_stops_only_without_other_access() {
+        let c = |valid, expired: &[&str], permanent| auth::Codes {
+            valid,
+            expired: expired.iter().map(|s| s.to_string()).collect(),
+            permanent,
+        };
+        assert!(should_stop_on_expiry(true, &c(0, &["g"], 0)));
+        // 启动时就已过期（如开机自启）：不因残留的过期码停止
+        assert!(!should_stop_on_expiry(false, &c(0, &["g"], 0)));
+        assert!(!should_stop_on_expiry(true, &c(1, &["g"], 0)));
+        assert!(!should_stop_on_expiry(true, &c(0, &["g"], 1)));
+        // 授权码被手动吊销（不是到期）：不停止
+        assert!(!should_stop_on_expiry(true, &c(0, &[], 0)));
+    }
 
     #[test]
     fn rejected_drain_has_a_total_deadline_even_with_continuous_data() {

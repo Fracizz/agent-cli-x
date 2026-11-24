@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Authorization codes: once every code issued on this machine has expired and no permanent caller token exists (the default token does not count), `serve` stops itself with exit code 0, so the machine is no longer exposed and service managers leave it stopped. Renew with `token rotate <name>` before expiry to keep it running.
+
 ## 0.0.19
 
 - `workspace add` keeps the previous sole workspace as the default (writes `default_workspace`) when a second one is added without `--default`.

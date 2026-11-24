@@ -1663,7 +1663,7 @@ fn token(cmd: TokenCmd, json: bool) -> Result<i32> {
         } else {
             match &exp {
                 Some(e) => {
-                    println!("{verb} authorization code `{name}` (full access, expires {e}): {tok}")
+                    println!("{verb} authorization code `{name}` (full access, expires {e}; serve then stops unless a permanent token exists): {tok}")
                 }
                 None => println!("{verb} token `{name}`: {tok}"),
             }

@@ -12,6 +12,17 @@ pub struct Auth {
     inner: Mutex<Inner>,
 }
 
+/// 已签发 token 的分类计数（不含默认 token）。
+#[derive(Debug, Default, PartialEq)]
+pub struct Codes {
+    /// 仍有效的授权码
+    pub valid: usize,
+    /// 已到期的授权码名称
+    pub expired: Vec<String>,
+    /// 长期 token（非授权码）数
+    pub permanent: usize,
+}
+
 struct Inner {
     cfg_mtime: Option<SystemTime>,
     tok_mtime: Option<SystemTime>,
@@ -63,6 +74,21 @@ impl Auth {
             .unwrap_or_else(|e| e.into_inner())
             .named
             .len()
+    }
+
+    /// 按当前 tokens.toml（有变化先重新加载）统计授权码与长期 token。
+    pub fn codes(&self, now: u64) -> Codes {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        self.maybe_reload(&mut g);
+        let mut c = Codes::default();
+        for (name, _, _, expires) in &g.named {
+            match expires {
+                None => c.permanent += 1,
+                Some(e) if now >= *e => c.expired.push(name.clone()),
+                Some(_) => c.valid += 1,
+            }
+        }
+        c
     }
 
     fn reload_tokens(&self, g: &mut Inner) {

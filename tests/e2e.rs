@@ -2213,6 +2213,53 @@ fn stop_local_serve() {
     assert!(run(c, &["job", "kill", "b", &id]).status.success());
 }
 
+/// 授权码全部到期且没有其他长期访问方时，serve 自动以退出码 0 停止。
+#[test]
+fn code_expiry_stops_serve() {
+    let mut env = setup();
+    let s = &env.server_home;
+    let o = run(s, &["token", "add", "guest", "--code", "--json"]);
+    assert!(o.status.success(), "{}", text(&o));
+    // 等巡检至少看到一次有效授权码
+    std::thread::sleep(Duration::from_secs(7));
+    assert!(env._server.child.try_wait().unwrap().is_none());
+    let tp = s.join("tokens.toml");
+    let t = fs::read_to_string(&tp).unwrap();
+    let t: Vec<_> = t
+        .lines()
+        .map(|l| {
+            if l.starts_with("expires") {
+                "expires = 1"
+            } else {
+                l
+            }
+        })
+        .collect();
+    fs::write(
+        &tp,
+        t.join(
+            "
+",
+        ),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(st) = env._server.child.try_wait().unwrap() {
+            break st;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "serve 未自动停止: {}",
+            serve_log(s)
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert!(status.success());
+    assert!(serve_log(s).contains("guest expired"), "{}", serve_log(s));
+    assert!(wait_closed(&env.listen));
+}
+
 #[test]
 fn workspace_add_remove_restarts_serve() {
     let env = setup();
