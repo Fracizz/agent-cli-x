@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.0.19
 
 - `workspace add` keeps the previous sole workspace as the default (writes `default_workspace`) when a second one is added without `--default`.
 - One-off access: `token add <name> [--code]` on a machine that was never initialized runs `init` with defaults first (JSON: `"initialized": true`). `token add` / `token rotate` warn when the local `serve` is not running (JSON: `"serve": "not_running"`).
