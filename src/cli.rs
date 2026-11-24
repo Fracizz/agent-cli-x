@@ -13,6 +13,7 @@ use std::time::Duration;
 
 const SKILL: &str = include_str!("../skills/agent-cli-x/SKILL.md");
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_LISTEN: &str = "0.0.0.0:47821";
 
 #[derive(Parser)]
 #[command(
@@ -39,7 +40,7 @@ enum Cmd {
         #[arg(long)]
         name: Option<String>,
         /// Listen address
-        #[arg(long, default_value = "0.0.0.0:47821")]
+        #[arg(long, default_value = DEFAULT_LISTEN)]
         listen: String,
         /// Workspace, repeatable: --workspace proj=D:/code/proj
         #[arg(long = "workspace", value_name = "NAME=PATH")]
@@ -78,6 +79,9 @@ enum Cmd {
         #[arg(long)]
         no_peers: bool,
     },
+    /// This machine's inbound firewall rule (serve already adds it at startup when run as admin/root)
+    #[command(subcommand)]
+    Firewall(FirewallCmd),
     /// Manage tokens for access to this machine (issued per caller, individually revocable)
     #[command(subcommand)]
     Token(TokenCmd),
@@ -443,6 +447,31 @@ enum WorkspaceCmd {
 }
 
 #[derive(Subcommand)]
+enum FirewallCmd {
+    /// Show whether other machines can reach the listen port
+    Status {
+        /// Port to check, default: listen port in config.toml
+        #[arg(long)]
+        port: Option<u16>,
+    },
+    /// Allow inbound connections, once (Windows: per-program rule, asks UAC; Linux: ufw/firewalld port, needs root)
+    Open {
+        /// Port to open, default: listen port in config.toml
+        #[arg(long)]
+        port: Option<u16>,
+        /// Already running elevated (internal, after UAC)
+        #[arg(long, hide = true)]
+        elevated: bool,
+    },
+    /// Remove the rules agent-cli-x added
+    Close {
+        /// Already running elevated (internal, after UAC)
+        #[arg(long, hide = true)]
+        elevated: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum TokenCmd {
     /// Issue a token for a caller and print the `peer add` command it needs
     Add {
@@ -682,14 +711,19 @@ pub fn run() -> Result<i32> {
             ..
         } => {
             let home = config::home_dir();
-            let pid = server::background::start(&home, wait_port)?;
+            let ready = server::background::start(&home, wait_port)?;
             if json {
-                println!("{}", json!({"pid": pid}));
+                println!("{ready}");
             } else {
                 eprintln!(
-                    "Serving in background (pid {pid}); logs: {}",
+                    "Serving in background (pid {}); logs: {}",
+                    ready["pid"],
                     server::log::dir(&home).display()
                 );
+                // 缺防火墙规则又没权限自动添加时，提示一次
+                if let Some(hint) = ready["firewall_hint"].as_str() {
+                    eprintln!("Firewall: {hint}");
+                }
             }
             Ok(0)
         }
@@ -701,6 +735,7 @@ pub fn run() -> Result<i32> {
         Cmd::Whoami { pair } => whoami(pair, json),
         // 禁止借道时不探测对端
         Cmd::Doctor { no_peers } => doctor::run(json, !no_peers && !no_relay),
+        Cmd::Firewall(f) => firewall(f, json),
         Cmd::Token(t) => token(t, json),
         Cmd::Workspace(w) => workspace(w, json),
         Cmd::Upgrade {
@@ -1136,21 +1171,19 @@ pub fn run() -> Result<i32> {
     }
 }
 
-fn init(
-    name: Option<String>,
-    listen: &str,
-    workspaces: &[String],
-    force: bool,
-    json: bool,
-) -> Result<i32> {
+/// `init` 生成的本机身份信息。
+struct Initialized {
+    node_name: String,
+    node_id: String,
+    token: String,
+    fingerprint: String,
+    workspaces: Vec<(String, String)>,
+}
+
+/// 生成 config.toml、证书与机器 ID（不检查是否已存在、不输出）。
+fn init_files(name: Option<String>, listen: &str, workspaces: &[String]) -> Result<Initialized> {
     let home = config::home_dir();
     let cfg_path = config::config_path(&home);
-    if cfg_path.exists() && !force {
-        return Err(AppError::config(format!(
-            "{} already exists. To regenerate (replaces token, cert and machine ID) add --force",
-            cfg_path.display()
-        )));
-    }
     let node_name = name.unwrap_or_else(config::default_node_name);
     config::validate_name(&node_name, "machine")?;
     let mut ws = Vec::new();
@@ -1172,6 +1205,37 @@ fn init(
         config::template(&node_name, &node_id, listen, &token, &ws).as_bytes(),
     )?;
     util::restrict_permissions(&cfg_path);
+    Ok(Initialized {
+        node_name,
+        node_id,
+        token,
+        fingerprint: fp,
+        workspaces: ws,
+    })
+}
+
+fn init(
+    name: Option<String>,
+    listen: &str,
+    workspaces: &[String],
+    force: bool,
+    json: bool,
+) -> Result<i32> {
+    let home = config::home_dir();
+    let cfg_path = config::config_path(&home);
+    if cfg_path.exists() && !force {
+        return Err(AppError::config(format!(
+            "{} already exists. To regenerate (replaces token, cert and machine ID) add --force",
+            cfg_path.display()
+        )));
+    }
+    let Initialized {
+        node_name,
+        node_id,
+        token,
+        fingerprint: fp,
+        workspaces: ws,
+    } = init_files(name, listen, workspaces)?;
     let port = listen.rsplit(':').next().unwrap_or("47821");
     if json {
         let ws_map: serde_json::Map<String, Value> =
@@ -1210,12 +1274,10 @@ fn init(
     println!("     {cmd}");
     print_other_ips(&others);
     println!("  4. Set up autostart (see README 'Start at boot'), then run `agent-cli-x doctor`");
-    if cfg!(windows) {
-        println!("  Firewall (run once in admin PowerShell; allows the program, so port changes need no update):");
-        println!("     {}", crate::firewall::program_rule_cmd());
-    } else {
-        println!("  Firewall (if ufw is enabled): sudo ufw allow {port}/tcp");
-    }
+    println!(
+        "  Firewall: serve opens it itself when run as admin/root, otherwise prints this once: {}",
+        crate::firewall::open_cmd(port.parse().unwrap_or(47821))
+    );
     Ok(0)
 }
 
@@ -1383,14 +1445,206 @@ fn parse_code_ttl(s: &str) -> std::result::Result<u64, String> {
     }
 }
 
+/// `firewall status|open|close`：本机入站防火墙规则。serve 启动时已自动检查一次，
+/// 这里给没有管理员 / root 权限启动 serve 的用户手动放行（Windows 交互终端下弹 UAC）。
+fn firewall(cmd: FirewallCmd, json: bool) -> Result<i32> {
+    use crate::firewall as fw;
+    let home = config::home_dir();
+    let port_of = |p: Option<u16>| -> Result<u16> {
+        if let Some(p) = p {
+            return Ok(p);
+        }
+        let cfg = config::load_config(&home)?;
+        cfg.listen
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .ok_or_else(|| {
+                AppError::config(format!("invalid listen `{}` in config.toml", cfg.listen))
+            })
+    };
+    let need_admin = |what: &str, manual: String| {
+        AppError::new(
+            "elevation_required",
+            format!("{what} needs admin/root rights. Run: {manual}"),
+        )
+    };
+    // Windows：交互终端里弹 UAC 以管理员身份重跑本命令；被 AI 等非交互调用时不弹，避免卡住
+    #[cfg(windows)]
+    let elevate = |args: &str, what: &str| -> Result<()> {
+        if !std::io::stdin().is_terminal() {
+            return Err(need_admin(
+                what,
+                format!(
+                    "`agent-cli-x {args}` in an admin PowerShell (or: {})",
+                    fw::program_rule_cmd()
+                ),
+            ));
+        }
+        eprintln!("Requesting administrator rights (UAC)...");
+        match fw::run_elevated(&format!("{args} --elevated")) {
+            Ok(0) => Ok(()),
+            Ok(code) => Err(AppError::io(format!(
+                "elevated `agent-cli-x {args}` failed (exit {code}). Run in an admin PowerShell: {}",
+                fw::program_rule_cmd()
+            ))),
+            Err(1223) => Err(need_admin(what, "it again and accept the UAC prompt".into())),
+            Err(e) => Err(AppError::io(format!(
+                "cannot request admin rights (error {e}). Run in an admin PowerShell: {}",
+                fw::program_rule_cmd()
+            ))),
+        }
+    };
+    match cmd {
+        FirewallCmd::Status { port } => {
+            let port = port_of(port)?;
+            let st = fw::check(port);
+            let fix = st.needs_action().then(|| fw::open_cmd(port));
+            if json {
+                let mut v = json!({"firewall": st.name(), "port": port});
+                if let Some(f) = &fix {
+                    v["fix"] = json!(f);
+                }
+                println!("{v}");
+            } else {
+                let line = match st {
+                    fw::Status::Program | fw::Status::Added => {
+                        format!("allowed: rule {} allows the program", fw::RULE)
+                    }
+                    fw::Status::Port => format!("allowed: inbound TCP {port}"),
+                    fw::Status::NotChecked => format!(
+                        "no host firewall to configure; cloud security groups must still allow TCP {port}"
+                    ),
+                    fw::Status::Unknown => "cannot query the firewall".into(),
+                    fw::Status::Off => format!(
+                        "Windows firewall is off; to keep working once it is turned on: {}",
+                        fw::open_cmd(port)
+                    ),
+                    s => format!("{}. Run once: {}", fw::describe(s, port), fw::open_cmd(port)),
+                };
+                println!("{line}");
+            }
+            Ok(0)
+        }
+        FirewallCmd::Open { port, elevated } => {
+            // Windows 按程序放行，不依赖端口；还没 init 时也能用
+            let port = if cfg!(windows) {
+                port_of(port).unwrap_or(47821)
+            } else {
+                port_of(port)?
+            };
+            let before = fw::check(port);
+            let changed = if before.allowed() || before == fw::Status::NotChecked {
+                false
+            } else if crate::platform::is_elevated() {
+                if !fw::add(&home, port) {
+                    return Err(AppError::io(format!(
+                        "adding the firewall rule failed ({}). Run {}",
+                        fw::describe(before, port),
+                        fw::manual_cmd(port)
+                    )));
+                }
+                true
+            } else if elevated {
+                return Err(AppError::io("still not elevated after UAC"));
+            } else {
+                #[cfg(windows)]
+                elevate(
+                    &format!("firewall open --port {port}"),
+                    "Opening the firewall",
+                )?;
+                #[cfg(not(windows))]
+                return Err(need_admin("Opening the firewall", fw::open_cmd(port)));
+                #[cfg(windows)]
+                true
+            };
+            let after = if changed { fw::check(port) } else { before };
+            if json {
+                println!(
+                    "{}",
+                    json!({"firewall": after.name(), "port": port, "changed": changed})
+                );
+            } else if !elevated {
+                eprintln!(
+                    "{}",
+                    match (changed, after) {
+                        (_, fw::Status::NotChecked) => format!(
+                            "No host firewall to configure; cloud security groups must still allow TCP {port}"
+                        ),
+                        (false, _) => format!("Already allowed (TCP {port})"),
+                        (true, _) if cfg!(windows) => format!(
+                            "Added inbound rule {} for this program (any port; stays valid across restarts, set-port and upgrades)",
+                            fw::RULE
+                        ),
+                        (true, _) => format!("Allowed TCP {port}"),
+                    }
+                );
+            }
+            Ok(0)
+        }
+        FirewallCmd::Close { elevated } => {
+            if !crate::platform::is_elevated() {
+                if elevated {
+                    return Err(AppError::io("still not elevated after UAC"));
+                }
+                #[cfg(windows)]
+                {
+                    elevate("firewall close", "Removing the firewall rule")?;
+                    if json {
+                        println!("{}", json!({"removed": [format!("rule {}", fw::RULE)]}));
+                    } else {
+                        eprintln!("Removed inbound rule {}", fw::RULE);
+                    }
+                    return Ok(0);
+                }
+                #[cfg(not(windows))]
+                return Err(need_admin(
+                    "Removing firewall rules",
+                    format!(
+                        "sudo {} firewall close",
+                        std::env::current_exe()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|_| "agent-cli-x".into())
+                    ),
+                ));
+            }
+            let removed = fw::remove_all(&home);
+            if json {
+                println!("{}", json!({"removed": removed}));
+            } else if !elevated {
+                if removed.is_empty() {
+                    eprintln!("Nothing to remove");
+                } else {
+                    eprintln!("Removed: {}", removed.join(", "));
+                }
+            }
+            Ok(0)
+        }
+    }
+}
+
 fn token(cmd: TokenCmd, json: bool) -> Result<i32> {
     let home = config::home_dir();
+    // 一次性授权场景（如 `token add guest --code`）：本机尚未 init 时用默认值自动初始化
+    let auto_init = matches!(cmd, TokenCmd::Add { .. }) && !config::config_path(&home).exists();
+    if auto_init {
+        let i = init_files(None, DEFAULT_LISTEN, &[])?;
+        if !json {
+            eprintln!(
+                "Not initialized yet; ran `agent-cli-x init` with defaults: {} (node {}, listen {DEFAULT_LISTEN}, workspace `home` = home dir)",
+                home.display(),
+                i.node_name
+            );
+        }
+    }
     let cfg = config::load_config(&home)?;
     let fp = tls::local_fingerprint(&home)?;
     let mut tokens = config::load_tokens(&home)?;
     let issued = |name: &str, tok: &str, verb: &str, expires: Option<u64>| {
         let (cmd, others) = pair_command(&cfg.node_name(), &cfg.listen, tok, &fp);
         let exp = expires.map(util::unix_iso);
+        // 签发的令牌要等本机 serve 运行后调用端才能用
+        let serving = client::admin::local_serve_running(&cfg);
         if json {
             let mut v = json!({"name": name, "token": tok, "pair_command": cmd});
             if !others.is_empty() {
@@ -1398,6 +1652,12 @@ fn token(cmd: TokenCmd, json: bool) -> Result<i32> {
             }
             if let Some(e) = &exp {
                 v["expires"] = json!(e);
+            }
+            if auto_init {
+                v["initialized"] = json!(true);
+            }
+            if !serving {
+                v["serve"] = json!("not_running");
             }
             println!("{v}");
         } else {
@@ -1410,6 +1670,9 @@ fn token(cmd: TokenCmd, json: bool) -> Result<i32> {
             println!("Run on the caller (token shown only once):");
             println!("  {cmd}");
             print_other_ips(&others);
+            if !serving {
+                eprintln!("serve is not running here; start it before the caller pairs: agent-cli-x serve");
+            }
         }
     };
     let code_expiry =

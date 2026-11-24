@@ -55,10 +55,10 @@ pub fn set_port(client: &Client, port: u16) -> Result<Value> {
         let _ = client.call("/v1/port", &json!({"action": "abort"}), CALL);
         let hint = match open["firewall_cmd"].as_str() {
             Some(cmd) => format!(
-                "Peer Windows firewall blocks it. Run once in an admin PowerShell on the peer (allows the program, no change needed for later port changes): {cmd}"
+                "The peer firewall blocks it and serve there lacks admin/root rights to open it. Run once on the peer: {cmd}"
             ),
             None => format!(
-                "Check that the peer firewall (Linux e.g. `sudo ufw allow {port}/tcp`) and cloud security group allow TCP {port}"
+                "Check that the network / cloud security group allows TCP {port} to the peer"
             ),
         };
         return Err(AppError::new(
@@ -162,6 +162,11 @@ pub fn stop(force: bool) -> Result<Value> {
         "interrupted_jobs": resp["interrupted_jobs"],
         "kept_jobs": resp["kept_jobs"],
     }))
+}
+
+/// 本机 serve 是否在监听（只探测端口，不握手）。
+pub fn local_serve_running(cfg: &Config) -> bool {
+    accepts(&local_connect_addr(&cfg.listen))
 }
 
 fn accepts(addr: &str) -> bool {

@@ -18,7 +18,7 @@ pub mod workspace;
 
 use crate::config::{self, Config};
 use crate::error::{AppError, Result};
-use crate::{http, platform, tls, util};
+use crate::{firewall, http, platform, tls, util};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use serde_json::{json, Value};
 use std::io::{BufReader, Read, Write};
@@ -97,6 +97,31 @@ pub fn serve(home: &Path, wait_port_secs: u64, background_child: bool) -> Result
         }
     }
     r
+}
+
+/// 启动时检查一次入站防火墙：缺规则且有管理员 / root 权限就加上（规则长期有效，之后启动不再变动），
+/// 否则在日志里提示一次；后台模式下由启动它的终端再打印一次。返回（状态名，提示）。
+fn startup_firewall(home: &Path, listener: &TcpListener) -> Option<(&'static str, Option<String>)> {
+    let addr = listener.local_addr().ok()?;
+    let off = std::env::var(firewall::ENV).is_ok_and(|v| v.eq_ignore_ascii_case("off"));
+    if off || addr.ip().is_loopback() {
+        return None;
+    }
+    let port = addr.port();
+    let st = firewall::ensure(home, port);
+    let hint = st.needs_action().then(|| {
+        format!(
+            "{}; other machines may not connect yet. Run once: {}",
+            firewall::describe(st, port),
+            firewall::open_cmd(port)
+        )
+    });
+    if st == firewall::Status::Added {
+        crate::slog!("  firewall: {}", firewall::added_msg(port));
+    } else if let Some(h) = &hint {
+        crate::slog!("  firewall: {h}");
+    }
+    Some((st.name(), hint))
 }
 
 fn bind(listen: &str, wait_secs: u64) -> Result<TcpListener> {
@@ -235,6 +260,7 @@ fn serve_inner(home: &Path, wait_port_secs: u64, background_child: bool) -> Resu
         ws.perm_rules().len(),
         cfg.policy.deny_commands.len()
     );
+    let fw = startup_firewall(home, &listener);
 
     let listen = cfg.listen.clone();
     let st = Arc::new(State {
@@ -256,7 +282,14 @@ fn serve_inner(home: &Path, wait_port_secs: u64, background_child: bool) -> Resu
     let h = admin::spawn_accept(&st, listener, &listen)?;
     st.net.set_active(h);
     if background_child {
-        background::notify(Ok(std::process::id()))?;
+        let mut ready = json!({"pid": std::process::id()});
+        if let Some(fw) = fw {
+            ready["firewall"] = json!(fw.0);
+            if let Some(hint) = fw.1 {
+                ready["firewall_hint"] = json!(hint);
+            }
+        }
+        background::notify(Ok(ready))?;
     }
     loop {
         thread::park();

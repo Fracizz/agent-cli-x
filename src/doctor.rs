@@ -197,42 +197,34 @@ fn check_firewall(r: &mut Report, port: &str) {
     let Ok(port) = port.parse::<u16>() else {
         return;
     };
+    use firewall::Status as S;
+    let st = firewall::check(port);
     let fix = || {
         format!(
-            "Run once in admin PowerShell: {}",
-            firewall::program_rule_cmd()
+            "{}; other machines may fail to connect. Run once: {}",
+            firewall::describe(st, port),
+            firewall::open_cmd(port)
         )
     };
-    use firewall::Status as S;
-    match firewall::check(port) {
+    match st {
         S::NotChecked => {}
         S::Program | S::Added => r.add(
             NAME,
             Level::Ok,
             "inbound rule agent-cli-x allows the program",
         ),
-        S::Port => r.add(
+        S::Port => r.add(NAME, Level::Ok, format!("inbound TCP {port} allowed")),
+        S::OtherPort | S::Missing => r.add(NAME, Level::Warn, fix()),
+        S::Unverified => r.add(NAME, Level::Skip, fix()),
+        S::Off => r.add(
             NAME,
             Level::Ok,
-            format!("inbound rule agent-cli-x allows port {port}"),
-        ),
-        S::OtherPort => r.add(
-            NAME,
-            Level::Warn,
             format!(
-                "inbound rule agent-cli-x exists but does not allow port {port}. {}",
-                fix()
+                "Windows firewall is off; to keep working once it is turned on: {}",
+                firewall::open_cmd(port)
             ),
         ),
-        S::Missing => r.add(
-            NAME,
-            Level::Warn,
-            format!(
-                "inbound rule agent-cli-x not found; other machines may fail to connect. {}",
-                fix()
-            ),
-        ),
-        S::Unknown => r.add(NAME, Level::Skip, "cannot run netsh"),
+        S::Unknown => r.add(NAME, Level::Skip, "cannot query the firewall"),
     }
 }
 

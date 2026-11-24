@@ -3,6 +3,10 @@
 ## Unreleased
 
 - `workspace add` keeps the previous sole workspace as the default (writes `default_workspace`) when a second one is added without `--default`.
+- One-off access: `token add <name> [--code]` on a machine that was never initialized runs `init` with defaults first (JSON: `"initialized": true`). `token add` / `token rotate` warn when the local `serve` is not running (JSON: `"serve": "not_running"`).
+- Firewall works out of the box: `serve` checks the inbound rule once at startup and, when it is missing, adds it if running as admin/root (Windows: per-program rule `agent-cli-x`; Linux: the listen port in ufw/firewalld); otherwise it prints one line with the command to run (background launcher on stderr, JSON: `firewall`, `firewall_hint`). `AGENT_CLI_X_FIREWALL=off` disables this.
+- `firewall status|open|close`: check, add (Windows asks for UAC in an interactive terminal; Linux needs root) or remove the rules agent-cli-x added.
+- `set-port` reclaims firewall rules: after the switch the rule agent-cli-x added for the old port is removed (Windows: an old per-port `agent-cli-x` rule once the per-program rule exists; Linux: only ports agent-cli-x opened), and a rolled-back or expired switch removes the rule for the new port.
 
 ## 0.0.18
 

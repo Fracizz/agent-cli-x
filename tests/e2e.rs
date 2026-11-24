@@ -35,6 +35,8 @@ fn run(home: &Path, args: &[&str]) -> Output {
     Command::new(BIN)
         .args(args)
         .env("AGENT_CLI_X_HOME", home)
+        // 测试不检查、不修改本机防火墙
+        .env("AGENT_CLI_X_FIREWALL", "off")
         .stdin(Stdio::null())
         .output()
         .expect("运行 agent-cli-x 失败")
@@ -155,6 +157,7 @@ fn setup_options(copy_bin: bool, desktop_capture: bool) -> Env {
         let mut child = Command::new(&server_bin)
             .args(["serve", "--foreground"])
             .env("AGENT_CLI_X_HOME", &server_home)
+            .env("AGENT_CLI_X_FIREWALL", "off")
             // CI 运行器本身可能在 systemd 下（带 INVOCATION_ID），强制用“自行拉起新进程”的重启方式
             .env("AGENT_CLI_X_RESTART", "spawn")
             .stdout(Stdio::null())
@@ -1257,6 +1260,37 @@ fn wait_code(home: &Path, args: &[&str], want: i32) -> Output {
     }
 }
 
+/// 一次性授权：未 init 时 `token add --code` 自动初始化，并提示启动 serve。
+#[test]
+fn token_add_auto_init() {
+    let home = std::env::temp_dir().join(format!(
+        "agent-cli-x-e2e-autoinit-{}-{}",
+        std::process::id(),
+        free_port()
+    ));
+    let _ = fs::remove_dir_all(&home);
+    let o = run(&home, &["token", "add", "guest", "--code", "--json"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let v = json_of(&o);
+    assert_eq!(v["initialized"], true, "{v}");
+    assert!(
+        v["pair_command"].as_str().unwrap().contains(":47821 "),
+        "{v}"
+    );
+    assert!(home.join("config.toml").exists());
+    // 已初始化后不再重复 init
+    let o = run(&home, &["token", "add", "guest2"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(!text(&o).contains("Not initialized"), "{}", text(&o));
+    // 默认端口上可能有本机真实 serve，serve 提示只在端口未监听时检查
+    if TcpStream::connect_timeout(&"127.0.0.1:47821".parse().unwrap(), Duration::from_secs(1))
+        .is_err()
+    {
+        assert!(text(&o).contains("agent-cli-x serve"), "{}", text(&o));
+    }
+    let _ = fs::remove_dir_all(&home);
+}
+
 #[test]
 fn tokens_multi_peer_doctor() {
     let env = setup();
@@ -1270,7 +1304,10 @@ fn tokens_multi_peer_doctor() {
     // 为调用方签发 token，用它登记第二个对端名
     let o = run(s, &["token", "add", "caller1", "--json"]);
     assert!(o.status.success(), "{}", text(&o));
-    let tok = json_of(&o)["token"].as_str().unwrap().to_string();
+    let v = json_of(&o);
+    let tok = v["token"].as_str().unwrap().to_string();
+    // serve 在运行、已 init：不带提示字段
+    assert!(v["serve"].is_null() && v["initialized"].is_null(), "{v}");
     assert_eq!(
         run(s, &["token", "add", "caller1"]).status.code(),
         Some(105)
@@ -2299,6 +2336,7 @@ fn restart_set_port_config_fallback() {
     let mut child = Command::new(BIN)
         .args(["serve", "--foreground"])
         .env("AGENT_CLI_X_HOME", s)
+        .env("AGENT_CLI_X_FIREWALL", "off")
         .env("AGENT_CLI_X_RESTART", "spawn")
         .stdout(Stdio::null())
         .stderr(Stdio::null())

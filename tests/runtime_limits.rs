@@ -75,6 +75,7 @@ impl Server {
         let child = Command::new(BIN)
             .args(["serve", "--foreground"])
             .env("AGENT_CLI_X_HOME", &home)
+            .env("AGENT_CLI_X_FIREWALL", "off")
             .env_remove("AGENT_CLI_X_NO_RELAY")
             .stdin(Stdio::null())
             .stdout(Stdio::null())

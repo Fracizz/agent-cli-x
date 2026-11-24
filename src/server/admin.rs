@@ -266,6 +266,7 @@ pub fn port(ctx: &Ctx, body: Value) -> Result<Value> {
         if let Some(p) = &p {
             p.handle.close();
             crate::slog!("new port {} revoked", p.handle.addr);
+            release_port(&ctx.st, p.port);
         }
         return Ok(json!({"aborted": p.is_some()}));
     }
@@ -318,14 +319,16 @@ fn open(ctx: &Ctx, port: u16) -> Result<Value> {
             if let Some(p) = g.pending.take() {
                 p.handle.close();
                 crate::slog!("new port {} not confirmed in time, closed", p.handle.addr);
+                // release_port 要再次取锁
+                drop(g);
+                release_port(&st2, p.port);
             }
         }
     });
 
-    let mut fw = firewall::check(port);
-    if fw.blocked() && platform::is_elevated() && firewall::add_program_rule() {
-        fw = firewall::Status::Added;
-        crate::slog!("added inbound firewall rule agent-cli-x (per program)");
+    let fw = firewall::ensure(&st.home, port);
+    if fw == firewall::Status::Added {
+        crate::slog!("firewall: {}", firewall::added_msg(port));
     }
     crate::slog!(
         "listening on {addr}, awaiting confirmation ({}@{})",
@@ -338,10 +341,24 @@ fn open(ctx: &Ctx, port: u16) -> Result<Value> {
         "firewall": fw.name(),
         "expires_secs": PENDING_SECS,
     });
-    if fw.blocked() {
-        v["firewall_cmd"] = json!(firewall::program_rule_cmd());
+    if fw.needs_action() {
+        v["firewall_cmd"] = json!(firewall::open_cmd(port));
     }
     Ok(v)
+}
+
+fn addr_port(addr: &str) -> Option<u16> {
+    addr.rsplit(':').next()?.parse().ok()
+}
+
+/// 回收不再监听的端口的防火墙规则（只删本程序加的；当前监听端口不动）。
+fn release_port(st: &State, port: u16) {
+    let Some(current) = addr_port(&st.net.listen()) else {
+        return;
+    };
+    if firewall::release(&st.home, port, current) {
+        crate::slog!("removed inbound firewall rule for unused TCP {port}");
+    }
 }
 
 fn commit(ctx: &Ctx, port: u16) -> Result<Value> {
@@ -384,5 +401,8 @@ fn commit(ctx: &Ctx, port: u16) -> Result<Value> {
         true,
         json!({"old": old_addr, "new": new_addr}),
     );
+    if let Some(old_port) = addr_port(&old_addr) {
+        release_port(st, old_port);
+    }
     Ok(json!({"listen": new_addr, "old_listen": old_addr}))
 }

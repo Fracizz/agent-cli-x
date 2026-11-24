@@ -40,7 +40,7 @@ pub fn connect(addr: &str, pin: Option<&str>, read_timeout: Duration) -> Result<
         .ok_or_else(|| AppError::connect(format!("cannot resolve address {addr}")))?;
     let tcp = TcpStream::connect_timeout(&sock_addr, CONNECT_TIMEOUT).map_err(|e| {
         AppError::connect(format!(
-            "cannot connect to {addr}: {e} (check that `agent-cli-x serve` is running on the peer and the firewall allows it)"
+            "cannot connect to {addr}: {e} (check that `agent-cli-x serve` is running on the peer and its firewall allows it: `agent-cli-x firewall open` there)"
         ))
     })?;
     let _ = tcp.set_read_timeout(Some(read_timeout));

@@ -9,7 +9,8 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
-pub fn start(home: &Path, wait_port_secs: u64) -> Result<u32> {
+/// 返回子进程的就绪报告：`{"pid": N, "firewall"?: ..., "firewall_hint"?: ...}`。
+pub fn start(home: &Path, wait_port_secs: u64) -> Result<Value> {
     #[cfg(windows)]
     protect_launcher_pipes()?;
     let exe = std::env::current_exe()?;
@@ -48,7 +49,7 @@ pub fn start(home: &Path, wait_port_secs: u64) -> Result<u32> {
         if status["pid"].as_u64() != Some(u64::from(child.id())) {
             return Err(AppError::io("invalid background server startup response"));
         }
-        Ok(child.id())
+        Ok(status)
     })();
     if result.is_err() {
         let _ = child.kill();
@@ -89,9 +90,10 @@ fn protect_launcher_pipes() -> Result<()> {
     Ok(())
 }
 
-pub fn notify(result: Result<u32>) -> Result<()> {
+/// `ready` 为就绪信息（含 pid），原样转给启动它的前台进程。
+pub fn notify(result: Result<Value>) -> Result<()> {
     let status = match result {
-        Ok(pid) => json!({"pid": pid}),
+        Ok(v) => v,
         Err(e) => json!({"error": e.code, "message": e.message}),
     };
     writeln!(std::io::stdout().lock(), "{status}")?;

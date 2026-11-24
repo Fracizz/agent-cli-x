@@ -37,11 +37,11 @@ agent-cli-x info build-01
 agent-cli-x exec build-01 --cwd proj: cargo test
 ```
 
-临时授权可改用授权码：`agent-cli-x token add guest --code` 签发全权限临时令牌，默认 4 小时有效，`--ttl 8h` 延长到 8 小时；到期后调用返回 101，用 `token rotate guest` 续期。
+临时授权可改用授权码：`agent-cli-x token add guest --code` 签发全权限临时令牌，默认 4 小时有效，`--ttl 8h` 延长到 8 小时；到期后调用返回 101，用 `token rotate guest` 续期。一次性使用时可跳过 `init`：本机未初始化时 `token add` 会先按默认值自动初始化；本机 `serve` 未运行时会提示先执行 `agent-cli-x serve`。
 
 如果配对时用了其他名字，把 `build-01` 换成登记的名字。需要再次查看默认令牌的配对命令时，在项目主机运行 `agent-cli-x whoami --pair`。
 
-`serve` 默认在后台运行，监听就绪后返回 PID，关掉终端仍可继续运行。日志在 `~/.agent-cli-x/serve-logs/`。排查问题或交给服务管理器时用 `serve --foreground`。在本机执行 `agent-cli-x stop` 可停止服务（只能在本机执行，后台任务继续运行；配置了开机自启时下次开机仍会启动）。配置重启后自动启动，可参考 [Linux systemd 与 Windows 任务计划程序示例](README.md#start-at-boot-recommended)，再运行 `agent-cli-x doctor` 验证。
+`serve` 默认在后台运行，监听就绪后返回 PID，关掉终端仍可继续运行。启动时会检查一次入站防火墙：缺规则时，以管理员 / root 运行会自动放行（Windows 按程序放行，长期有效，改端口、升级都无需再改），否则在终端提示一次，按提示执行 `agent-cli-x firewall open` 即可。日志在 `~/.agent-cli-x/serve-logs/`。排查问题或交给服务管理器时用 `serve --foreground`。在本机执行 `agent-cli-x stop` 可停止服务（只能在本机执行，后台任务继续运行；配置了开机自启时下次开机仍会启动）。配置重启后自动启动，可参考 [Linux systemd 与 Windows 任务计划程序示例](README.md#start-at-boot-recommended)，再运行 `agent-cli-x doctor` 验证。
 
 给 Codex、Claude Code 等助手使用时，可安装 [Agent Skill](skills/agent-cli-x/SKILL.md)，或运行 `agent-cli-x skill` 查看。
 
