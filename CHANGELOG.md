@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.0.21
+
+- `proxy <peer> -- <command>`: run a local command with its HTTP(S) traffic going out through a peer's network, for slow downloads of releases and dependencies (npm, pnpm, pip, cargo, git over HTTPS, curl). The command's exit code is passed through and one stderr line reports connections and bytes.
+- Off by default: the peer owner sets `[policy] net_proxy = true` and restarts `serve`. Loopback, link-local and the peer's own addresses are refused unless `net_proxy_local = true`; `--no-relay` tokens are refused; every target is written to the audit log.
+- `init` now writes `net_proxy = false`. Versions before 0.0.21 can't read a `config.toml` that contains `net_proxy`, so don't `upgrade` such a peer with an older binary.
+
 ## 0.0.20
 
 - Authorization codes: once every code issued on this machine has expired and no permanent caller token exists (the default token does not count), `serve` stops itself with exit code 0, so the machine is no longer exposed and service managers leave it stopped. Renew with `token rotate <name>` before expiry to keep it running.
