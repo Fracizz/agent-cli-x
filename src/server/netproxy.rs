@@ -21,18 +21,14 @@ static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 struct Permit;
 impl Permit {
     fn acquire() -> Result<Self> {
-        ACTIVE
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                (n < MAX_TUNNELS).then_some(n + 1)
-            })
-            .map_err(|_| {
-                AppError::new(
-                    "busy",
-                    format!(
-                        "{MAX_TUNNELS} proxy connections already open on this peer; retry later"
-                    ),
-                )
-            })?;
+        // 先占位再判断：不用 fetch_update（新版标准库改名为 try_update，最低支持版本还没有）
+        if ACTIVE.fetch_add(1, Ordering::SeqCst) >= MAX_TUNNELS {
+            ACTIVE.fetch_sub(1, Ordering::SeqCst);
+            return Err(AppError::new(
+                "busy",
+                format!("{MAX_TUNNELS} proxy connections already open on this peer; retry later"),
+            ));
+        }
         Ok(Self)
     }
 }
