@@ -92,6 +92,7 @@ Each host can run the same binary as a client and server. Pairing authorises a c
 | `put <peer> <local> <dest>` / `get <peer> <src> <local>` | transfer files or directories (`--exclude`) |
 | `cp <src-peer> <src> <dst-peer> <dest>` | copy between two peers: streamed through this machine without touching its disk (`--exclude`; undo on the destination with `rollback`). The destination needs 0.0.4+; with an older one it falls back to a temporary local copy that is deleted afterwards |
 | `rollback <peer> <op_id>` | undo a write/edit/put/rm |
+| `proxy <peer> -- <command>` | run a **local** command with its HTTP(S) downloads going out through the peer; see [Network proxy](#network-proxy) |
 | `skill` | print the agent guide |
 
 Paths use `workspace:relative/path`. See `agent-cli-x --help`.
@@ -141,6 +142,26 @@ Capture reads **displayed pixels**, including layered/overlapping windows. Selec
 
 Interactive validation on Windows: `cargo test --test e2e native_desktop_roundtrip -- --ignored --test-threads=1`. This uses isolated client/server profiles and only reads pixels; it does not activate windows or upgrade an existing service.
 
+### Network proxy
+
+When this machine downloads slowly and a peer has a better network, run the command here and let its traffic leave through the peer:
+
+```bash
+agent-cli-x proxy dev -- pnpm install
+agent-cli-x proxy dev -- git clone https://github.com/owner/repo
+agent-cli-x proxy dev -- curl -fLO https://example.com/big.zip
+```
+
+**Enable it on the peer** (off by default): set `net_proxy = true` under `[policy]` in its `config.toml`, run `agent-cli-x serve --check`, then restart `serve`. `info` then shows `network proxy: enabled`.
+
+How it works: while the command runs, this machine listens on a random `127.0.0.1` port with a random password and sets `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, the npm proxy variables and `NODE_USE_ENV_PROXY=1` for the command only. Each connection travels over the usual pinned TLS to the peer, which connects to the target with its own network settings (VPN or TUN included) and resolves the name itself. The peer needs no extra port or firewall rule and stores nothing. The command's exit code is passed through, and one summary line on stderr reports connections and bytes.
+
+- Only programs that honor the proxy variables use it: npm, pnpm, pip, uv, cargo, git over HTTPS, curl, Go, PowerShell 7 web cmdlets. SSH, Java build tools and some download scripts don't; the summary says `no connections` when the proxy was bypassed. A proxy set in a program's own config (git `http.proxy`, pip `proxy`) may take precedence.
+- `NO_PROXY` entries you already have stay direct, and `localhost` is always direct. Mirrors close to this machine can be faster without the proxy.
+- The peer refuses loopback, link-local and its own addresses unless `net_proxy_local = true`. Other LAN addresses the peer can reach **are** reachable.
+- Tokens issued with `--no-relay` are refused. Every target `host:port` is written to the peer's audit log.
+- Limits: 48 simultaneous connections (further ones wait), idle connections close after 5 minutes. Revoking a token doesn't cut connections already open.
+
 ## Multiple machines
 
 Every machine runs `serve` and registers the others as peers, so A, B and C can all call each other. A full mesh of N machines needs N×(N−1) `peer add` commands. `token add <caller>` prints each one for you.
@@ -159,7 +180,7 @@ Every machine runs `serve` and registers the others as peers, so A, B and C can 
 - **Broken config at startup.** Every time `serve` starts successfully it saves a copy as `~/.agent-cli-x/config.toml.last-good`. If `config.toml` later fails to parse or validate, `serve` logs the error and runs on that copy instead of exiting, so the machine stays reachable. `info` then shows a `配置异常` line (`config_error` in `--json`), `info @all` marks the peer, and `doctor` on the machine reports the config as failed. Fix the file and run `restart <peer>`. Note that the old copy may carry looser rules than the ones you were trying to set. A missing `config.toml` does not fall back.
 - **Change the listen port.** `set-port <peer> <port>` asks the peer to listen on the new port as well, confirms through the new port that this machine can reach it, and only then writes `listen` into the peer's `config.toml` and closes the old port. No restart is needed. If the new port can't be reached (a firewall or cloud security group), the change is rolled back and the old port keeps working. Other machines that registered the peer must run `peer set <name> --addr <ip:new-port>`, and the command prints that line for you. Firewall: when the peer's `serve` runs as admin/root it opens the new port itself (Windows: the per-program rule covers every port; Linux: allows the new port in ufw/firewalld) and, once switched, removes the rule it had added for the old port (on Windows, an old per-port `agent-cli-x` rule once the per-program rule exists; on Linux, only ports agent-cli-x opened itself). A rolled-back or expired switch removes the rule for the new port again. Without those rights the error tells you to run `agent-cli-x firewall open` on the peer.
 - **Handshake failures.** When TCP connects but TLS fails, the error says why. A dropped connection usually means something other than `serve` is on that port, for example a port forwarder whose backend `serve` has exited. Check the peer's `~/.agent-cli-x/serve-logs/`.
-- **Not supported:** relaying through another machine (A → B → C) or automatic discovery. Every pair of machines must reach each other directly on the listen port.
+- **Not supported:** relaying through another machine (A → B → C) or automatic discovery. Every pair of machines must reach each other directly on the listen port. ([`proxy`](#network-proxy) only forwards a local command's internet traffic; it doesn't forward agent-cli-x calls.)
 
 ### One-way access
 
@@ -204,6 +225,7 @@ max_transfer_mb = 2048     # per put/get
 max_jobs = 16              # concurrent background jobs
 job_timeout_secs = 86400
 rm_use_trash = true        # rm moves to the recycle bin; false = back up to ~/.agent-cli-x/backup then delete
+net_proxy = false          # true: callers may use this machine as a network exit (see Network proxy)
 # prewarm_shells = 2       # idle PowerShell kept ready for exec; unset = 1 (<16 GB RAM) or 2, set = capped at RAM in GB, 0 = off
 prewarm_idle_secs = 600    # release idle warm shells after this long without exec (next exec cold-starts and refills); 0 = keep forever
 

@@ -10,6 +10,7 @@ mod exec;
 mod fs;
 mod jobs;
 pub mod log;
+mod netproxy;
 mod recycle;
 pub mod transfer;
 mod upgrade;
@@ -41,12 +42,14 @@ const CODE_WATCH: Duration = Duration::from_secs(5);
 /// - purge：按 op_id 彻底清除回收站条目与备份
 /// - restart / set_port：`/v1/restart` 与 `/v1/port`
 /// - workspace：`/v1/workspace` 远程登记 / 删除工作区
+/// - net_proxy：`/v1/connect` 经本机访问网络（还需 policy.net_proxy = true）
 pub const FEATURES: &[&str] = &[
     "put_stream",
     "purge",
     "restart",
     "set_port",
     "workspace",
+    "net_proxy",
     #[cfg(windows)]
     "desktop_capture",
 ];
@@ -425,7 +428,21 @@ fn handle_conn(st: Arc<State>, tcp: TcpStream) {
                 return;
             }
         }
-        Ok((req, caller)) => dispatch(&st, ip, local_port, same_host, req, caller, &mut conn),
+        Ok((req, caller)) => {
+            let ctx = Ctx {
+                st: Arc::clone(&st),
+                ip,
+                caller: caller.name,
+                no_relay: caller.no_relay,
+                local_port,
+                same_host,
+            };
+            // 隧道需要接管整条连接，结束时由它自己收尾
+            if req.path == "/v1/connect" {
+                return netproxy::serve(ctx, &req.body, conn);
+            }
+            dispatch(ctx, req, &mut conn)
+        }
     }
     let s = conn.get_mut();
     s.conn.send_close_notify();
@@ -463,23 +480,7 @@ fn authorize(st: &State, req: &http::Request) -> auth::Check {
     st.auth.check(got)
 }
 
-fn dispatch(
-    st: &Arc<State>,
-    ip: String,
-    local_port: u16,
-    same_host: bool,
-    req: http::Request,
-    caller: auth::Caller,
-    conn: &mut Conn,
-) {
-    let ctx = Ctx {
-        st: Arc::clone(st),
-        ip,
-        caller: caller.name,
-        no_relay: caller.no_relay,
-        local_port,
-        same_host,
-    };
+fn dispatch(ctx: Ctx, req: http::Request, conn: &mut Conn) {
     match req.path.as_str() {
         "/v1/fs/put" => {
             // 带 X-Agent-Cli-Stream: frames 时请求体长度未知（cp 中转），按帧读到结束帧为止
@@ -612,6 +613,7 @@ fn info_base(ctx: &Ctx) -> Value {
         "exec_user": platform::current_user(),
         "exec_elevated": platform::is_elevated(),
         "features": FEATURES,
+        "net_proxy": ctx.st.cfg.policy.net_proxy,
         "desktop": {"supported": crate::desktop::supported(), "capture_allowed": ctx.st.cfg.policy.desktop_capture},
         // 本次调用方及其限制：no_relay 时在本机 exec 里不能再调用 agent-cli-x 访问其他节点
         "caller": ctx.caller,

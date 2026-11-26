@@ -35,6 +35,7 @@ EOF
 agent-cli-x write B proj:notes.md --from ./notes.md       # or --content / stdin
 agent-cli-x put B ./dist proj:web/dist --exclude node_modules ; agent-cli-x get B proj:logs ./logs
 agent-cli-x cp A dl:pkg B home:               # peer → peer, streamed, nothing kept locally
+agent-cli-x proxy B -- pnpm install           # runs HERE, downloads exit via B's network
 agent-cli-x rm B proj:build/tmp -r            # to recycle bin; rollback B <op_id> undoes write/edit/put/rm
 agent-cli-x upgrade B                         # on a `version mismatch` hint
 agent-cli-x restart B ; agent-cli-x set-port B 48000   # never hand-edit a peer's config/firewall for these
@@ -47,6 +48,8 @@ agent-cli-x restart B ; agent-cli-x set-port B 48000   # never hand-edit a peer'
 - `--json` for fields (`sha256`, `op_id`, job id); `--full` for essential trimmed text. Full JSON caps at 1MB (multi-peer full: 8MB/peer); remainder stays in the log.
 
 Desktop: physical-pixel coordinates; default 50 windows / 32KB, titles 200 chars; screenshot <=1600px longest edge / 1MB PNG. `--full` keeps original pixels (<=64M pixels / 32MB). Captures displayed pixels, including overlap; never activates windows. On desktop policy denial (102), stop; do not substitute exec capture scripts.
+
+Proxy (slow local downloads): needs `network proxy: enabled` in `info` (owner sets `policy.net_proxy = true`; 102 otherwise). Only programs honoring `HTTP(S)_PROXY` use it (npm, pnpm, pip, uv, cargo, https git, curl); the stderr summary's `no connections` means it was bypassed. Domestic mirrors may be faster without it.
 
 ## Rules
 

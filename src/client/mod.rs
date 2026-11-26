@@ -4,6 +4,7 @@ pub mod admin;
 pub mod desktop;
 pub mod multi;
 pub mod output;
+pub mod proxy;
 pub mod transfer;
 pub mod upgrade;
 

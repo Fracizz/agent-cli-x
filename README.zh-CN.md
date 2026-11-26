@@ -58,6 +58,17 @@ agent-cli-x exec build-01 --cwd proj: cargo test
 
 路径用 `工作区名:相对路径`。使用 `exec --detach` 可运行后台任务，再通过 `job list`、`job logs` 或 `job kill` 管理。可用 `rollback` 撤销支持回滚的写入、编辑、上传与删除操作。完整语法见[命令参考](README.md#commands)。
 
+## 经对端下载（代理）
+
+本机下载慢、某台对端网络好时，命令仍在本机执行，流量经对端出去：
+
+```bash
+agent-cli-x proxy build-01 -- pnpm install
+agent-cli-x proxy build-01 -- git clone https://github.com/owner/repo
+```
+
+默认关闭：在对端 `config.toml` 的 `[policy]` 下设 `net_proxy = true`，执行 `agent-cli-x serve --check` 后重启服务，`info` 显示 `network proxy: enabled` 即可使用。仅对识别 `HTTP_PROXY` / `HTTPS_PROXY` 的程序有效（npm、pnpm、pip、uv、cargo、git over HTTPS、curl 等，SSH 与 Java 工具不识别）；结束时 stderr 汇总连接数与流量，显示 `no connections` 表示命令没有走代理。对端默认拒绝访问其回环、链路本地和本机地址，但能访问它可达的局域网地址；`--no-relay` 令牌不能使用。详见[代理参考](README.md#network-proxy)。
+
 ## 输出上限
 
 普通输出和 JSON 使用同样的数据预算。输出被截断时，命令会给出日志路径或继续读取的参数。

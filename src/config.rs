@@ -66,6 +66,12 @@ pub struct Policy {
     /// Allow read-only desktop observation independently of filesystem/exec permissions.
     #[serde(default)]
     pub desktop_capture: bool,
+    /// Let callers use this machine as their network exit (`proxy` command).
+    #[serde(default)]
+    pub net_proxy: bool,
+    /// Also let proxied connections reach loopback, link-local and this machine's own addresses.
+    #[serde(default)]
+    pub net_proxy_local: bool,
     #[serde(default)]
     pub deny_paths: Vec<String>,
     /// 只读路径（兼容旧配置）：等价于 `[[policy.paths]]` 中 `allow = "r"` 的规则。
@@ -106,6 +112,8 @@ impl Default for Policy {
     fn default() -> Self {
         Self {
             desktop_capture: false,
+            net_proxy: false,
+            net_proxy_local: false,
             deny_paths: Vec::new(),
             readonly_paths: Vec::new(),
             paths: Vec::new(),
@@ -393,6 +401,12 @@ rm_use_trash = true
 # Read-only Windows desktop/window capture, separate from filesystem and exec permissions.
 # Requires an unlocked interactive user session; screenshots are returned to the caller, not saved here.
 desktop_capture = false
+
+# Let callers send a command's traffic out through this machine: `agent-cli-x proxy <this-peer> -- <command>`.
+# Loopback, link-local and this machine's own addresses are refused unless net_proxy_local = true.
+# Callers with a --no-relay token are always refused. Targets are recorded in the audit log.
+net_proxy = false
+# net_proxy_local = false
 
 # Number of idle shells kept warm: only when the default shell is pwsh / powershell (sh / bash / cmd start fast anyway).
 # Each command still runs in a fresh process, isolated; this only saves PowerShell cold start (pwsh ~0.3s, 5.1 ~2s).

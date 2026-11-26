@@ -83,10 +83,11 @@ fn setup() -> Env {
 
 /// `copy_bin` 为 true 时把二进制复制到临时目录再运行 serve（upgrade 测试会替换它）。
 fn setup_with(copy_bin: bool) -> Env {
-    setup_options(copy_bin, false)
+    setup_options(copy_bin, &[])
 }
 
-fn setup_options(copy_bin: bool, desktop_capture: bool) -> Env {
+/// `replacements` 对生成的 config.toml 做文本替换（用于打开默认关闭的策略开关）。
+fn setup_options(copy_bin: bool, replacements: &[(&str, &str)]) -> Env {
     let base = std::env::temp_dir().join(format!(
         "agent-cli-x-e2e-{}-{}",
         std::process::id(),
@@ -125,11 +126,10 @@ fn setup_options(copy_bin: bool, desktop_capture: bool) -> Env {
     // 追加目录黑名单
     let cfg_path = server_home.join("config.toml");
     let cfg = fs::read_to_string(&cfg_path).unwrap();
-    let cfg = if desktop_capture {
-        cfg.replace("desktop_capture = false", "desktop_capture = true")
-    } else {
-        cfg
-    };
+    let cfg = replacements.iter().fold(cfg, |cfg, (from, to)| {
+        assert!(cfg.contains(from), "配置模板里没有 {from}");
+        cfg.replacen(from, to, 1)
+    });
     let cfg = cfg.replacen("deny_paths = [", "deny_paths = [\n  \"secrets\",", 1);
     // 预设只读规则（Windows 为整个 C 盘）会让临时目录里的工作区只读：
     // 用更具体的规则放开工作区（顺带验证“最具体规则优先”），docs 只读、drafts 只能读和新建
@@ -258,7 +258,10 @@ fn setup_options(copy_bin: bool, desktop_capture: bool) -> Env {
 #[test]
 #[ignore = "requires an unlocked interactive Windows desktop"]
 fn native_desktop_roundtrip() {
-    let env = setup_options(false, true);
+    let env = setup_options(
+        false,
+        &[("desktop_capture = false", "desktop_capture = true")],
+    );
     let c = &env.client_home;
     let o = run(c, &["desktop", "windows", "b", "--max", "1", "--json"]);
     assert!(o.status.success(), "{}", text(&o));
@@ -2540,4 +2543,171 @@ fn trash_operations_keep_distinct_identities() {
     );
     let o = run(c, &["purge", "b", a]);
     assert!(o.status.success(), "{}", text(&o));
+}
+
+/// 迷你 HTTP 源站：GET /big 返回固定内容，POST 原样返回请求体，其余返回 `small`。
+fn origin_server() -> (u16, Vec<u8>) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let big: Vec<u8> = (0..8 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let body = std::sync::Arc::new(big.clone());
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let body = body.clone();
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(&stream);
+                let mut first = String::new();
+                let mut length = 0usize;
+                reader.read_line(&mut first).ok()?;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).ok()?;
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(v) = lower.strip_prefix("content-length:") {
+                        length = v.trim().parse().ok()?;
+                    }
+                }
+                let mut upload = vec![0; length];
+                reader.read_exact(&mut upload).ok()?;
+                let reply: &[u8] = if first.starts_with("POST") {
+                    &upload
+                } else if first.starts_with("GET /big ") {
+                    &body
+                } else {
+                    b"small"
+                };
+                let mut w = &stream;
+                write!(
+                    w,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    reply.len()
+                )
+                .ok()?;
+                w.write_all(reply).ok()
+            });
+        }
+    });
+    (port, big)
+}
+
+/// `proxy b -- curl -sSf --noproxy "" <extra>`：清空直连名单，让回环源站也走代理。
+fn proxy_curl(client_home: &Path, extra: &[&str]) -> Output {
+    let mut args = vec!["proxy", "b", "--", "curl", "-sSf", "--noproxy", ""];
+    args.extend_from_slice(extra);
+    run(client_home, &args)
+}
+
+#[test]
+fn proxy_through_peer() {
+    assert!(
+        Command::new("curl").arg("--version").output().is_ok(),
+        "该测试需要 curl"
+    );
+    let (port, big) = origin_server();
+    let url = format!("http://127.0.0.1:{port}");
+
+    // 默认关闭
+    let env = setup();
+    let o = run(&env.client_home, &["proxy", "b", "--", "curl", "--version"]);
+    assert_eq!(o.status.code(), Some(102), "{}", text(&o));
+    assert!(text(&o).contains("net_proxy = true"), "{}", text(&o));
+    drop(env);
+
+    // 开启后默认仍拒绝访问对端的回环地址
+    let env = setup_options(false, &[("net_proxy = false", "net_proxy = true")]);
+    let o = proxy_curl(&env.client_home, &[&url]);
+    assert_ne!(o.status.code(), Some(0), "{}", text(&o));
+    assert!(text(&o).contains("refused"), "{}", text(&o));
+    assert!(text(&o).contains("1 failed"), "{}", text(&o));
+    drop(env);
+
+    let env = setup_options(
+        false,
+        &[(
+            "net_proxy = false",
+            "net_proxy = true\nnet_proxy_local = true",
+        )],
+    );
+    let c = &env.client_home;
+    assert!(text(&run(c, &["info", "b"])).contains("network proxy: enabled"));
+    let out = env.ws.join("big.bin");
+    let out_arg = out.display().to_string();
+    let big_url = format!("{url}/big");
+    // 普通 HTTP（绝对地址请求）与 CONNECT 隧道
+    for extra in [&[][..], &["--proxytunnel"][..]] {
+        let mut args = extra.to_vec();
+        args.extend_from_slice(&["-o", &out_arg, &big_url]);
+        let o = proxy_curl(c, &args);
+        assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+        assert!(
+            text(&o).contains("1 connections, 8.0MB down"),
+            "{}",
+            text(&o)
+        );
+        assert!(fs::read(&out).unwrap() == big, "下载内容不一致");
+        fs::remove_file(&out).unwrap();
+    }
+    // 上行数据
+    let source = env.ws.join("upload.bin");
+    fs::write(&source, &big).unwrap();
+    let upload = format!("@{}", source.display());
+    for extra in [&[][..], &["--proxytunnel"][..]] {
+        let mut args = extra.to_vec();
+        args.extend_from_slice(&["--data-binary", &upload, "-o", &out_arg, &url]);
+        let o = proxy_curl(c, &args);
+        assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+        assert!(fs::read(&out).unwrap() == big, "回传内容不一致");
+    }
+    // 并发连接数超过上限时排队，全部成功
+    let many = format!("{url}/[1-120]");
+    let o = proxy_curl(
+        c,
+        &[
+            "--parallel",
+            "--parallel-immediate",
+            "--parallel-max",
+            "100",
+            &many,
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+    assert_eq!(o.stdout.len(), 120 * "small".len(), "{}", text(&o));
+    // 子命令退出码原样返回；找不到命令为 103
+    let exit7: &[&str] = if cfg!(windows) {
+        &["proxy", "b", "--", "cmd", "/c", "exit", "7"]
+    } else {
+        &["proxy", "b", "--", "sh", "-c", "exit 7"]
+    };
+    let o = run(c, exit7);
+    assert_eq!(o.status.code(), Some(7), "{}", text(&o));
+    assert!(text(&o).contains("no connections"), "{}", text(&o));
+    let o = run(c, &["proxy", "b", "--", "acx-no-such-program"]);
+    assert_eq!(o.status.code(), Some(103), "{}", text(&o));
+    // --no-relay 令牌不能借道
+    let o = run(
+        &env.server_home,
+        &["token", "add", "guest", "--no-relay", "--json"],
+    );
+    let token = json_of(&o)["token"].as_str().unwrap().to_string();
+    let o = run(
+        c,
+        &[
+            "peer",
+            "add",
+            "g",
+            &env.listen,
+            "--token",
+            &token,
+            "--fingerprint",
+            &env.fp,
+        ],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    let o = run(c, &["proxy", "g", "--", "curl", "--version"]);
+    assert_eq!(o.status.code(), Some(102), "{}", text(&o));
+    assert!(text(&o).contains("--no-relay"), "{}", text(&o));
 }

@@ -163,6 +163,17 @@ enum Cmd {
     /// Manage background jobs
     #[command(subcommand)]
     Job(JobCmd),
+    /// Run a LOCAL command with its HTTP(S) traffic going out through a peer (peer needs policy.net_proxy = true)
+    #[command(
+        after_help = "Examples: agent-cli-x proxy B -- npm install   agent-cli-x proxy B -- curl -fLO https://host/file.zip
+Only programs honoring HTTP_PROXY/HTTPS_PROXY use it (npm, pnpm, pip, uv, cargo, git over https, curl, Go); SSH and Java don't."
+    )]
+    Proxy {
+        peer: String,
+        /// Command to run here (after `--`)
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
     /// List a directory (honors .gitignore, hides denied paths)
     Ls {
         peer: String,
@@ -796,6 +807,7 @@ pub fn run() -> Result<i32> {
             Ok(0)
         }
         Cmd::Desktop(cmd) => desktop_command(cmd, json),
+        Cmd::Proxy { peer, command } => client::proxy::run(Client::load(&peer)?, &command, json),
         Cmd::Exec {
             peer,
             cwd,
@@ -2680,6 +2692,9 @@ fn print_info(name: &str, v: &Value) {
                 "disabled (policy.desktop_capture = true to enable)"
             }
         );
+    }
+    if v["net_proxy"] == true {
+        println!("  network proxy: enabled (agent-cli-x proxy {name} -- <command>)");
     }
     if v["caller_no_relay"] == true {
         println!(
